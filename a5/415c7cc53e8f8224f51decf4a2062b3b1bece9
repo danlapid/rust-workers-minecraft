@@ -1,0 +1,111 @@
+.cargo/config.toml
+  s_2427bf394889ab::t_38e05caf7e65bb 1-23
+.editorconfig
+  s_77e92d86b6594b::t_17ad61f6d7f163 1-15
+.gitignore
+  s_d5dedfcaa293c8::t_115eb090477ca8 1-26
+.node-version
+  s_77e92d86b6594b::t_27cd0be3d6ae58 1
+AGENTS.md
+  s_d5dedfcaa293c8::t_4871b4b882e786 1-38
+Cargo.lock
+  s_d5dedfcaa293c8::t_f513e4c30fb125 1-3166
+LICENSE
+  s_77e92d86b6594b::t_e714002079a5fa 1-674
+LICENSES/rust-workers-minecraft-MIT.txt
+  s_77e92d86b6594b::t_0a7e7906fb6c98 1-21
+patches/pumpkin-emscripten.patch
+  s_e30a808a9e02c6::t_08bd47309bdfaf 1-2469
+patches/wasm-bindgen-emscripten-closures.patch
+  s_d5dedfcaa293c8::t_67f6d3289d1243 1-30
+patches/wasm-streams-rlib.patch
+  s_d5dedfcaa293c8::t_40453df56ef2b0 1-25
+patches/workers-rs-emscripten-toolchain.patch
+  s_d5dedfcaa293c8::t_ac8d84c1c65720 1-184
+rust-toolchain.toml
+  s_77e92d86b6594b::t_85dd2f94c2567d 1-4
+scripts/build.sh
+  s_d5dedfcaa293c8::t_52423593612716 1-7
+scripts/check-ports.mjs
+  s_d5dedfcaa293c8::t_2e222a9d2ad044 1-18
+scripts/common.sh
+  s_d5dedfcaa293c8::t_040079fc846f21 1-36
+scripts/test-scheduler.sh
+  s_d5dedfcaa293c8::t_3af2dbacf06d75 1-8
+tests/client.mjs
+  s_d5dedfcaa293c8::t_71fece1c20fe26 1-170
+tests/fixtures/filesystem.rs
+  s_d5dedfcaa293c8::t_d89b1f72274386 1-76
+tests/fixtures/startup-failure.mjs
+  s_d5dedfcaa293c8::t_85369a491185e2 1-14
+tests/fixtures/worker.mjs
+  s_d5dedfcaa293c8::t_35852fc24c49f6 1-56
+tests/fixtures/wrangler.jsonc
+  s_d5dedfcaa293c8::t_cbed8954f07a3e 1-14
+tests/integration.mjs
+  s_d5dedfcaa293c8::t_c4a0cc31007758 1-130
+tests/protocol.mjs
+  s_d5dedfcaa293c8::t_80467dfbafa325 1-143
+toolchain/wasm-bindgen.Cargo.lock
+  s_77e92d86b6594b::t_81c70f3770475b 1-4510
+tsconfig.json
+  s_d5dedfcaa293c8::t_223ca76f5b0ffd 1-12
+worker/filesystem.ts
+  s_d5dedfcaa293c8::t_f879a6dbef4562 1-16
+worker/fs-library.js
+  s_d5dedfcaa293c8::t_fbea001517a53c 1-114
+worker/index.ts
+  s_d5dedfcaa293c8::t_61d1dd0f9e1abf 1-17
+worker/modules.d.ts
+  s_d5dedfcaa293c8::t_de15f4c99fc44e 1-20
+worker/pumpkin.ts
+  s_d5dedfcaa293c8::t_6e861ea21d3c61 1-22
+worker/socket.ts
+  s_d5dedfcaa293c8::t_a75ead2ec3a7a5 1-25
+worker/world.ts
+  s_d5dedfcaa293c8::t_a63c29556c5d2f 1-92
+README.md
+  s_e30a808a9e02c6::t_87c6b1be926ae7 1-80
+docs/memory-reduction.md
+  s_e30a808a9e02c6::t_4989bfdddefdc1 1-52
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a5415c7cc53e8f8224f51decf4a2062b3b1bece9",
+  "prompts": {},
+  "sessions": {
+    "s_2427bf394889ab": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "28753db2-9693-4557-828c-5c58d097f066",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Dan Lapid <dlapid@cloudflare.com>"
+    },
+    "s_77e92d86b6594b": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a06e5b-098e-7712-a0e5-7e7e6c827616",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Dan Lapid <dlapid@cloudflare.com>"
+    },
+    "s_d5dedfcaa293c8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a07103-f349-7710-bc05-5ce39268dba3",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Dan Lapid <dlapid@cloudflare.com>"
+    },
+    "s_e30a808a9e02c6": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a07239-dd7d-74e0-a087-56033c167d90",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Dan Lapid <dlapid@cloudflare.com>"
+    }
+  }
+}
