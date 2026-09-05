@@ -1,0 +1,19 @@
+docs/memory-reduction.md
+  s_e30a808a9e02c6::t_923c99cc9f8bb4 1-50
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "31b74334f9d4631ddeb1c1341ed5c23150b6d588",
+  "prompts": {},
+  "sessions": {
+    "s_e30a808a9e02c6": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a07239-dd7d-74e0-a087-56033c167d90",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Dan Lapid <dlapid@cloudflare.com>"
+    }
+  }
+}
