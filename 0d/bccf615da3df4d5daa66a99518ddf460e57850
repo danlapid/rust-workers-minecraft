@@ -1,0 +1,71 @@
+.github/workflows/ci.yml
+  s_d5dedfcaa293c8::t_8d8d09af64c802 40-42,47-51,57-60
+.gitignore
+  s_d5dedfcaa293c8::t_fa4a1ed92b2122 7
+AGENTS.md
+  s_d5dedfcaa293c8::t_d6510b8ad6a61f 4-6,10-14,18-22,30-32,36
+Cargo.lock
+  s_d5dedfcaa293c8::t_0aee1ed5c8034f 60,207-217,1262-1267,1363,1499-1518,1768,1849,2157-2162,2240-2250,2268,2292,2304-2315,2468-2488,2508,2510,2554,2939-2949,3009-3061
+Cargo.toml
+  s_d5dedfcaa293c8::t_e35f1fa9f96679 14-26,35,43-44
+docs/architecture.md
+  s_d5dedfcaa293c8::t_38cfaac922a798 33,39,43-46,48-52,54-65,74-77
+docs/dependencies.md
+  s_d5dedfcaa293c8::t_6099e94c73253d 11,16-17,56-58,71-78
+docs/workers.md
+  s_d5dedfcaa293c8::t_b24bbde0b57bed 1-89
+node/check-ports.mjs
+  s_d5dedfcaa293c8::t_fd0dcbc3c84dc4 1-18
+node/worker-probe.mjs
+  s_d5dedfcaa293c8::t_3ce1c257310d95 1-178
+package-lock.json
+  s_d5dedfcaa293c8::t_486e608122405a 1-1654
+package.json
+  s_d5dedfcaa293c8::t_617219f276717e 1-30
+patches/README.md
+  s_d5dedfcaa293c8::t_8ae138f83f89a5 4-6,12-14,16
+patches/pumpkin-emscripten.patch
+  s_d5dedfcaa293c8::t_837ca2163bb5b9 868,880-959,1241,1244,1253-1255,1379-1513,1522,1530,1538,1834,1837-1894,1903,1911,1920-1988
+patches/wasm-bindgen-emscripten-closures.patch
+  s_d5dedfcaa293c8::t_745d50417b05d3 1-17
+patches/wasm-streams-rlib.patch
+  s_d5dedfcaa293c8::t_ec8fea5e1263fb 1-13
+patches/workers-rs-emscripten-toolchain.patch
+  s_d5dedfcaa293c8::t_a3d237d92a3cc8 1-86
+scripts/build-worker.sh
+  s_d5dedfcaa293c8::t_ff0d312a4e3ac5 1-24
+scripts/serve-worker.sh
+  s_d5dedfcaa293c8::t_fcc1aae0b1a033 1-9
+scripts/setup.sh
+  s_d5dedfcaa293c8::t_bc2fc4786f385f 52-53,55,57-58
+scripts/test-worker.sh
+  s_d5dedfcaa293c8::t_284de88bd55209 1-11
+src/config.rs
+  s_d5dedfcaa293c8::t_11ff4699d6ac52 1-38
+src/durable.rs
+  s_d5dedfcaa293c8::t_7cbdf24d7f7d62 1-108
+src/main.rs
+  s_d5dedfcaa293c8::t_5d93b60b1b3a41 5,8,32
+src/transport.rs
+  s_d5dedfcaa293c8::t_d9e544f31c96a5 1-81
+tsconfig.json
+  s_d5dedfcaa293c8::t_f665034290c200 1-12
+worker/fs-library.js
+  s_d5dedfcaa293c8::t_7dc727576b9c44 1-17
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0dbccf615da3df4d5daa66a99518ddf460e57850",
+  "prompts": {},
+  "sessions": {
+    "s_d5dedfcaa293c8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a07103-f349-7710-bc05-5ce39268dba3",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Dan Lapid <dlapid@cloudflare.com>"
+    }
+  }
+}
