@@ -1,0 +1,81 @@
+.cargo/config.toml
+  s_77e92d86b6594b::t_416011944f9385 1-41
+.editorconfig
+  s_77e92d86b6594b::t_a1ad906aa44d7b 1-15
+.github/workflows/ci.yml
+  s_77e92d86b6594b::t_0997cfbb323037 1-51
+.gitignore
+  s_77e92d86b6594b::t_4086e8c6fc0b2a 1-25
+.node-version
+  s_77e92d86b6594b::t_913f14f8eed38d 1
+AGENTS.md
+  s_77e92d86b6594b::t_58b15b0b108bac 1-39
+Cargo.lock
+  s_77e92d86b6594b::t_39636430c5a9e8 1-3016
+Cargo.toml
+  s_77e92d86b6594b::t_db6e3311ff5db2 1-41
+LICENSE
+  s_77e92d86b6594b::t_1ceecafff67fab 1-674
+LICENSES/rust-workers-minecraft-MIT.txt
+  s_77e92d86b6594b::t_f6b8668cf345c3 1-21
+README.md
+  s_77e92d86b6594b::t_5ac93fc61fad85 1-116
+STATE.md
+  s_77e92d86b6594b::t_92704571026b44 1-79
+docs/architecture.md
+  s_77e92d86b6594b::t_c3ac483e779476 1-70
+docs/dependencies.md
+  s_77e92d86b6594b::t_2b2df1eaed625d 1-65
+docs/history/M0-FINDINGS.md
+  s_77e92d86b6594b::t_e108300529e519 1-438
+docs/history/PLAN.md
+  s_77e92d86b6594b::t_a7dac5b95fcc2d 1-268
+docs/history/STATE.md
+  s_77e92d86b6594b::t_4eebfa3fad5428 1-123
+docs/roadmap.md
+  s_77e92d86b6594b::t_c6e8e48147e7a1 1-66
+node/probe.mjs
+  s_77e92d86b6594b::t_c3f14b47ed4b25 1-132
+node/protocol.mjs
+  s_77e92d86b6594b::t_5cb8dc61128f30 1-61
+node/server.mjs
+  s_77e92d86b6594b::t_50e3d3e5b2e15c 1-13
+patches/README.md
+  s_77e92d86b6594b::t_8ed67c4e0a49a9 1-14
+patches/pumpkin-emscripten.patch
+  s_77e92d86b6594b::t_3e6984e2ee8eae 1-2054
+patches/wasm-bindgen-tokio-hosted-runtime.patch
+  s_77e92d86b6594b::t_8b0c5f9fbc808f 1-57
+rust-toolchain.toml
+  s_77e92d86b6594b::t_3bd574426b453a 1-4
+scripts/build.sh
+  s_77e92d86b6594b::t_b9495df55e2753 1-4
+scripts/common.sh
+  s_77e92d86b6594b::t_3bf2a2c582be20 1-41
+scripts/serve.sh
+  s_77e92d86b6594b::t_b449c083fbb5e0 1-8
+scripts/setup.sh
+  s_77e92d86b6594b::t_e256a1285cac7c 1-87
+scripts/test.sh
+  s_77e92d86b6594b::t_36b3d40c00636b 1-10
+src/main.rs
+  s_77e92d86b6594b::t_f41c3f4c4eae86 1-91
+toolchain/wasm-bindgen.Cargo.lock
+  s_77e92d86b6594b::t_92c881b3345144 1-4510
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d420b346513386909be2b66ba2aeb448580f3fde",
+  "prompts": {},
+  "sessions": {
+    "s_77e92d86b6594b": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a06e5b-098e-7712-a0e5-7e7e6c827616",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Dan Lapid <dlapid@cloudflare.com>"
+    }
+  }
+}
