@@ -1,0 +1,23 @@
+[build]
+target = "wasm32-unknown-emscripten"
+target-dir = "target/workers"
+
+[target.wasm32-unknown-emscripten]
+rustflags = [
+    # Static linking and unwind semantics are required by the hosted runtime.
+    "-Crelocation-model=static",
+    "--cfg=tokio_unstable",
+    "-Clink-arg=-sWASM_BINDGEN=auto",
+    "-Clink-arg=-sEXPORT_ES6",
+    # Generated host glue uses Workers' Node compatibility APIs.
+    "-Clink-arg=-sENVIRONMENT=node",
+    "-Clink-arg=-sNODERAWSOCKETS",
+    "-Clink-arg=-sNODERAWFS",
+    "-Clink-arg=-sJSPI",
+    "-Clink-arg=-sASSERTIONS=0",
+    "-Clink-arg=-sSTACK_SIZE=8MB",
+    "-Clink-arg=-sALLOW_MEMORY_GROWTH=1",
+    # Each Durable Object creates its own wasm instance and mounted filesystem.
+    "-Clink-arg=-sMODULARIZE=1",
+    "-Clink-arg=-sEXPORT_NAME=createPumpkinModule",
+]

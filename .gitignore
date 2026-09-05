@@ -1,0 +1,26 @@
+# Reproducible dependency checkouts, toolchains, and build output
+/.work/
+/target/
+**/target/
+node_modules/
+.wrangler/
+/worker/env.d.ts
+*.wasm
+
+# Local worlds, player data, and configuration
+/.data/
+/world/
+/configuration/
+/data/
+/players/
+
+# Secrets and machine-specific settings
+.env
+.env.*
+.dev.vars
+.dev.vars.*
+*.pem
+*.key
+.emscripten_cf
+*.log
+.DS_Store

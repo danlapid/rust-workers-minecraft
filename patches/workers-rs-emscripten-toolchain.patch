@@ -1,0 +1,184 @@
+Subject: [PATCH] Embed workers-rs with the hosted Emscripten runtime
+
+The embedding host creates each Emscripten module and owns its lifetime.
+The SDK's standalone wasm-bindgen loader and recovery hook cannot
+reinitialize those instances, so leave initialization and panic handling
+to the host on this target.
+
+Expose an Emscripten-only adapter that drives promise exports on one hosted
+Tokio runtime per module and converts injected sockets into SDK streams.
+It uses the hosted-runtime Tokio fork selected by the application. Align
+the wasm-bindgen, js-sys, and web-sys version family with the pinned
+Emscripten-enabled wasm-bindgen CLI so their generated bindings agree.
+
+Flush outstanding socket writes before closing the WritableStream. This
+satisfies AsyncWrite's shutdown contract and releases the writer lock
+before close, including when a pending write completes asynchronously.
+
+Base-commit: 7db011ec97658a5d907f3e3102028ce86c044f19
+
+---
+diff --git a/Cargo.toml b/Cargo.toml
+index 4e08234..9888881 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -28,7 +28,7 @@ chrono = { version = "0.4.41", default-features = false, features = [
+ futures-channel = "0.3.31"
+ futures-util = { version = "0.3.31", default-features = false }
+ http = "1.3"
+-js-sys = { version = "0.3.104" }
++js-sys = { version = "0.3.103" }
+ serde = { version = "1.0.164", features = ["derive"] }
+ strum = { version = "0.28", features = ["derive"] }
+ serde_json = "1.0.140"
+@@ -37,14 +37,14 @@ syn = "3.0.3"
+ trybuild = "1.0"
+ proc-macro2 = "1.0.60"
+ quote = "1.0.28"
+-wasm-bindgen = { version = "0.2.127" }
+-wasm-bindgen-cli-support = { version = "0.2.127" }
+-wasm-bindgen-futures = { version = "0.4.77" }
+-wasm-bindgen-macro-support = { version = "0.2.127" }
+-wasm-bindgen-shared = { version = "0.2.127" }
+-wasm-bindgen-test = { version = "0.3.77" }
++wasm-bindgen = { version = "0.2.126" }
++wasm-bindgen-cli-support = { version = "0.2.126" }
++wasm-bindgen-futures = { version = "0.4.76" }
++wasm-bindgen-macro-support = { version = "0.2.126" }
++wasm-bindgen-shared = { version = "0.2.126" }
++wasm-bindgen-test = { version = "0.3.76" }
+ wasm-streams = { version = "0.6.0" }
+-web-sys = { version = "0.3.104", features = [
++web-sys = { version = "0.3.103", features = [
+     "AbortController",
+     "AbortSignal",
+     "BinaryType",
+@@ -106,11 +106,11 @@ opt-level = "z"
+ # These are local patches we use to test against local wasm bindgen
+ # We always align on the exact stable wasm bindgen version for releases
+ [patch.crates-io]
+-js-sys = { version = "0.3.104", path = './wasm-bindgen/crates/js-sys' }
+-wasm-bindgen = { version = "0.2.127", path = './wasm-bindgen' }
+-wasm-bindgen-cli-support = { version = "0.2.127", path = "./wasm-bindgen/crates/cli-support" }
+-wasm-bindgen-futures = { version = "0.4.77", path = './wasm-bindgen/crates/futures' }
+-wasm-bindgen-macro-support = { version = "0.2.127", path = "./wasm-bindgen/crates/macro-support" }
+-wasm-bindgen-shared = { version = "0.2.127", path = "./wasm-bindgen/crates/shared" }
+-wasm-bindgen-test = { version = "0.3.77", path = "./wasm-bindgen/crates/test" }
+-web-sys = { version = "0.3.104", path = './wasm-bindgen/crates/web-sys' }
++js-sys = { version = "0.3.103", path = './wasm-bindgen/crates/js-sys' }
++wasm-bindgen = { version = "0.2.126", path = './wasm-bindgen' }
++wasm-bindgen-cli-support = { version = "0.2.126", path = "./wasm-bindgen/crates/cli-support" }
++wasm-bindgen-futures = { version = "0.4.76", path = './wasm-bindgen/crates/futures' }
++wasm-bindgen-macro-support = { version = "0.2.126", path = "./wasm-bindgen/crates/macro-support" }
++wasm-bindgen-shared = { version = "0.2.126", path = "./wasm-bindgen/crates/shared" }
++wasm-bindgen-test = { version = "0.3.76", path = "./wasm-bindgen/crates/test" }
++web-sys = { version = "0.3.103", path = './wasm-bindgen/crates/web-sys' }
+diff --git a/worker/Cargo.toml b/worker/Cargo.toml
+index 573a8f2..d286f02 100644
+--- a/worker/Cargo.toml
++++ b/worker/Cargo.toml
+@@ -45,6 +45,9 @@ web-sys.workspace = true
+ worker-macros.workspace = true
+ worker-sys.workspace = true
+ 
++[target.'cfg(target_os = "emscripten")'.dependencies]
++tokio = { version = "1.28", default-features = false, features = ["rt", "time", "net"] }
++
+ [features]
+ queue = ["worker-macros/queue", "worker-sys/queue"]
+ d1 = ["worker-sys/d1"]
+diff --git a/worker/src/lib.rs b/worker/src/lib.rs
+index bc2cdc9..72097fe 100644
+--- a/worker/src/lib.rs
++++ b/worker/src/lib.rs
+@@ -223,6 +223,11 @@ mod container;
+ mod context;
+ mod cors;
+ pub mod crypto;
++#[cfg(target_os = "emscripten")]
++pub mod emscripten;
++// The embedding host owns Emscripten module instances and panic handling.
++// SDK reinitialization targets wasm-bindgen's standalone loader instead.
++#[cfg(not(target_os = "emscripten"))]
+ mod init;
+ // Require pub module for macro export
+ #[cfg(feature = "d1")]
+diff --git a/worker/src/socket.rs b/worker/src/socket.rs
+index bc46cd4..a32d2bd 100644
+--- a/worker/src/socket.rs
++++ b/worker/src/socket.rs
+@@ -289,6 +289,12 @@ impl AsyncWrite for Socket {
+     }
+ 
+     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
++        // An outstanding write owns the stream's writer lock. Finish it before
++        // closing the WritableStream, as required by AsyncWrite::poll_shutdown.
++        match self.as_mut().poll_flush(cx) {
++            Poll::Ready(Ok(())) => {}
++            pending_or_error => return pending_or_error,
++        }
+         fn handle_future(cx: &mut Context<'_>, mut fut: JsFuture) -> (Closing, Poll<IoResult<()>>) {
+             match fut.poll_unpin(cx) {
+                 Poll::Pending => (Closing::Pending(fut), Poll::Pending),
+diff --git a/worker/src/emscripten.rs b/worker/src/emscripten.rs
+new file mode 100644
+index 0000000..e3516ed
+--- /dev/null
++++ b/worker/src/emscripten.rs
+@@ -0,0 +1,56 @@
++//! Promise exports driven by the Emscripten hosted Tokio runtime.
++//!
++//! Each modularized Wasm instance owns its runtime. This adapter keeps Tokio
++//! timers and I/O on that executor when JavaScript invokes an async Rust export.
++//! It requires the Emscripten-enabled Tokio toolchain.
++
++use std::future::Future;
++use wasm_bindgen::prelude::*;
++
++thread_local! {
++    static RUNTIME: tokio::runtime::HostedRuntime = tokio::runtime::Builder::new_current_thread()
++        .enable_all()
++        .build_hosted_event_loop_runtime()
++        .expect("hosted runtime");
++}
++
++/// All exports in one wasm instance use the same runtime. Emscripten's module
++/// factory gives each world its own wasm memory, thread locals, and callbacks.
++pub fn future_to_promise<F>(future: F) -> js_sys::Promise
++where
++    F: Future<Output = Result<JsValue, JsValue>> + 'static,
++{
++    // Tokio catches future panics and delivers JoinError to the completion callback.
++    let mut future = std::panic::AssertUnwindSafe(Some(future));
++    js_sys::Promise::new(&mut move |resolve, reject| {
++        let future = future.take().expect("Promise executor runs once");
++        RUNTIME.with(|runtime| {
++            runtime.schedule(future, move |result| {
++                let result = result
++                    .unwrap_or_else(|error| Err(js_sys::Error::new(&error.to_string()).into()));
++                match result {
++                    Ok(value) => {
++                        let _ = resolve.call1(&JsValue::UNDEFINED, &value);
++                    }
++                    Err(error) => {
++                        let _ = reject.call1(&JsValue::UNDEFINED, &error);
++                    }
++                }
++            });
++            runtime.drive();
++        });
++    })
++}
++
++pub fn js_error(error: impl std::fmt::Display) -> JsValue {
++    js_sys::Error::new(&error.to_string()).into()
++}
++
++/// Convert the socket passed to an Emscripten export into the SDK's async stream.
++pub fn socket_from_value(value: JsValue) -> Result<crate::Socket, JsValue> {
++    use crate::FromSocket;
++    crate::Socket::from_raw(value.unchecked_into()).map_err(|error| {
++        let error: Box<dyn std::error::Error> = error.into();
++        js_error(error)
++    })
++}

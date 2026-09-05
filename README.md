@@ -1,0 +1,82 @@
+# Minecraft on Workers
+
+A [Pumpkin](https://github.com/Pumpkin-MC/Pumpkin) Minecraft Java server, compiled
+from Rust to WebAssembly and hosted in a Cloudflare Durable Object. Workers accepts
+the TCP connection; Pumpkin runs the game; a mounted SQLite filesystem stores the
+world.
+
+![Minecraft Java 26.2 multiplayer alongside Wrangler running the Pumpkin server](docs/images/minecraft-on-workers.png)
+
+```text
+Minecraft → Workers TCP ingress → MinecraftWorld → Pumpkin + SQLite
+```
+
+## Try it
+
+The supported build host is macOS with Homebrew. Install Git,
+[rustup](https://rustup.rs/), Python 3.11+, and Node 24+ (26 recommended).
+From a checkout of this repository:
+
+```sh
+brew install emscripten
+npm ci
+bash scripts/setup.sh
+npm run dev
+```
+
+Setup installs the pinned Rust toolchain, fetches dependency sources, and builds
+the matching wasm-bindgen CLI. `npm run dev` compiles Pumpkin and starts Wrangler.
+The first build takes several minutes; later builds use Cargo's cache.
+
+Connect **Minecraft Java 26.2** to **`localhost:25565`**. Status is available at
+**http://localhost:8787/**.
+
+The example uses offline mode, with encryption and compression disabled. Local
+listeners bind to loopback. `WORLD_NAME` in [wrangler.jsonc](wrangler.jsonc) selects
+the Durable Object; server settings are in [src/config.rs](src/config.rs).
+
+World data lives under `.data/workers/server/`. After the last connection closes,
+the server saves and stops. The next connection restores the same world. Wait for
+status to report `phase: "idle"` and a checkpoint timestamp before stopping
+Wrangler; changes held in memory can be lost if the process is terminated early.
+
+## Build and contribute
+
+```sh
+npm run build        # Compile the server without starting Wrangler
+npm test             # Two-player gameplay, a persistent block edit, and restart
+npm run test:scheduler
+npm run typecheck
+```
+
+The tests use separate data under `.data/probes/`. They verify that two clients
+observe the same block edit and that the edit and player position survive restart.
+
+See [development](docs/development.md), [architecture](docs/architecture.md), and
+[dependency pins](docs/dependencies.md) for build details and patch maintenance.
+
+## Deploy
+
+After setup, build the runtime and deploy the Worker:
+
+```sh
+npm run build
+npx wrangler deploy
+```
+
+Deployment uses standard SQLite-backed Durable Objects with Workers TCP ingress.
+See [memory usage](docs/memory-reduction.md) for the optimizations and measurements.
+Provision the public TCP endpoint separately and route it to this Worker's
+`connect` handler. The listener in `wrangler.jsonc` is for local development.
+
+## Credits and license
+
+Built on [Pumpkin](https://github.com/Pumpkin-MC/Pumpkin),
+[Guy Bedford's Rust/Emscripten work](https://github.com/guybedford),
+[workers-rs](https://github.com/cloudflare/workers-rs), Thomas Rubini's TCP ingress
+work, and [worker-fs-mount](https://github.com/danlapid/worker-fs-mount).
+
+Licensed under [GPL-3.0-only](LICENSE), consistent with Pumpkin. The
+[original MIT notice](LICENSES/rust-workers-minecraft-MIT.txt) is retained for
+inherited code. Dependencies retain their own licenses. This is an unofficial
+project and is not affiliated with Mojang or Microsoft.

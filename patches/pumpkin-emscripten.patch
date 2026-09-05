@@ -1,0 +1,2469 @@
+Subject: [PATCH] Support headless Pumpkin on a cooperative runtime
+
+Embedding Pumpkin in a Durable Object requires accepting host-provided
+streams and running without OS worker threads or native plugin runtimes.
+Add an injected-stream connection entry point and optional subsystems for
+NetherNet, plugin loading, the console, and system crash reporting. Native
+builds retain these subsystems and thread-backed execution by default.
+
+Share asynchronous ticker and chunk-scheduler loops between native and
+single-threaded builds. Route Rayon and blocking jobs through helpers that
+can run on the current thread, await scheduler notifications and results,
+and track cooperative tasks through shutdown. Match the Tokio requirement
+to the hosted-runtime fork and guard unsupported Emscripten system calls
+and synchronous HTTP lookups.
+
+Reserve save-queue capacity before transferring chunks or marking writes
+pending, and widen pending-write counters to usize. Drain late generation
+results with an elapsed-time timeout before the final save. Regression
+tests cover a full save queue and delayed results during shutdown.
+
+Resolve build-script Git watches through git rev-parse so nonexistent
+paths do not invalidate Cargo's cache on every build. The application
+Cargo.lock supplies the embedded dependency resolution; Pumpkin's lockfile
+is excluded from this patch.
+
+Base-commit: b5b9b9d7010e793806a83c495af223c67e1d35ee
+
+---
+diff --git a/Cargo.toml b/Cargo.toml
+index 143ba8a36..57314ca35 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -126,7 +126,7 @@ strip = false
+ debug = false
+ 
+ [workspace.dependencies]
+-tokio = { version = "1.53", default-features = false }
++tokio = { version = "1.52", default-features = false }
+ syn = { version = "3.0", default-features = false, features = ["full", "parsing", "printing", "proc-macro", "clone-impls", "derive"] }
+ 
+ thiserror = { version = "2.0", default-features = false }
+diff --git a/crates/pumpkin-util/Cargo.toml b/crates/pumpkin-util/Cargo.toml
+index f4fb121fb..0a4a30761 100644
+--- a/crates/pumpkin-util/Cargo.toml
++++ b/crates/pumpkin-util/Cargo.toml
+@@ -6,11 +6,13 @@ rust-version.workspace = true
+ license.workspace = true
+ 
+ [dependencies]
++rayon.workspace = true
+ pumpkin-nbt.workspace = true
+ pumpkin-codecs.workspace = true
+ serde.workspace = true
+ serde_json.workspace = true
+ bytes.workspace = true
++tokio = { workspace = true, features = ["rt"] }
+ 
+ num-derive.workspace = true
+ num-traits.workspace = true
+@@ -39,6 +41,8 @@ criterion = { workspace = true, features = ["html_reports"] }
+ 
+ [features]
+ default = []
++# Run CPU tasks on the current thread (see rayon_spawn and spawn_blocking).
++single-threaded = []
+ codegen = ["dep:syn", "dep:quote", "dep:proc-macro2"]
+ 
+ [[bench]]
+diff --git a/crates/pumpkin-util/src/lib.rs b/crates/pumpkin-util/src/lib.rs
+index 5119797bc..a1ae947a2 100644
+--- a/crates/pumpkin-util/src/lib.rs
++++ b/crates/pumpkin-util/src/lib.rs
+@@ -310,3 +310,42 @@ impl TryFrom<i32> for Hand {
+         }
+     }
+ }
++
++/// Spawn a fire-and-forget CPU task.
++///
++/// On normal targets this hands the closure to rayon's global thread pool. On
++/// `wasm32-unknown-emscripten` there are no OS threads and rayon has no worker to
++/// run an injected job (a bare `rayon::spawn` would never execute, so any code that
++/// then `.await`s the result over a channel would deadlock). There we run the
++/// closure inline on the calling thread instead.
++pub fn rayon_spawn<F: FnOnce() + Send + 'static>(f: F) {
++    #[cfg(feature = "single-threaded")]
++    {
++        f();
++    }
++    #[cfg(not(feature = "single-threaded"))]
++    {
++        rayon::spawn(f);
++    }
++}
++
++/// Schedule bounded synchronous work using the selected execution model.
++///
++/// Single-threaded builds run the closure in a regular Tokio task, preserving
++/// panic reporting through `JoinError` without creating a blocking-pool thread.
++/// The closure itself must finish without waiting for another task on this thread.
++/// JSPI does not make the public Tokio `spawn_blocking` API threadless.
++pub fn spawn_blocking<F, R>(f: F) -> tokio::task::JoinHandle<R>
++where
++    F: FnOnce() -> R + Send + 'static,
++    R: Send + 'static,
++{
++    #[cfg(feature = "single-threaded")]
++    {
++        tokio::spawn(async move { f() })
++    }
++    #[cfg(not(feature = "single-threaded"))]
++    {
++        tokio::task::spawn_blocking(f)
++    }
++}
+diff --git a/crates/pumpkin-world/Cargo.toml b/crates/pumpkin-world/Cargo.toml
+index f1675a8f2..82c219179 100644
+--- a/crates/pumpkin-world/Cargo.toml
++++ b/crates/pumpkin-world/Cargo.toml
+@@ -17,11 +17,9 @@ bytes.workspace = true
+ 
+ tokio = { workspace = true, features = [
+     "macros",
+-    # Maybe remove this in the future
+-    "rt-multi-thread",
++    "rt",
+     "sync",
+     "io-std",
+-    "signal",
+     "fs",
+     "io-util",
+     "time",
+@@ -56,6 +54,13 @@ rand.workspace = true
+ rustc-hash.workspace = true
+ slotmap.workspace = true
+ 
++[features]
++default = ["multi-threaded"]
++# Multi-core runtime + OS threads (rayon pool, tokio multi-thread scheduler).
++multi-threaded = ["tokio/rt-multi-thread", "tokio/signal"]
++# One cooperative thread: rayon runs inline, tokio current-thread, cooperative chunk scheduler.
++single-threaded = ["pumpkin-util/single-threaded"]
++
+ [dev-dependencies]
+ tempfile.workspace = true
+ criterion = { workspace = true, features = ["html_reports", "async_tokio"] }
+diff --git a/crates/pumpkin-world/src/chunk/format/anvil.rs b/crates/pumpkin-world/src/chunk/format/anvil.rs
+index 38de745f9..60cedf53d 100644
+--- a/crates/pumpkin-world/src/chunk/format/anvil.rs
++++ b/crates/pumpkin-world/src/chunk/format/anvil.rs
+@@ -798,7 +798,7 @@ impl<S: SingleChunkDataSerializer + 'static> ChunkSerializer for AnvilChunkFile<
+ 
+         let (tx, mut rx) = tokio::sync::mpsc::channel(chunk_items.len().max(1));
+ 
+-        rayon::spawn(move || {
++        pumpkin_util::rayon_spawn(move || {
+             use rayon::prelude::*;
+             chunk_items
+                 .into_par_iter()
+@@ -810,6 +810,9 @@ impl<S: SingleChunkDataSerializer + 'static> ChunkSerializer for AnvilChunkFile<
+                             Err(err) => LoadedData::Error((chunk, err)),
+                         },
+                     );
++                    #[cfg(feature = "single-threaded")]
++                    let _ = tx.try_send(result);
++                    #[cfg(not(feature = "single-threaded"))]
+                     let _ = tx.blocking_send(result);
+                 });
+         });
+diff --git a/crates/pumpkin-world/src/chunk/format/linear.rs b/crates/pumpkin-world/src/chunk/format/linear.rs
+index 3927c66fc..fd76019bf 100644
+--- a/crates/pumpkin-world/src/chunk/format/linear.rs
++++ b/crates/pumpkin-world/src/chunk/format/linear.rs
+@@ -599,7 +599,7 @@ impl<S: SingleChunkDataSerializer + 'static> ChunkSerializer for LinearV2File<S>
+ 
+         let (tx, mut rx) = tokio::sync::mpsc::channel(chunk_items.len().max(1));
+ 
+-        rayon::spawn(move || {
++        pumpkin_util::rayon_spawn(move || {
+             use rayon::prelude::*;
+             chunk_items.into_par_iter().for_each(|(chunk, data)| {
+                 let result = data.map_or_else(
+@@ -609,6 +609,9 @@ impl<S: SingleChunkDataSerializer + 'static> ChunkSerializer for LinearV2File<S>
+                         Err(err) => LoadedData::Error((chunk, err)),
+                     },
+                 );
++                #[cfg(feature = "single-threaded")]
++                let _ = tx.try_send(result);
++                #[cfg(not(feature = "single-threaded"))]
+                 let _ = tx.blocking_send(result);
+             });
+         });
+diff --git a/crates/pumpkin-world/src/chunk/format/pump.rs b/crates/pumpkin-world/src/chunk/format/pump.rs
+index f1c44adc7..b5a8dd1d7 100644
+--- a/crates/pumpkin-world/src/chunk/format/pump.rs
++++ b/crates/pumpkin-world/src/chunk/format/pump.rs
+@@ -147,7 +147,7 @@ where
+ 
+         let (tx, mut rx) = tokio::sync::mpsc::channel(chunk_items.len().max(1));
+ 
+-        rayon::spawn(move || {
++        pumpkin_util::rayon_spawn(move || {
+             use rayon::prelude::*;
+             chunk_items.into_par_iter().for_each(|(pos, chunk_bytes)| {
+                 let data_res = chunk_bytes.map_or_else(
+@@ -170,6 +170,9 @@ where
+                         }
+                     },
+                 );
++                #[cfg(feature = "single-threaded")]
++                let _ = tx.try_send(data_res);
++                #[cfg(not(feature = "single-threaded"))]
+                 let _ = tx.blocking_send(data_res);
+             });
+         });
+diff --git a/crates/pumpkin-world/src/chunk/io/mod.rs b/crates/pumpkin-world/src/chunk/io/mod.rs
+index c4daf5bb5..78271c344 100644
+--- a/crates/pumpkin-world/src/chunk/io/mod.rs
++++ b/crates/pumpkin-world/src/chunk/io/mod.rs
+@@ -13,7 +13,7 @@ where
+     T: Send + 'static,
+     F: FnOnce() -> T + Send + 'static,
+ {
+-    tokio::task::spawn_blocking(task).await
++    pumpkin_util::spawn_blocking(task).await
+ }
+ 
+ /// The result of loading a chunk data.
+diff --git a/crates/pumpkin-world/src/chunk_system/channel.rs b/crates/pumpkin-world/src/chunk_system/channel.rs
+index 190d578fa..c138b1f50 100644
+--- a/crates/pumpkin-world/src/chunk_system/channel.rs
++++ b/crates/pumpkin-world/src/chunk_system/channel.rs
+@@ -14,6 +14,7 @@ pub type LevelChange = (
+ pub struct LevelChannel {
+     pub value: Mutex<(Option<LevelChange>, Option<Vec<ChunkPos>>)>,
+     pub notify: Condvar,
++    wake: tokio::sync::Notify,
+ }
+ 
+ impl Default for LevelChannel {
+@@ -28,6 +29,7 @@ impl LevelChannel {
+         Self {
+             value: Mutex::new((None, None)),
+             notify: Condvar::new(),
++            wake: tokio::sync::Notify::const_new(),
+         }
+     }
+     pub fn set_both(
+@@ -67,6 +69,7 @@ impl LevelChannel {
+             value.0 = Some(new_value);
+         }
+         self.notify.notify_one();
++        self.wake.notify_one();
+     }
+     pub fn set_level(
+         &self,
+@@ -103,6 +106,7 @@ impl LevelChannel {
+             value.0 = Some(new_value);
+         }
+         self.notify.notify_one();
++        self.wake.notify_one();
+     }
+     pub fn set_priority(&self, pos: Vec<ChunkPos>) {
+         // debug!("set new priority");
+@@ -111,6 +115,10 @@ impl LevelChannel {
+             .unwrap_or_else(std::sync::PoisonError::into_inner)
+             .1 = Some(pos);
+         self.notify.notify_one();
++        self.wake.notify_one();
++    }
++    pub async fn changed(&self) {
++        self.wake.notified().await;
+     }
+     pub fn get(&self) -> (Option<LevelChange>, Option<Vec<ChunkPos>>) {
+         let mut lock = self
+@@ -152,5 +160,6 @@ impl LevelChannel {
+             .unwrap_or_else(std::sync::PoisonError::into_inner);
+         drop(val);
+         self.notify.notify_one();
++        self.wake.notify_one();
+     }
+ }
+diff --git a/crates/pumpkin-world/src/chunk_system/mod.rs b/crates/pumpkin-world/src/chunk_system/mod.rs
+index f670ad37b..b9d9a8671 100644
+--- a/crates/pumpkin-world/src/chunk_system/mod.rs
++++ b/crates/pumpkin-world/src/chunk_system/mod.rs
+@@ -13,7 +13,7 @@ pub type HashSetType<K> = rustc_hash::FxHashSet<K>;
+ pub type ChunkPos = pumpkin_util::math::vector2::Vector2<i32>;
+ pub type ChunkLevel = HashMapType<ChunkPos, i8>;
+ pub type IOLock = std::sync::Arc<(
+-    std::sync::Mutex<HashMapType<ChunkPos, u8>>,
++    std::sync::Mutex<HashMapType<ChunkPos, usize>>,
+     tokio::sync::Notify,
+ )>;
+ 
+diff --git a/crates/pumpkin-world/src/chunk_system/schedule.rs b/crates/pumpkin-world/src/chunk_system/schedule.rs
+index 145e15de8..2942a1d31 100644
+--- a/crates/pumpkin-world/src/chunk_system/schedule.rs
++++ b/crates/pumpkin-world/src/chunk_system/schedule.rs
+@@ -69,13 +69,14 @@ pub struct GenerationSchedule {
+     running_task_count: u16,
+     max_in_flight: u16,
+     queue_dirty: bool,
+-    recv_chunk: crossbeam::channel::Receiver<(ChunkPos, RecvChunk)>,
++    recv_chunk: tokio::sync::mpsc::UnboundedReceiver<(ChunkPos, RecvChunk)>,
+     io_read: tokio::sync::mpsc::Sender<Vec<ChunkPos>>,
+     io_write: tokio::sync::mpsc::Sender<Vec<(ChunkPos, Chunk)>>,
+-    send_chunk: crossbeam::channel::Sender<(ChunkPos, RecvChunk)>,
++    send_chunk: tokio::sync::mpsc::UnboundedSender<(ChunkPos, RecvChunk)>,
+     listener: Arc<ChunkListener>,
+     lighting_config: LightingEngineConfig,
+     last_unload: std::time::Instant,
++    #[cfg(not(feature = "single-threaded"))]
+     generation_pool: Arc<rayon::ThreadPool>,
+ }
+ 
+@@ -105,7 +106,7 @@ impl GenerationSchedule {
+         listener: Arc<ChunkListener>,
+         thread_tracker: &mut Vec<thread::JoinHandle<()>>,
+     ) {
+-        let (send_chunk, recv_chunk) = crossbeam::channel::unbounded();
++        let (send_chunk, recv_chunk) = tokio::sync::mpsc::unbounded_channel();
+ 
+         let (send_read_io, recv_read_io) = tokio::sync::mpsc::channel(io_read_thread_count + 5);
+         let recv_read_io = Arc::new(tokio::sync::Mutex::new(recv_read_io));
+@@ -132,51 +133,63 @@ impl GenerationSchedule {
+             io_lock.clone(),
+         ));
+ 
+-        let cpus = thread::available_parallelism().map_or(1, std::num::NonZero::get);
+-        let gen_threads = (cpus / 2).clamp(2, 16);
+-        let generation_pool = Arc::new(
+-            rayon::ThreadPoolBuilder::new()
+-                .num_threads(gen_threads)
+-                .thread_name(|i| format!("ChunkGen-{i}"))
+-                .build()
+-                .expect("Failed to build Chunk Generation ThreadPool"),
+-        );
+-        let max_in_flight = (gen_threads * 2) as u16;
+-
+-        let level_sched = level;
+-        let lighting_config = level_sched.lighting_config;
+-        let handle = thread::Builder::new()
+-            .name("Schedule".to_string())
+-            .spawn(move || {
+-                let scheduler = Self {
+-                    queue: BinaryHeap::new(),
+-                    graph: DAG::default(),
+-                    last_level: ChunkLevel::default(),
+-                    last_high_priority: Vec::new(),
+-                    send_level: level_channel,
+-                    public_chunk_map: level_sched.loaded_chunks.clone(),
+-                    loaded_chunk_changes: level_sched.loaded_chunk_changes.clone(),
+-                    unload_chunks: HashSetType::default(),
+-                    waiting_for_chunks: HashSetType::default(),
+-                    io_lock,
+-                    running_task_count: 0,
+-                    max_in_flight,
+-                    queue_dirty: false,
+-                    recv_chunk,
+-                    io_read: send_read_io,
+-                    io_write: send_write_io,
+-                    send_chunk,
+-                    listener,
+-                    chunk_map: HashMap::default(),
+-                    lighting_config,
+-                    last_unload: std::time::Instant::now(),
+-                    generation_pool,
+-                };
+-                scheduler.work(&level_sched);
+-            })
+-            .expect("Failed to spawn Scheduler Thread");
+-
+-        thread_tracker.push(handle);
++        #[cfg(not(feature = "single-threaded"))]
++        let generation_pool = {
++            let cpus = thread::available_parallelism().map_or(1, std::num::NonZero::get);
++            Arc::new(
++                rayon::ThreadPoolBuilder::new()
++                    .num_threads((cpus / 2).clamp(2, 16))
++                    .thread_name(|i| format!("ChunkGen-{i}"))
++                    .build()
++                    .expect("Failed to build Chunk Generation ThreadPool"),
++            )
++        };
++        #[cfg(not(feature = "single-threaded"))]
++        let max_in_flight = (generation_pool.current_num_threads() * 2) as u16;
++        #[cfg(feature = "single-threaded")]
++        let max_in_flight = 4;
++        let scheduler = Self {
++            queue: BinaryHeap::new(),
++            graph: DAG::default(),
++            last_level: ChunkLevel::default(),
++            last_high_priority: Vec::new(),
++            send_level: level_channel,
++            public_chunk_map: level.loaded_chunks.clone(),
++            loaded_chunk_changes: level.loaded_chunk_changes.clone(),
++            unload_chunks: HashSetType::default(),
++            waiting_for_chunks: HashSetType::default(),
++            io_lock,
++            running_task_count: 0,
++            max_in_flight,
++            queue_dirty: false,
++            recv_chunk,
++            io_read: send_read_io,
++            io_write: send_write_io,
++            send_chunk,
++            listener,
++            chunk_map: HashMap::default(),
++            lighting_config: level.lighting_config,
++            last_unload: std::time::Instant::now(),
++            #[cfg(not(feature = "single-threaded"))]
++            generation_pool,
++        };
++        #[cfg(not(feature = "single-threaded"))]
++        {
++            let runtime = tokio::runtime::Handle::current();
++            thread_tracker.push(
++                thread::Builder::new()
++                    .name("Schedule".into())
++                    .spawn(move || runtime.block_on(scheduler.work(level)))
++                    .expect("Failed to spawn Scheduler Thread"),
++            );
++        }
++        #[cfg(feature = "single-threaded")]
++        {
++            let _ = thread_tracker;
++            level
++                .chunk_system_tasks
++                .spawn(scheduler.work(level.clone()));
++        }
+     }
+ 
+     fn apply_lighting_override(&self, chunk: &SyncChunk) {
+@@ -849,11 +862,16 @@ impl GenerationSchedule {
+         }
+     }
+ 
+-    fn process_unload_queue(&mut self) {
++    async fn process_unload_queue(&mut self) {
+         if self.unload_chunks.is_empty() {
+             return;
+         }
+ 
++        let sender = self.io_write.clone();
++        let permit = sender
++            .reserve()
++            .await
++            .expect("Chunk writer stopped before unload completed");
+         let mut unload_chunks = HashSetType::default();
+         swap(&mut unload_chunks, &mut self.unload_chunks);
+         let mut chunks = Vec::with_capacity(unload_chunks.len());
+@@ -914,15 +932,15 @@ impl GenerationSchedule {
+             *data.entry(*pos).or_insert(0) += 1;
+         }
+         drop(data);
+-        if let Err(e) = self.io_write.blocking_send(chunks) {
+-            error!(
+-                "Failed to send chunks to io write thread during save (may have shut down): {:?}",
+-                e
+-            );
+-        }
++        permit.send(chunks);
+     }
+ 
+-    fn save_all_chunk(&mut self, save_proto_chunk: bool) {
++    async fn save_all_chunk(&mut self, save_proto_chunk: bool) {
++        let sender = self.io_write.clone();
++        let permit = sender
++            .reserve()
++            .await
++            .expect("Chunk writer stopped before save completed");
+         let mut chunks = Vec::with_capacity(self.chunk_map.len());
+ 
+         for (pos, holder) in &mut self.chunk_map {
+@@ -969,9 +987,7 @@ impl GenerationSchedule {
+         }
+         drop(data);
+ 
+-        if let Err(e) = self.io_write.blocking_send(chunks) {
+-            error!("Failed to send chunks to io write thread: {:?}", e);
+-        }
++        permit.send(chunks);
+     }
+ 
+     fn drop_node(&mut self, node: NodeKey) {
+@@ -1254,25 +1270,22 @@ impl GenerationSchedule {
+     }
+ 
+     #[expect(clippy::too_many_lines)]
+-    fn work(mut self, level: &Arc<Level>) {
+-        debug!(
+-            "schedule thread start id: {:?} name: {}",
+-            thread::current().id(),
+-            thread::current().name().unwrap_or("unknown")
+-        );
++    async fn work(mut self, level: Arc<Level>) {
++        debug!("Chunk scheduler started");
+         loop {
++            ::tokio::task::yield_now().await;
+             if level.should_unload.swap(false, Relaxed) {
+                 self.garbage_collect_dependencies();
+-                self.process_unload_queue();
++                self.process_unload_queue().await;
+             }
+             if level.should_save.swap(false, Relaxed) {
+-                self.save_all_chunk(false);
++                self.save_all_chunk(false).await;
+             }
+             if level.shut_down_chunk_system.load(Relaxed) {
+                 info!("Saving chunks before shutdown...");
+                 self.garbage_collect_dependencies();
+-                self.process_unload_queue();
+-                self.save_all_chunk(true);
++                self.process_unload_queue().await;
++                self.save_all_chunk(true).await;
+                 break;
+             }
+ 
+@@ -1287,7 +1300,7 @@ impl GenerationSchedule {
+             // is what puts stale dependency holders into the queue in the first place.
+             if self.last_unload.elapsed() >= std::time::Duration::from_secs(1) {
+                 self.garbage_collect_dependencies();
+-                self.process_unload_queue();
++                self.process_unload_queue().await;
+                 self.last_unload = std::time::Instant::now();
+             }
+ 
+@@ -1308,7 +1321,7 @@ impl GenerationSchedule {
+                 if level.shut_down_chunk_system.load(Relaxed) {
+                     self.queue.push(task);
+                     info!("Shutdown detected during task processing, saving chunks...");
+-                    self.save_all_chunk(true);
++                    self.save_all_chunk(true).await;
+                     break 'out2;
+                 }
+ 
+@@ -1400,11 +1413,12 @@ impl GenerationSchedule {
+                         if io_batch.len() >= 16
+                             && self
+                                 .io_read
+-                                .blocking_send(std::mem::take(&mut io_batch))
++                                .send(std::mem::take(&mut io_batch))
++                                .await
+                                 .is_err()
+                         {
+                             info!("IO read thread closed, saving remaining chunks...");
+-                            self.save_all_chunk(true);
++                            self.save_all_chunk(true).await;
+                             break 'out2;
+                         }
+                     } else {
+@@ -1412,11 +1426,12 @@ impl GenerationSchedule {
+                         if !io_batch.is_empty()
+                             && self
+                                 .io_read
+-                                .blocking_send(std::mem::take(&mut io_batch))
++                                .send(std::mem::take(&mut io_batch))
++                                .await
+                                 .is_err()
+                         {
+                             info!("IO read thread closed, saving remaining chunks...");
+-                            self.save_all_chunk(true);
++                            self.save_all_chunk(true).await;
+                             break 'out2;
+                         }
+ 
+@@ -1552,12 +1567,19 @@ impl GenerationSchedule {
+                         let send_chunk = self.send_chunk.clone();
+                         let level = level.clone();
+ 
+-                        self.generation_pool.spawn(move || {
++                        let generate = move || {
+                             let result = crate::chunk_system::worker_logic::run_generation(
+                                 pos, cache, stage, &level,
+                             );
+                             let _ = send_chunk.send((pos, result));
+-                        });
++                        };
++                        #[cfg(not(feature = "single-threaded"))]
++                        self.generation_pool.spawn(generate);
++                        #[cfg(feature = "single-threaded")]
++                        {
++                            generate();
++                            tokio::task::yield_now().await;
++                        }
+                     }
+                 }
+             }
+@@ -1566,82 +1588,39 @@ impl GenerationSchedule {
+             if !io_batch.is_empty()
+                 && self
+                     .io_read
+-                    .blocking_send(std::mem::take(&mut io_batch))
++                    .send(std::mem::take(&mut io_batch))
++                    .await
+                     .is_err()
+             {
+                 info!("IO read thread closed, saving remaining chunks...");
+-                self.save_all_chunk(true);
++                self.save_all_chunk(true).await;
+             }
+ 
+-            // 5. Wait for work or results
+-            if self.queue.is_empty() {
+-                if self.running_task_count > 0 {
+-                    match self.recv_chunk.recv_timeout(Duration::from_millis(5)) {
+-                        Ok((pos, data)) => {
+-                            self.receive_chunk(pos, data);
+-                            if self.resort_work(self.send_level.get()) {
+-                                self.garbage_collect_dependencies();
+-                            }
+-                        }
+-                        Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+-                            // Periodically check LevelChannel for new requests
+-                            if self.resort_work(self.send_level.get()) {
+-                                self.garbage_collect_dependencies();
+-                            }
+-                        }
+-                        Err(crossbeam::channel::RecvTimeoutError::Disconnected) => break,
+-                    }
+-                } else {
+-                    // No tasks in flight, check for any unblocked waiting tasks or stranded ready tasks
+-                    self.check_waiting_tasks();
+-                    let restored = Self::restore_ready_tasks(
+-                        &mut self.graph,
+-                        &mut self.queue,
+-                        &self.chunk_map,
+-                        &self.last_level,
+-                        &self.last_high_priority,
+-                        &self.waiting_for_chunks,
+-                    );
+-                    if restored > 0 || !self.queue.is_empty() {
+-                        debug!(
+-                            "Restored {restored} stranded ready chunk tasks to generation queue"
+-                        );
+-                        if self.queue_dirty {
+-                            self.sort_queue();
+-                            self.queue_dirty = false;
+-                        }
+-                        continue;
+-                    }
++            if self.queue.is_empty() && self.running_task_count == 0 {
++                self.check_waiting_tasks();
++                Self::restore_ready_tasks(
++                    &mut self.graph,
++                    &mut self.queue,
++                    &self.chunk_map,
++                    &self.last_level,
++                    &self.last_high_priority,
++                    &self.waiting_for_chunks,
++                );
++                if self.queue.is_empty() {
+                     debug_assert!(self.debug_check());
+-                    debug_assert_eq!(self.running_task_count, 0);
+-                    if self.resort_work(self.send_level.wait_and_get(level)) {
+-                        self.garbage_collect_dependencies();
+-                    }
+                 }
+-                if self.queue_dirty {
+-                    self.sort_queue();
+-                    self.queue_dirty = false;
+-                }
+-            } else if self.running_task_count >= self.max_in_flight {
+-                // Queue has tasks, but we are at maximum in-flight capacity.
+-                // Wait for an in-flight worker to finish instead of busy-spinning.
+-                match self.recv_chunk.recv_timeout(Duration::from_millis(5)) {
+-                    Ok((pos, data)) => {
++            }
++            if self.queue.is_empty() || self.running_task_count >= self.max_in_flight {
++                tokio::select! {
++                    result = self.recv_chunk.recv() => {
++                        let Some((pos, data)) = result else { break };
+                         self.receive_chunk(pos, data);
+-                        if self.resort_work(self.send_level.get()) {
+-                            self.garbage_collect_dependencies();
+-                        }
+-                    }
+-                    Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+-                        if self.resort_work(self.send_level.get()) {
+-                            self.garbage_collect_dependencies();
+-                        }
+                     }
+-                    Err(crossbeam::channel::RecvTimeoutError::Disconnected) => break,
++                    () = self.send_level.changed() => {}
++                    () = tokio::time::sleep(Duration::from_millis(50)) => {}
+                 }
+-                if self.queue_dirty {
+-                    self.sort_queue();
+-                    self.queue_dirty = false;
++                if self.resort_work(self.send_level.get()) {
++                    self.garbage_collect_dependencies();
+                 }
+             }
+         }
+@@ -1649,24 +1628,10 @@ impl GenerationSchedule {
+             "schedule: waiting for {} generation tasks to finish",
+             self.running_task_count
+         );
+-        let mut wait_iterations = 0;
+-        let max_wait_iterations = 100; // 5 seconds max wait
+-        while self.running_task_count > 0 && wait_iterations < max_wait_iterations {
+-            if let Ok((pos, data)) = self.recv_chunk.try_recv() {
+-                self.receive_chunk(pos, data);
+-                wait_iterations = 0;
+-            } else {
+-                wait_iterations += 1;
+-                if wait_iterations % 20 == 0 {
+-                    warn!(
+-                        "Still waiting for {} tasks to complete (waited {}ms)",
+-                        self.running_task_count,
+-                        wait_iterations * 50
+-                    );
+-                }
+-                thread::sleep(Duration::from_millis(50));
+-            }
+-        }
++        self.drain_results().await;
++        // Results received during the drain may contain dirty chunks that were
++        // absent from the first save. Queue them before closing the writer.
++        self.save_all_chunk(true).await;
+ 
+         if self.running_task_count > 0 {
+             warn!(
+@@ -1716,6 +1681,15 @@ impl GenerationSchedule {
+         self.graph.edges.clear();
+     }
+ 
++    async fn drain_results(&mut self) {
++        while self.running_task_count > 0 {
++            match tokio::time::timeout(Duration::from_secs(5), self.recv_chunk.recv()).await {
++                Ok(Some((pos, data))) => self.receive_chunk(pos, data),
++                Ok(None) | Err(_) => break,
++            }
++        }
++    }
++
+     fn debug_check(&self) -> bool {
+         if !self.graph.nodes.is_empty() {
+             for (key, value) in &self.graph.nodes {
+@@ -1746,3 +1720,123 @@ impl GenerationSchedule {
+         true
+     }
+ }
++
++#[cfg(all(test, feature = "single-threaded"))]
++mod storage_tests {
++    use super::*;
++    use crate::generation::generator::{CustomChunkGenerator, WorldGenerator};
++    use pumpkin_data::dimension::Dimension;
++
++    struct EmptyGenerator;
++    impl CustomChunkGenerator for EmptyGenerator {
++        fn dimension(&self) -> &Dimension {
++            &Dimension::OVERWORLD
++        }
++        fn seed(&self) -> u64 {
++            0
++        }
++    }
++
++    fn chunk(stage: StagedChunkEnum) -> Chunk {
++        let generator = WorldGenerator::Custom(Arc::new(EmptyGenerator));
++        let mut chunk = crate::ProtoChunk::new(0, 0, &generator);
++        chunk.stage = stage;
++        Chunk::Proto(Box::new(chunk))
++    }
++
++    fn scheduler() -> (
++        GenerationSchedule,
++        tokio::sync::mpsc::Receiver<Vec<(ChunkPos, Chunk)>>,
++    ) {
++        let (send_chunk, recv_chunk) = tokio::sync::mpsc::unbounded_channel();
++        let (io_write, receiver) = tokio::sync::mpsc::channel(1);
++        (
++            GenerationSchedule {
++                queue: BinaryHeap::new(),
++                graph: DAG::default(),
++                last_level: ChunkLevel::default(),
++                last_high_priority: Vec::new(),
++                send_level: Arc::new(LevelChannel::new()),
++                public_chunk_map: Arc::new(DashMap::new()),
++                loaded_chunk_changes: Arc::new(crossbeam::queue::SegQueue::new()),
++                chunk_map: HashMap::new(),
++                unload_chunks: HashSetType::default(),
++                waiting_for_chunks: HashSetType::default(),
++                io_lock: Arc::new((
++                    Mutex::new(HashMapType::default()),
++                    tokio::sync::Notify::new(),
++                )),
++                running_task_count: 0,
++                max_in_flight: 4,
++                queue_dirty: false,
++                recv_chunk,
++                io_read: tokio::sync::mpsc::channel(1).0,
++                io_write,
++                send_chunk,
++                listener: Arc::new(ChunkListener::new()),
++                lighting_config: LightingEngineConfig::Default,
++                last_unload: std::time::Instant::now(),
++            },
++            receiver,
++        )
++    }
++
++    #[tokio::test]
++    async fn full_save_queue_retains_the_batch_until_capacity_is_available() {
++        let (mut scheduler, mut receiver) = scheduler();
++        let pos = ChunkPos::new(0, 0);
++        scheduler.chunk_map.insert(
++            pos,
++            ChunkHolder {
++                chunk: Some(chunk(StagedChunkEnum::Noise)),
++                ..Default::default()
++            },
++        );
++        scheduler.io_write.send(Vec::new()).await.unwrap();
++        let lock = scheduler.io_lock.clone();
++        let save = scheduler.save_all_chunk(true);
++        tokio::pin!(save);
++        assert!(
++            tokio::time::timeout(Duration::from_millis(20), &mut save)
++                .await
++                .is_err()
++        );
++        assert!(lock.0.lock().unwrap().is_empty());
++        receiver.recv().await.unwrap();
++        save.await;
++        let batch = receiver.recv().await.unwrap();
++        assert_eq!(batch.len(), 1);
++        assert_eq!(batch[0].0, pos);
++        assert_eq!(lock.0.lock().unwrap().get(&pos), Some(&1));
++    }
++
++    #[tokio::test]
++    async fn shutdown_waits_for_delayed_results_instead_of_counting_yields() {
++        let (mut scheduler, _receiver) = scheduler();
++        let pos = ChunkPos::new(0, 0);
++        let occupied = scheduler
++            .graph
++            .nodes
++            .insert(Node::new(pos, StagedChunkEnum::None));
++        scheduler.chunk_map.insert(
++            pos,
++            ChunkHolder {
++                occupied,
++                ..Default::default()
++            },
++        );
++        scheduler.running_task_count = 1;
++        let send = scheduler.send_chunk.clone();
++        let producer = tokio::spawn(async move {
++            tokio::time::sleep(Duration::from_millis(100)).await;
++            assert!(
++                send.send((pos, RecvChunk::IO(chunk(StagedChunkEnum::Empty))))
++                    .is_ok()
++            );
++        });
++        scheduler.drain_results().await;
++        assert_eq!(scheduler.running_task_count, 0);
++        assert!(scheduler.chunk_map[&pos].chunk.is_some());
++        producer.await.unwrap();
++    }
++}
+diff --git a/crates/pumpkin-world/src/chunk_system/worker_logic.rs b/crates/pumpkin-world/src/chunk_system/worker_logic.rs
+index b50ac05c9..281fa41f0 100644
+--- a/crates/pumpkin-world/src/chunk_system/worker_logic.rs
++++ b/crates/pumpkin-world/src/chunk_system/worker_logic.rs
+@@ -90,7 +90,7 @@ fn process_loaded_chunk(chunk: Arc<crate::chunk::ChunkData>, level: &Level) -> C
+ 
+ pub async fn io_read_work(
+     recv: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Vec<ChunkPos>>>>,
+-    send: crossbeam::channel::Sender<(ChunkPos, RecvChunk)>,
++    send: tokio::sync::mpsc::UnboundedSender<(ChunkPos, RecvChunk)>,
+     level: Arc<Level>,
+     lock: IOLock,
+ ) {
+diff --git a/crates/pumpkin-world/src/level.rs b/crates/pumpkin-world/src/level.rs
+index fbc69749a..533b09d21 100644
+--- a/crates/pumpkin-world/src/level.rs
++++ b/crates/pumpkin-world/src/level.rs
+@@ -316,7 +316,7 @@ impl Level {
+ 
+     pub fn spawn_entity_generation(self: &Arc<Self>, pos: Vector2<i32>) {
+         let level = self.clone();
+-        rayon::spawn(move || {
++        pumpkin_util::rayon_spawn(move || {
+             let arc_chunk = Arc::new(ChunkEntityData {
+                 x: pos.x,
+                 z: pos.y,
+@@ -354,43 +354,46 @@ impl Level {
+         self.tasks.close();
+         self.chunk_system_tasks.close();
+ 
+-        let handles = {
+-            let mut lock = self
+-                .thread_tracker
+-                .lock()
+-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+-            lock.drain(..).collect::<Vec<_>>()
+-        };
++        #[cfg(not(feature = "single-threaded"))]
++        {
++            let handles = {
++                let mut lock = self
++                    .thread_tracker
++                    .lock()
++                    .unwrap_or_else(std::sync::PoisonError::into_inner);
++                lock.drain(..).collect::<Vec<_>>()
++            };
+ 
+-        let handle_count = handles.len();
+-        info!("Joining {} threads for {}...", handle_count, world_id);
+-        let (tx, rx) = tokio::sync::oneshot::channel();
+-        let _ = std::thread::Builder::new()
+-            .name("Thread-Joiner".into())
+-            .spawn(move || {
+-                let mut failed_count = 0;
+-                for handle in handles {
+-                    if handle.join().is_err() {
+-                        failed_count += 1;
++            let handle_count = handles.len();
++            info!("Joining {} threads for {}...", handle_count, world_id);
++            let (tx, rx) = tokio::sync::oneshot::channel();
++            let _ = std::thread::Builder::new()
++                .name("Thread-Joiner".into())
++                .spawn(move || {
++                    let mut failed_count = 0;
++                    for handle in handles {
++                        if handle.join().is_err() {
++                            failed_count += 1;
++                        }
++                    }
++                    let _ = tx.send(failed_count);
++                });
++
++            match timeout(Duration::from_secs(3), rx).await {
++                Ok(Ok(failed_count)) => {
++                    if failed_count > 0 {
++                        warn!(
++                            "{} threads failed to join properly for {}.",
++                            failed_count, world_id
++                        );
+                     }
+                 }
+-                let _ = tx.send(failed_count);
+-            });
+-
+-        match timeout(Duration::from_secs(3), rx).await {
+-            Ok(Ok(failed_count)) => {
+-                if failed_count > 0 {
+-                    warn!(
+-                        "{} threads failed to join properly for {}.",
+-                        failed_count, world_id
+-                    );
++                Ok(Err(_)) => {
++                    warn!("Thread join task panicked for {}.", world_id);
++                }
++                Err(_) => {
++                    warn!("Timed out waiting for threads to join for {}.", world_id);
+                 }
+-            }
+-            Ok(Err(_)) => {
+-                warn!("Thread join task panicked for {}.", world_id);
+-            }
+-            Err(_) => {
+-                warn!("Timed out waiting for threads to join for {}.", world_id);
+             }
+         }
+ 
+diff --git a/crates/pumpkin-world/src/world_info/anvil.rs b/crates/pumpkin-world/src/world_info/anvil.rs
+index ebbcb49b6..46975c6c5 100644
+--- a/crates/pumpkin-world/src/world_info/anvil.rs
++++ b/crates/pumpkin-world/src/world_info/anvil.rs
+@@ -425,6 +425,11 @@ impl WorldInfoWriter for AnvilLevelInfo {
+         level_data.last_played = since_the_epoch.as_millis() as i64;
+         stamp_current_version(&mut level_data);
+ 
++        // Ensure the world directory exists before writing level.dat. On a brand-new
++        // world this runs before the chunk system creates the folder, so File::create
++        // would otherwise fail with NotFound ("Info not found!").
++        std::fs::create_dir_all(level_folder)?;
++
+         // ── Write level.dat ───────────────────────────────────────────────────
+         let path = level_folder.join(LEVEL_DAT_FILE_NAME);
+         let path_new = level_folder.join("level.dat_new");
+diff --git a/crates/pumpkin/Cargo.toml b/crates/pumpkin/Cargo.toml
+index 6ade6bfcb..c9230c03a 100644
+--- a/crates/pumpkin/Cargo.toml
++++ b/crates/pumpkin/Cargo.toml
+@@ -17,6 +17,14 @@ LegalCopyright = "Copyright © 2026 Aleksander Medvedev"
+ [lib]
+ doctest = false
+ 
++# The native server binary uses `#[tokio::main]` (multi_thread) + tokio::signal, so it
++# requires the multi-threaded runtime. Single-threaded hosts (e.g. the wasm demo) link the
++# library instead.
++[[bin]]
++name = "pumpkin"
++path = "src/main.rs"
++required-features = ["multi-threaded"]
++
+ [dependencies]
+ # pumpkin
+ arc-swap.workspace = true
+@@ -35,20 +43,22 @@ pumpkin-gametest = { path = "../pumpkin-gametest" }
+ dashmap.workspace = true
+ crossbeam.workspace = true
+ uuid.workspace = true
++# Base tokio features (work on the single-thread emscripten hosted runtime).
++# `rt-multi-thread` and `signal` need OS threads / signals, so they are enabled
++# only off-emscripten (see the target-specific dependency below).
+ tokio = { workspace = true, features = [
+     "macros",
+     "net",
+-    "rt-multi-thread",
++    "rt",
+     "sync",
+     "io-std",
+-    "signal",
+     "fs",
+     "io-util",
+     "time",
+ ] }
+ thiserror.workspace = true
+-futures.workspace = true
+-notify.workspace = true
++futures = { workspace = true, features = ["executor"] }
++notify = { workspace = true, optional = true }
+ 
+ # config
+ serde.workspace = true
+@@ -64,7 +74,7 @@ rand.workspace = true
+ num-bigint.workspace = true
+ 
+ # Console line reading
+-rustyline.workspace = true
++rustyline = { workspace = true, optional = true }
+ 
+ # encryption
+ aes.workspace = true
+@@ -73,8 +83,8 @@ rsa.workspace = true
+ # verification & WASM parsing
+ ed25519-dalek.workspace = true
+ hex.workspace = true
+-wasmparser.workspace = true
+-wasm-encoder = "0.258"
++wasmparser = { workspace = true, optional = true }
++wasm-encoder = { version = "0.258", optional = true }
+ 
+ # authentication
+ reqwest = { workspace = true, features = ["json"] }
+@@ -95,7 +105,7 @@ tracing-subscriber.workspace = true
+ time = { workspace = true, features = ["parsing", "macros", "local-offset"] }
+ 
+ # plugins
+-libloading.workspace = true
++libloading = { workspace = true, optional = true }
+ rustc-hash.workspace = true
+ 
+ # Task handling
+@@ -103,18 +113,18 @@ tokio-util = { workspace = true, features = ["rt"] }
+ 
+ # System details & Rustc version
+ libc = { workspace = true }
+-sysinfo.workspace = true
++sysinfo = { workspace = true, optional = true }
+ rustc_version_runtime.workspace = true
+ 
+ flate2.workspace = true
+ console-subscriber = { workspace = true, optional = true }
+ 
+-wasmtime = { workspace = true }
+-wasmtime-wasi = { workspace = true }
+-wasmtime-wasi-http = { workspace = true }
+-hyper = { workspace = true }
+-axum.workspace = true
+-webrtc.workspace = true
++wasmtime = { workspace = true, optional = true }
++wasmtime-wasi = { workspace = true, optional = true }
++wasmtime-wasi-http = { workspace = true, optional = true }
++hyper = { workspace = true, optional = true }
++axum = { workspace = true, optional = true }
++webrtc = { workspace = true, optional = true }
+ async-trait.workspace = true
+ 
+ ordered-float.workspace = true
+@@ -131,6 +141,22 @@ indexmap.workspace = true
+ tempfile.workspace = true
+ 
+ [features]
++# Default preserves upstream behavior (all subsystems present).
++default = ["multi-threaded", "nethernet", "plugin-loaders", "console", "crash-report"]
++# Bedrock game transport (WebRTC/NetherNet). Off = Java-only server, no webrtc/axum.
++nethernet = ["dep:webrtc", "dep:axum"]
++# Plugin loaders (WASM via wasmtime, native via libloading) + hot-reload watcher.
++# Off = the plugin event system still exists but loads nothing (no wasmtime).
++plugin-loaders = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:wasmtime-wasi-http", "dep:hyper", "dep:libloading", "dep:notify", "dep:wasm-encoder", "dep:wasmparser"]
++# Interactive stdin console (rustyline). Off = no TTY line editing.
++console = ["dep:rustyline"]
++# Crash report with system info (sysinfo). Off = minimal panic report.
++crash-report = ["dep:sysinfo"]
++# Multi-core runtime: tokio multi-thread scheduler + OS threads + rayon pool.
++multi-threaded = ["tokio/rt-multi-thread", "tokio/signal", "pumpkin-world/multi-threaded"]
++# Single cooperative thread (wasm / deterministic / embedded). No rt-multi-thread; rayon
++# runs inline; the chunk scheduler and ticker run cooperatively.
++single-threaded = ["pumpkin-world/single-threaded", "pumpkin-util/single-threaded"]
+ console-subscriber = ["dep:console-subscriber"]
+ 
+ [lints]
+diff --git a/crates/pumpkin/build.rs b/crates/pumpkin/build.rs
+index 5314180a1..a6accb815 100644
+--- a/crates/pumpkin/build.rs
++++ b/crates/pumpkin/build.rs
+@@ -23,8 +23,21 @@ fn main() {
+         _ => "unknown".to_string(),
+     };
+ 
+-    println!("cargo::rerun-if-changed=../.git/HEAD");
+-    println!("cargo::rerun-if-changed=../.git/refs/heads/");
++    // Git paths are relative to the repository, not this crate's subdirectory.
++    for name in ["HEAD", "refs/heads", "packed-refs"] {
++        if let Ok(output) = Command::new("git")
++            .args(["rev-parse", "--git-path", name])
++            .output()
++        {
++            if output.status.success() {
++                let path = String::from_utf8_lossy(&output.stdout);
++                let path = path.trim();
++                if std::path::Path::new(path).exists() {
++                    println!("cargo::rerun-if-changed={path}");
++                }
++            }
++        }
++    }
+     println!("cargo::rustc-env=GIT_HASH={git_hash_short}");
+     println!("cargo::rustc-env=GIT_HASH_FULL={git_hash_full}");
+ }
+diff --git a/crates/pumpkin/src/command/commands/pumpkin.rs b/crates/pumpkin/src/command/commands/pumpkin.rs
+index 0045511a9..9586e5dc5 100644
+--- a/crates/pumpkin/src/command/commands/pumpkin.rs
++++ b/crates/pumpkin/src/command/commands/pumpkin.rs
+@@ -56,6 +56,7 @@ fn fetch_all_contributors_cached() -> Vec<Contributor> {
+         return cache.data.clone();
+     }
+ 
++    #[cfg(not(feature = "single-threaded"))]
+     let contributors = tokio::runtime::Handle::try_current().map_or_else(
+         |_| {
+             tokio::runtime::Runtime::new()
+@@ -63,6 +64,9 @@ fn fetch_all_contributors_cached() -> Vec<Contributor> {
+         },
+         |handle| tokio::task::block_in_place(|| handle.block_on(fetch_all_contributors())),
+     );
++    // Emscripten: no sync-blocking HTTP from the single-thread runtime.
++    #[cfg(feature = "single-threaded")]
++    let contributors: Vec<Contributor> = Vec::new();
+ 
+     if !contributors.is_empty() {
+         if let Ok(mut guard) = CONTRIBUTORS_CACHE.lock() {
+@@ -251,6 +255,7 @@ fn fetch_donators_hover_cached() -> TextComponent {
+         return cache.data.clone();
+     }
+ 
++    #[cfg(not(feature = "single-threaded"))]
+     let donators = tokio::runtime::Handle::try_current().map_or_else(
+         |_| {
+             tokio::runtime::Runtime::new().map_or_else(
+@@ -260,6 +265,8 @@ fn fetch_donators_hover_cached() -> TextComponent {
+         },
+         |handle| tokio::task::block_in_place(|| handle.block_on(fetch_donators_hover())),
+     );
++    #[cfg(feature = "single-threaded")]
++    let donators = TextComponent::text("Donators are unavailable in this build");
+ 
+     if let Ok(mut guard) = DONATORS_CACHE.lock() {
+         *guard = Some(DonatorCache {
+diff --git a/crates/pumpkin/src/crash.rs b/crates/pumpkin/src/crash.rs
+index 6f88670e3..9969598c2 100644
+--- a/crates/pumpkin/src/crash.rs
++++ b/crates/pumpkin/src/crash.rs
+@@ -13,6 +13,7 @@ use pumpkin_util::text::{
+ };
+ use pumpkin_world::CURRENT_MC_VERSION;
+ use rustc_hash::FxHashMap;
++#[cfg(feature = "crash-report")]
+ use sysinfo::{Cpu, System};
+ use time::OffsetDateTime;
+ use tracing::error;
+@@ -206,6 +207,7 @@ impl CrashReport {
+             rustc_version_runtime::version()
+         );
+ 
++        #[cfg(feature = "crash-report")]
+         if sysinfo::IS_SUPPORTED_SYSTEM {
+             writeln_output!(&mut output, "\n--- System Details ---");
+ 
+@@ -243,6 +245,7 @@ impl CrashReport {
+         output
+     }
+ 
++    #[cfg(feature = "crash-report")]
+     fn write_cpus(output: &mut String, sys: &System) {
+         writeln_output!(output);
+         let cpus = sys.cpus();
+diff --git a/crates/pumpkin/src/data/datapack/mod.rs b/crates/pumpkin/src/data/datapack/mod.rs
+index 2f8f72349..eefa123d0 100644
+--- a/crates/pumpkin/src/data/datapack/mod.rs
++++ b/crates/pumpkin/src/data/datapack/mod.rs
+@@ -253,7 +253,7 @@ impl DatapackManager {
+         if let Some(nbt_path) = nbt_path {
+             let display_path = nbt_path.display().to_string();
+ 
+-            return tokio::task::spawn_blocking(move || {
++            return pumpkin_util::spawn_blocking(move || {
+                 let file = fs::File::open(&nbt_path).map_err(|error| {
+                     format!("Failed to open structure '{display_path}': {error}")
+                 })?;
+diff --git a/crates/pumpkin/src/data/player_server.rs b/crates/pumpkin/src/data/player_server.rs
+index 0899fa9c1..733e66780 100644
+--- a/crates/pumpkin/src/data/player_server.rs
++++ b/crates/pumpkin/src/data/player_server.rs
+@@ -87,7 +87,7 @@ impl ServerPlayerData {
+             }
+ 
+             let storage = self.storage.clone();
+-            rayon::spawn(move || {
++            pumpkin_util::rayon_spawn(move || {
+                 for (uuid, nbt) in snapshots {
+                     if let Err(e) = storage.save_player_data(&uuid, nbt) {
+                         error!("Failed to save player data for {uuid}: {e}");
+diff --git a/crates/pumpkin/src/entity/mod.rs b/crates/pumpkin/src/entity/mod.rs
+index 7d64f9b1c..ca28e83b4 100644
+--- a/crates/pumpkin/src/entity/mod.rs
++++ b/crates/pumpkin/src/entity/mod.rs
+@@ -2361,7 +2361,7 @@ impl Entity {
+                 let yaw = self.yaw.load();
+ 
+                 let rt_handle = world_clone.server.upgrade().map(|s| s.runtime.clone());
+-                rayon::spawn(move || {
++                pumpkin_util::rayon_spawn(move || {
+                     let _guard = rt_handle.as_ref().map(tokio::runtime::Handle::enter);
+                     let Some(entity_arc) = world_clone.get_entity_by_id(entity_id) else {
+                         return;
+diff --git a/crates/pumpkin/src/entity/player.rs b/crates/pumpkin/src/entity/player.rs
+index a19825bc2..45d6783e8 100644
+--- a/crates/pumpkin/src/entity/player.rs
++++ b/crates/pumpkin/src/entity/player.rs
+@@ -572,6 +572,7 @@ impl Player {
+             .and_then(|m| m.model.as_deref())
+             .is_some_and(|model| model == "slim");
+ 
++        #[cfg(not(feature = "single-threaded"))]
+         let bytes = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+             tokio::task::block_in_place(|| {
+                 handle.block_on(async {
+@@ -585,6 +586,13 @@ impl Player {
+                 client.get(&url).send().await.ok()?.bytes().await.ok()
+             })?
+         };
++        // Emscripten: no sync-blocking HTTP from the single-thread runtime; skip the
++        // skin fetch (players still join, just without a fetched skin texture).
++        #[cfg(feature = "single-threaded")]
++        let bytes: Vec<u8> = {
++            let _ = &url;
++            return None;
++        };
+         let img = image::load_from_memory(&bytes).ok()?;
+ 
+         let width = img.width();
+@@ -2583,6 +2591,7 @@ impl Player {
+             sender.prepare_batch(&world.level, player_chunk, epoch, version)
+         });
+ 
++
+         let total_sent_chunks = prepared_batch.map_or_else(
+             || {
+                 self.chunk_sender
+diff --git a/crates/pumpkin/src/lib.rs b/crates/pumpkin/src/lib.rs
+index 7110bc9e4..3438afb65 100644
+--- a/crates/pumpkin/src/lib.rs
++++ b/crates/pumpkin/src/lib.rs
+@@ -8,12 +8,14 @@ extern crate pumpkin_macros;
+ 
+ use crate::crash::CrashReport;
+ use crate::data::VanillaData;
+-use crate::logging::{
+-    ConsoleWriter, GzipRollingLogger, PumpkinCommandCompleter, ReadlineLogWrapper,
+-};
++#[cfg(feature = "console")]
++use crate::logging::PumpkinCommandCompleter;
++use crate::logging::{ConsoleWriter, GzipRollingLogger, ReadlineLogWrapper};
++#[cfg(feature = "nethernet")]
++use crate::net::bedrock::nethernet::load_or_create_identity_key;
+ use crate::net::bedrock::{
+     BedrockClient,
+-    nethernet::{NetherNetListener, load_or_create_identity_key},
++    nethernet::NetherNetListener,
+     status::{IceSocket, StatusResponder},
+ };
+ use crate::net::java::JavaClient;
+@@ -26,8 +28,11 @@ use plugin::server::server_load::{LoadType, ServerLoadEvent};
+ use pumpkin_config::{AdvancedConfiguration, BasicConfiguration};
+ use pumpkin_util::text::TextComponent;
+ use pumpkin_util::text::color::{Color, NamedColor};
++#[cfg(feature = "console")]
+ use rustyline::Editor;
++#[cfg(feature = "console")]
+ use rustyline::history::FileHistory;
++#[cfg(feature = "console")]
+ use rustyline::{Config, error::ReadlineError};
+ use std::collections::HashMap;
+ use std::io::{ErrorKind, IsTerminal, stdin};
+@@ -112,6 +117,7 @@ pub fn init_logger(advanced_config: &AdvancedConfiguration) {
+             }
+         };
+ 
++        #[cfg(feature = "console")]
+         let (logger, rl): (
+             ConsoleWriter,
+             Option<Editor<PumpkinCommandCompleter, FileHistory>>,
+@@ -142,6 +148,8 @@ pub fn init_logger(advanced_config: &AdvancedConfiguration) {
+         } else {
+             (ConsoleWriter::new(None), None)
+         };
++        #[cfg(not(feature = "console"))]
++        let logger = ConsoleWriter::new();
+ 
+         let fmt_layer = fmt::layer()
+             .with_writer(std::sync::Mutex::new(logger))
+@@ -194,7 +202,11 @@ pub fn init_logger(advanced_config: &AdvancedConfiguration) {
+             timestamp: advanced_config.logging.timestamp,
+         };
+ 
+-        (ReadlineLogWrapper::new(rl), level, logging_config)
++        #[cfg(feature = "console")]
++        let wrapper = ReadlineLogWrapper::new(rl);
++        #[cfg(not(feature = "console"))]
++        let wrapper = ReadlineLogWrapper::new();
++        (wrapper, level, logging_config)
+     });
+ 
+     assert!(
+@@ -251,7 +263,7 @@ impl PumpkinServer {
+     ) -> Self {
+         let server = Server::new(basic_config, advanced_config, vanilla_data).await;
+ 
+-        #[cfg(target_family = "unix")]
++        #[cfg(all(target_family = "unix", not(target_os = "emscripten")))]
+         adjust_file_descriptor_limit();
+ 
+         let rcon = server.advanced_config.networking.rcon.clone();
+@@ -320,19 +332,30 @@ impl PumpkinServer {
+             None
+         };
+ 
+-        // Ticker
++        // Ticker: one async loop (`Ticker::run`), driven differently per mode.
++        // Multi-threaded: a dedicated OS thread runs it via `block_on`, isolating tick timing.
++        #[cfg(not(feature = "single-threaded"))]
+         {
+             let ticker_server = server.clone();
+             if let Err(err) = std::thread::Builder::new()
+                 .name("Server-Ticker".into())
+                 .spawn(move || {
+-                    Ticker::run(&ticker_server);
++                    ticker_server.runtime.block_on(Ticker::run(&ticker_server));
+                 })
+             {
+                 error!("Failed to spawn Server-Ticker thread: {err}");
+                 std::process::exit(1);
+             }
+         };
++        // Single-threaded (e.g. emscripten): no OS threads — run it as a cooperative task
++        // on the hosted runtime.
++        #[cfg(feature = "single-threaded")]
++        {
++            let ticker_server = server.clone();
++            server.spawn_task(async move {
++                Ticker::run(&ticker_server).await;
++            });
++        }
+ 
+         let (bedrock_status, ice_socket) = Self::bind_bedrock_status(&server).await;
+         let nethernet_listener = Self::bind_nethernet(&server, ice_socket).await;
+@@ -345,6 +368,15 @@ impl PumpkinServer {
+         }
+     }
+ 
++    #[cfg(not(feature = "nethernet"))]
++    async fn bind_nethernet(
++        _server: &Arc<Server>,
++        _ice_socket: Option<IceSocket>,
++    ) -> Option<NetherNetListener> {
++        None
++    }
++
++    #[cfg(feature = "nethernet")]
+     async fn bind_nethernet(
+         server: &Arc<Server>,
+         ice_socket: Option<IceSocket>,
+@@ -441,6 +473,7 @@ impl PumpkinServer {
+     }
+ 
+     pub async fn start(&self) {
++        #[cfg(feature = "console")]
+         if self.server.advanced_config.commands.use_console
+             && let Some((wrapper, _, _)) = LOGGER_IMPL.wait()
+         {
+@@ -527,6 +560,7 @@ impl PumpkinServer {
+ 
+         info!("Completed save!");
+ 
++        #[cfg(feature = "console")]
+         if let Some((wrapper, _, _)) = LOGGER_IMPL.wait()
+             && let Some(rl) = wrapper.take_readline()
+         {
+@@ -534,6 +568,72 @@ impl PumpkinServer {
+         }
+     }
+ 
++    /// Run the normal Java client lifecycle for a host-provided byte stream.
++    pub async fn serve_connection<S>(&self, connection: S, client_addr: SocketAddr, client_id: u64)
++    where
++        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin + 'static,
++    {
++        let server_clone = self.server.clone();
++        let packet_limiter = PacketRateLimiter::from_config(
++            &server_clone.advanced_config.networking.java.packet_limiter,
++        );
++        let mut pending =
++            PendingConnection::from_stream(connection, client_addr, client_id, packet_limiter);
++        let login_result = pending.handle_login_sequence(&server_clone).await;
++
++        match login_result {
++            PacketHandlerResult::Stop => {
++                pending.close();
++            }
++            PacketHandlerResult::ReadyToPlay(profile, config) => {
++                let mut java_client =
++                    JavaClient::from_pending(pending, profile.clone(), config.clone());
++                java_client.start_outgoing_packet_task();
++
++                if let Some((player, world)) = server_clone.add_player(
++                    Arc::new(ClientPlatform::Java(java_client)),
++                    profile,
++                    Some(config),
++                ) {
++                    if let ClientPlatform::Java(client) = player.client.as_ref() {
++                        client.set_player(player.clone());
++                    }
++                    world
++                        .spawn_java_player(&server_clone.basic_config, &player, &server_clone)
++                        .await;
++
++                    if let ClientPlatform::Java(client) = player.client.as_ref() {
++                        client.progress_player_packets(&player, &server_clone).await;
++
++                        // Close when done
++                        client.close();
++                        client.await_tasks().await;
++                    }
++                    player.remove().await;
++                    server_clone.remove_player(&player);
++                    if let Err(e) = server_clone
++                        .player_data_storage
++                        .handle_player_leave(&player)
++                    {
++                        error!("Failed to save player data on disconnect: {e}");
++                    }
++                    if let Err(e) = server_clone.advancement_manager.save_player(&player).await {
++                        error!("Failed to save player advancement on disconnect: {e}");
++                    }
++                }
++            }
++        }
++    }
++
++    fn clone_for_connection(&self) -> Self {
++        Self {
++            server: self.server.clone(),
++            tcp_listener: None,
++            bedrock_status: None,
++            nethernet_listener: None,
++        }
++    }
++
+     #[allow(clippy::too_many_lines)]
+     pub async fn unified_listener_task(
+         &self,
+@@ -559,66 +659,13 @@ impl PumpkinServer {
+                             format!("{client_addr}")
+                         };
+                         debug!("Accepted connection from Java Edition: {formatted_address} (id {client_id})");
+-                        let server_clone = self.server.clone();
+-
++                        let server = self.clone_for_connection();
+                         tasks.spawn(async move {
+-                            let packet_limiter = PacketRateLimiter::from_config(
+-                                &server_clone.advanced_config.networking.java.packet_limiter,
+-                            );
+-                            let mut pending = PendingConnection::new(
+-                                connection,
+-                                client_addr,
+-                                client_id,
+-                                packet_limiter,
+-                            );
+-                            let login_result = pending.handle_login_sequence(&server_clone).await;
+-
+-                            match login_result {
+-                                PacketHandlerResult::Stop => {
+-                                     pending.close();
+-                                },
+-                                PacketHandlerResult::ReadyToPlay(profile, config) => {
+-                                     let mut java_client = JavaClient::from_pending(pending, profile.clone(), config.clone());
+-                                     java_client.start_outgoing_packet_task();
+-
+-                                     if let Some((player, world)) = server_clone
+-                                         .add_player(Arc::new(ClientPlatform::Java(java_client)), profile, Some(config))
+-                                 {
+-
+-                                     if let ClientPlatform::Java(client) = player.client.as_ref() {
+-                                         client.set_player(player.clone());
+-                                     }
+-                                     world
+-                                         .spawn_java_player(&server_clone.basic_config, &player, &server_clone)
+-                                         .await;
+-
+-                                     if let ClientPlatform::Java(client) = player.client.as_ref() {
+-                                         client.progress_player_packets(&player, &server_clone).await;
+-
+-                                         // Close when done
+-                                         client.close();
+-                                         client.await_tasks().await;
+-                                     }
+-                                     player.remove().await;
+-                                     server_clone.remove_player(&player);
+-                                    if let Err(e) = server_clone
+-                                        .player_data_storage
+-                                        .handle_player_leave(&player)
+-                                    {
+-                                        error!("Failed to save player data on disconnect: {e}");
+-                                    }
+-                                    if let Err(e) = server_clone.advancement_manager
+-                                        .save_player(&player)
+-                                        .await {
+-                                            error!("Failed to save player advancement on disconnect: {e}");
+-                                        }
+-                                    }
+-                                },
+-                            }
++                            server.serve_connection(connection, client_addr, client_id).await;
+                         });
+                     }
+                     Err(e) => {
+-                        #[cfg(target_family = "unix")]
++                        #[cfg(all(target_family = "unix", not(target_os = "emscripten")))]
+                         if e.raw_os_error() == Some(libc::EMFILE) {
+                             error!(
+                                 "Too many open files! Server reached file descriptor limit. \
+@@ -719,6 +766,7 @@ impl PumpkinServer {
+     }
+ }
+ 
++#[cfg(feature = "console")]
+ fn setup_stdin_console(server: &Arc<Server>) {
+     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+     let rt = tokio::runtime::Handle::current();
+@@ -759,6 +807,7 @@ fn setup_stdin_console(server: &Arc<Server>) {
+     });
+ }
+ 
++#[cfg(feature = "console")]
+ fn setup_console(mut rl: Editor<PumpkinCommandCompleter, FileHistory>, server: Arc<Server>) {
+     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+     let (tx_reply, mut rx_reply) = tokio::sync::mpsc::channel(1);
+@@ -839,7 +888,7 @@ fn scrub_address(ip: &str) -> String {
+         .collect()
+ }
+ 
+-#[cfg(target_family = "unix")]
++#[cfg(all(target_family = "unix", not(target_os = "emscripten")))]
+ fn adjust_file_descriptor_limit() {
+     let mut rlim = libc::rlimit {
+         rlim_cur: 0,
+diff --git a/crates/pumpkin/src/logging.rs b/crates/pumpkin/src/logging.rs
+index 85b51a45a..4006f6eca 100644
+--- a/crates/pumpkin/src/logging.rs
++++ b/crates/pumpkin/src/logging.rs
+@@ -2,11 +2,17 @@
+ #![allow(clippy::print_stdout)]
+ 
+ use flate2::write::GzEncoder;
++#[cfg(feature = "console")]
+ use rustyline::completion::Completer;
++#[cfg(feature = "console")]
+ use rustyline::highlight::Highlighter;
++#[cfg(feature = "console")]
+ use rustyline::hint::Hinter;
++#[cfg(feature = "console")]
+ use rustyline::history::FileHistory;
++#[cfg(feature = "console")]
+ use rustyline::validate::Validator;
++#[cfg(feature = "console")]
+ use rustyline::{Editor, Helper};
+ use std::borrow::Cow;
+ use std::fs::File;
+@@ -85,15 +91,18 @@ const MAX_ATTEMPTS: u32 = 1000;
+ /// A wrapper for our logger to hold the terminal input while no input is expected in order to
+ /// properly flush logs to the output while they happen instead of batched
+ pub struct ReadlineLogWrapper {
++    #[cfg(feature = "console")]
+     readline: std::sync::Mutex<Option<Editor<PumpkinCommandCompleter, FileHistory>>>,
+ }
+ 
+ pub struct ConsoleWriter {
++    #[cfg(feature = "console")]
+     printer: Option<Box<dyn rustyline::ExternalPrinter + Send>>,
+     buffer: Vec<u8>,
+ }
+ 
+ impl ConsoleWriter {
++    #[cfg(feature = "console")]
+     #[must_use]
+     pub fn new(printer: Option<Box<dyn rustyline::ExternalPrinter + Send>>) -> Self {
+         Self {
+@@ -101,9 +110,16 @@ impl ConsoleWriter {
+             buffer: Vec::new(),
+         }
+     }
++
++    #[cfg(not(feature = "console"))]
++    #[must_use]
++    pub fn new() -> Self {
++        Self { buffer: Vec::new() }
++    }
+ }
+ 
+ impl Write for ConsoleWriter {
++    #[cfg(feature = "console")]
+     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+         if let Some(ref mut printer) = self.printer {
+             self.buffer.extend_from_slice(buf);
+@@ -122,6 +138,12 @@ impl Write for ConsoleWriter {
+         }
+     }
+ 
++    #[cfg(not(feature = "console"))]
++    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
++        io::stdout().write(buf)
++    }
++
++    #[cfg(feature = "console")]
+     fn flush(&mut self) -> io::Result<()> {
+         if let Some(ref mut printer) = self.printer {
+             if !self.buffer.is_empty() {
+@@ -138,6 +160,11 @@ impl Write for ConsoleWriter {
+             io::stdout().flush()
+         }
+     }
++
++    #[cfg(not(feature = "console"))]
++    fn flush(&mut self) -> io::Result<()> {
++        io::stdout().flush()
++    }
+ }
+ 
+ struct GzipRollingLoggerData {
+@@ -362,6 +389,7 @@ impl tracing::field::Visit for StringVisitor {
+ }
+ 
+ impl ReadlineLogWrapper {
++    #[cfg(feature = "console")]
+     #[must_use]
+     pub const fn new(rl: Option<Editor<PumpkinCommandCompleter, FileHistory>>) -> Self {
+         Self {
+@@ -369,6 +397,13 @@ impl ReadlineLogWrapper {
+         }
+     }
+ 
++    #[cfg(not(feature = "console"))]
++    #[must_use]
++    pub const fn new() -> Self {
++        Self {}
++    }
++
++    #[cfg(feature = "console")]
+     pub fn take_readline(&self) -> Option<Editor<PumpkinCommandCompleter, FileHistory>> {
+         self.readline
+             .lock()
+@@ -377,6 +412,7 @@ impl ReadlineLogWrapper {
+ 
+     // This isn't really dead code. It is just only used by the lib and not the bin for this
+     // crate, and as such creates a compiler warning.
++    #[cfg(feature = "console")]
+     #[allow(dead_code)]
+     pub fn return_readline(&self, rl: Editor<PumpkinCommandCompleter, FileHistory>) {
+         if let Ok(mut result) = self.readline.lock() {
+@@ -385,12 +421,14 @@ impl ReadlineLogWrapper {
+     }
+ }
+ 
++#[cfg(feature = "console")]
+ #[derive(Clone, Default)]
+ pub struct PumpkinCommandCompleter {
+     pub server: Arc<std::sync::RwLock<Option<Arc<Server>>>>,
+     pub rt: Arc<std::sync::OnceLock<tokio::runtime::Handle>>,
+ }
+ 
++#[cfg(feature = "console")]
+ impl PumpkinCommandCompleter {
+     #[must_use]
+     pub fn new() -> Self {
+@@ -401,7 +439,9 @@ impl PumpkinCommandCompleter {
+     }
+ }
+ 
++#[cfg(feature = "console")]
+ impl Helper for PumpkinCommandCompleter {}
++#[cfg(feature = "console")]
+ impl Highlighter for PumpkinCommandCompleter {
+     fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
+         line.find(' ').map_or_else(
+@@ -417,6 +457,7 @@ impl Highlighter for PumpkinCommandCompleter {
+         Cow::Owned(format!("\x1b[90m{hint}\x1b[0m"))
+     }
+ }
++#[cfg(feature = "console")]
+ impl Hinter for PumpkinCommandCompleter {
+     type Hint = String;
+     fn hint(&self, line: &str, pos: usize, ctx: &rustyline::Context<'_>) -> Option<Self::Hint> {
+@@ -440,8 +481,10 @@ impl Hinter for PumpkinCommandCompleter {
+     }
+ }
+ 
++#[cfg(feature = "console")]
+ impl Validator for PumpkinCommandCompleter {}
+ 
++#[cfg(feature = "console")]
+ impl Completer for PumpkinCommandCompleter {
+     type Candidate = String;
+ 
+diff --git a/crates/pumpkin/src/net/authentication.rs b/crates/pumpkin/src/net/authentication.rs
+index f344d1978..b32c3bc2a 100644
+--- a/crates/pumpkin/src/net/authentication.rs
++++ b/crates/pumpkin/src/net/authentication.rs
+@@ -311,6 +311,7 @@ pub async fn lookup_profile_by_name(
+     }
+ }
+ 
++#[cfg(not(feature = "single-threaded"))]
+ pub fn lookup_profile_by_name_blocking(
+     name: &str,
+     auth_config: &AuthenticationConfig,
+@@ -324,6 +325,17 @@ pub fn lookup_profile_by_name_blocking(
+     }
+ }
+ 
++// Emscripten has a single-thread cooperative runtime: there is no way to block on
++// an async lookup from a sync context (no OS threads, `block_in_place` is invalid).
++// Online-mode auth is not supported there; offline mode never calls this.
++#[cfg(feature = "single-threaded")]
++pub fn lookup_profile_by_name_blocking(
++    _name: &str,
++    _auth_config: &AuthenticationConfig,
++) -> Result<Option<(Uuid, String)>, AuthError> {
++    Ok(None)
++}
++
+ pub async fn fetch_profile_by_uuid(
+     uuid: Uuid,
+     auth_config: &AuthenticationConfig,
+diff --git a/crates/pumpkin/src/net/bedrock/mod.rs b/crates/pumpkin/src/net/bedrock/mod.rs
+index 5ea3e41ac..fd913a72b 100644
+--- a/crates/pumpkin/src/net/bedrock/mod.rs
++++ b/crates/pumpkin/src/net/bedrock/mod.rs
+@@ -1,3 +1,7 @@
++#[cfg(feature = "nethernet")]
++pub mod nethernet;
++#[cfg(not(feature = "nethernet"))]
++#[path = "nethernet_stub.rs"]
+ pub mod nethernet;
+ pub mod play;
+ pub mod status;
+diff --git a/crates/pumpkin/src/net/java/config/known_packs.rs b/crates/pumpkin/src/net/java/config/known_packs.rs
+index 7e45c3db9..8a4d5af4d 100644
+--- a/crates/pumpkin/src/net/java/config/known_packs.rs
++++ b/crates/pumpkin/src/net/java/config/known_packs.rs
+@@ -14,7 +14,7 @@ impl JavaClient {
+             let test_instance_entries =
+                 server.datapack_manager.get_test_instance_registry_entries();
+ 
+-            let packets = tokio::task::spawn_blocking(move || {
++            let packets = pumpkin_util::spawn_blocking(move || {
+                 let registry = Registry::get_synced(version);
+                 let mut packets = Vec::new();
+                 let mut sent_dimension_type = false;
+diff --git a/crates/pumpkin/src/net/java/mod.rs b/crates/pumpkin/src/net/java/mod.rs
+index fb0e9c901..96e3b1101 100644
+--- a/crates/pumpkin/src/net/java/mod.rs
++++ b/crates/pumpkin/src/net/java/mod.rs
+@@ -42,7 +42,6 @@ use pumpkin_util::text::TextComponent;
+ use pumpkin_util::version::JavaMinecraftVersion;
+ use tokio::{
+     io::{BufReader, BufWriter},
+-    net::tcp::{OwnedReadHalf, OwnedWriteHalf},
+     sync::oneshot,
+ };
+ use tokio::{
+@@ -53,6 +52,9 @@ use tokio_util::sync::CancellationToken;
+ use tokio_util::task::TaskTracker;
+ use tracing::{debug, error, warn};
+ 
++pub type ConnectionReader = Box<dyn tokio::io::AsyncRead + Send + Sync + Unpin>;
++pub type ConnectionWriter = Box<dyn tokio::io::AsyncWrite + Send + Sync + Unpin>;
++
+ pub mod config;
+ pub mod handshake;
+ pub mod login;
+@@ -103,9 +105,9 @@ pub struct JavaClient {
+     /// A high-priority queue of serialized packets to send to the network.
+     outgoing_packet_priority_recv: Option<Receiver<OutgoingPacket>>,
+     /// The packet encoder for outgoing packets.
+-    network_writer: std::sync::Mutex<Option<TCPNetworkEncoder<BufWriter<OwnedWriteHalf>>>>,
++    network_writer: std::sync::Mutex<Option<TCPNetworkEncoder<BufWriter<ConnectionWriter>>>>,
+     /// The packet decoder for incoming packets.
+-    network_reader: std::sync::Mutex<Option<TCPNetworkDecoder<BufReader<OwnedReadHalf>>>>,
++    network_reader: std::sync::Mutex<Option<TCPNetworkDecoder<BufReader<ConnectionReader>>>>,
+     /// Keep Alive:
+     ///
+     /// Whether we are waiting for a response after sending a keep alive packet.
+@@ -155,10 +157,10 @@ fn take_frame_batch(packets: &mut VecDeque<OutgoingPacket>) -> Vec<OutgoingPacke
+ }
+ 
+ fn frame_packet_batch(
+-    mut writer: TCPNetworkEncoder<BufWriter<OwnedWriteHalf>>,
++    mut writer: TCPNetworkEncoder<BufWriter<ConnectionWriter>>,
+     batch: &[OutgoingPacket],
+ ) -> (
+-    TCPNetworkEncoder<BufWriter<OwnedWriteHalf>>,
++    TCPNetworkEncoder<BufWriter<ConnectionWriter>>,
+     Vec<u8>,
+     Option<PacketEncodeError>,
+ ) {
+@@ -174,11 +176,11 @@ fn frame_packet_batch(
+ }
+ 
+ async fn frame_batch_maybe_offload(
+-    writer: TCPNetworkEncoder<BufWriter<OwnedWriteHalf>>,
++    writer: TCPNetworkEncoder<BufWriter<ConnectionWriter>>,
+     packet_batch: Vec<OutgoingPacket>,
+ ) -> Result<
+     (
+-        TCPNetworkEncoder<BufWriter<OwnedWriteHalf>>,
++        TCPNetworkEncoder<BufWriter<ConnectionWriter>>,
+         Vec<OutgoingPacket>,
+         Vec<u8>,
+         Option<PacketEncodeError>,
+@@ -190,7 +192,7 @@ async fn frame_batch_maybe_offload(
+         .any(|packet| writer.is_compressing_packet(&packet.data));
+ 
+     if needs_offload {
+-        tokio::task::spawn_blocking(move || {
++        pumpkin_util::spawn_blocking(move || {
+             let (writer, frame, frame_err) = frame_packet_batch(writer, &packet_batch);
+             (writer, packet_batch, frame, frame_err)
+         })
+@@ -406,7 +408,7 @@ impl JavaClient {
+ 
+         let version = self.version.load();
+         let (tx, rx) = oneshot::channel();
+-        rayon::spawn(move || {
++        pumpkin_util::rayon_spawn(move || {
+             let mut serialized = Vec::with_capacity(valid_chunks.len());
+             for chunk in valid_chunks {
+                 let mut buf = Vec::with_capacity(32 * 1024);
+@@ -532,7 +534,7 @@ impl JavaClient {
+ 
+     pub async fn get_packet_with_reader(
+         &self,
+-        network_reader: &mut TCPNetworkDecoder<BufReader<OwnedReadHalf>>,
++        network_reader: &mut TCPNetworkDecoder<BufReader<ConnectionReader>>,
+     ) -> Option<RawPacket> {
+         tokio::select! {
+             () = self.await_close_interrupt() => {
+diff --git a/crates/pumpkin/src/net/java/pending.rs b/crates/pumpkin/src/net/java/pending.rs
+index 2522573e0..a627b07b8 100644
+--- a/crates/pumpkin/src/net/java/pending.rs
++++ b/crates/pumpkin/src/net/java/pending.rs
+@@ -23,10 +23,7 @@ use pumpkin_protocol::{
+ use pumpkin_util::{Hand, text::TextComponent, version::JavaMinecraftVersion};
+ use tokio::{
+     io::{BufReader, BufWriter},
+-    net::{
+-        TcpStream,
+-        tcp::{OwnedReadHalf, OwnedWriteHalf},
+-    },
++    net::TcpStream,
+ };
+ use tokio_util::sync::CancellationToken;
+ use tracing::{debug, error, warn};
+@@ -40,7 +37,7 @@ use crate::{
+     server::Server,
+ };
+ 
+-use super::JavaClient;
++use super::{ConnectionReader, ConnectionWriter, JavaClient};
+ 
+ const BRAND_CHANNEL_PREFIX: &str = "minecraft:brand";
+ 
+@@ -61,8 +58,8 @@ pub struct PendingConnection {
+     pub version: AtomicCell<JavaMinecraftVersion>,
+     pub connection_state: AtomicCell<ConnectionState>,
+     pub close_token: CancellationToken,
+-    pub network_writer: TCPNetworkEncoder<BufWriter<OwnedWriteHalf>>,
+-    pub network_reader: TCPNetworkDecoder<BufReader<OwnedReadHalf>>,
++    pub network_writer: TCPNetworkEncoder<BufWriter<ConnectionWriter>>,
++    pub network_reader: TCPNetworkDecoder<BufReader<ConnectionReader>>,
+     pub gameprofile: Option<GameProfile>,
+     pub config: Option<PlayerConfig>,
+     pub brand: Option<String>,
+@@ -78,7 +75,22 @@ impl PendingConnection {
+         id: u64,
+         packet_limiter: PacketRateLimiter,
+     ) -> Self {
+-        let (read, write) = tcp_stream.into_split();
++        Self::from_stream(tcp_stream, address, id, packet_limiter)
++    }
++
++    /// Accept an injected byte stream while retaining the native TCP constructor.
++    pub fn from_stream<S>(
++        stream: S,
++        address: SocketAddr,
++        id: u64,
++        packet_limiter: PacketRateLimiter,
++    ) -> Self
++    where
++        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin + 'static,
++    {
++        let (read, write) = tokio::io::split(stream);
++        let read: ConnectionReader = Box::new(read);
++        let write: ConnectionWriter = Box::new(write);
+         Self {
+             id,
+             address,
+diff --git a/crates/pumpkin/src/net/java/play/chat_message.rs b/crates/pumpkin/src/net/java/play/chat_message.rs
+index 589277311..ba28c7450 100644
+--- a/crates/pumpkin/src/net/java/play/chat_message.rs
++++ b/crates/pumpkin/src/net/java/play/chat_message.rs
+@@ -266,7 +266,7 @@ impl JavaClient {
+         let public_keys = server.mojang_public_keys.load_full();
+ 
+         let (tx, rx) = tokio::sync::oneshot::channel();
+-        rayon::spawn(move || {
++        pumpkin_util::rayon_spawn(move || {
+             let is_valid = public_keys.iter().any(|key| {
+                 let verifying_key = VerifyingKey::<Sha1>::new(key.clone());
+                 verifying_key.verify(&signable, &key_signature).is_ok()
+diff --git a/crates/pumpkin/src/plugin/loader/mod.rs b/crates/pumpkin/src/plugin/loader/mod.rs
+index fa7f8c5ab..61bbe63f1 100644
+--- a/crates/pumpkin/src/plugin/loader/mod.rs
++++ b/crates/pumpkin/src/plugin/loader/mod.rs
+@@ -1,8 +1,12 @@
+-use crate::plugin::{PluginMetadata, api::Plugin, loader::wasm::wasm_host::PluginInitError};
++use crate::plugin::{PluginMetadata, api::Plugin};
++#[cfg(feature = "plugin-loaders")]
++use crate::plugin::loader::wasm::wasm_host::PluginInitError;
+ use std::{any::Any, path::Path, pin::Pin, sync::Arc};
+ use thiserror::Error;
+ 
++#[cfg(feature = "plugin-loaders")]
+ pub mod native;
++#[cfg(feature = "plugin-loaders")]
+ pub mod wasm;
+ 
+ pub type PluginLoadFuture<'a> = Pin<
+@@ -67,6 +71,7 @@ pub enum LoaderError {
+         server_version: u32,
+     },
+ 
++    #[cfg(feature = "plugin-loaders")]
+     #[error("Wasm plugin initialization error: {0}")]
+     WasmInitializationError(#[from] PluginInitError),
+ }
+diff --git a/crates/pumpkin/src/plugin/mod.rs b/crates/pumpkin/src/plugin/mod.rs
+index b686898d0..33ed73b36 100644
+--- a/crates/pumpkin/src/plugin/mod.rs
++++ b/crates/pumpkin/src/plugin/mod.rs
+@@ -1,6 +1,9 @@
+ use arc_swap::ArcSwap;
+ use futures::future::join_all;
+-use loader::{LoaderError, PluginLoader, native::NativePluginLoader};
++use loader::{LoaderError, PluginLoader};
++#[cfg(feature = "plugin-loaders")]
++use loader::native::NativePluginLoader;
++#[cfg(feature = "plugin-loaders")]
+ use notify::{EventKind, RecursiveMode, Watcher, event::ModifyKind};
+ use std::{
+     any::Any,
+@@ -27,7 +30,9 @@ pub mod loader;
+ /// host features.
+ pub mod permissions;
+ 
+-use crate::{LOGGER_IMPL, plugin::loader::wasm::WasmPluginLoader, server::Server};
++use crate::{LOGGER_IMPL, server::Server};
++#[cfg(feature = "plugin-loaders")]
++use crate::plugin::loader::wasm::WasmPluginLoader;
+ pub use api::*;
+ 
+ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+@@ -238,10 +243,20 @@ impl PluginManager {
+     pub fn new(verify_plugin_signatures: bool) -> Self {
+         Self {
+             plugins: SyncRwLock::new(Vec::new()),
+-            loaders: RwLock::new(vec![
+-                Arc::new(NativePluginLoader),
+-                Arc::new(WasmPluginLoader::new(verify_plugin_signatures)),
+-            ]),
++            loaders: RwLock::new({
++                #[cfg(feature = "plugin-loaders")]
++                {
++                    vec![
++                        Arc::new(NativePluginLoader) as Arc<dyn PluginLoader>,
++                        Arc::new(WasmPluginLoader::new(verify_plugin_signatures)),
++                    ]
++                }
++                #[cfg(not(feature = "plugin-loaders"))]
++                {
++                    let _ = verify_plugin_signatures;
++                    Vec::<Arc<dyn PluginLoader>>::new()
++                }
++            }),
+             handlers: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+             unloaded_files: RwLock::new(HashSet::new()),
+             services: Arc::new(RwLock::new(HashMap::new())),
+@@ -285,6 +300,7 @@ impl PluginManager {
+     }
+ 
+     /// Start watching the plugins directory for changes
++    #[cfg(feature = "plugin-loaders")]
+     pub async fn start_watcher(self: &Arc<Self>, server: &Arc<Server>) -> Result<(), ManagerError> {
+         if self.hot_reload_task.read().await.is_some() {
+             return Ok(());
+@@ -368,6 +384,7 @@ impl PluginManager {
+     }
+ 
+     /// Stop watching the plugins directory for changes
++    #[cfg(feature = "plugin-loaders")]
+     pub async fn stop_watcher(&self) {
+         let mut task_lock = self.hot_reload_task.write().await;
+         if let Some(handle) = task_lock.take() {
+@@ -376,6 +393,15 @@ impl PluginManager {
+         self.set_hot_reload_enabled(false);
+     }
+ 
++    /// No-op watcher controls when plugin loaders are compiled out.
++    #[cfg(not(feature = "plugin-loaders"))]
++    pub async fn start_watcher(self: &Arc<Self>, _server: &Arc<Server>) -> Result<(), ManagerError> {
++        Ok(())
++    }
++
++    #[cfg(not(feature = "plugin-loaders"))]
++    pub async fn stop_watcher(&self) {}
++
+     pub fn set_hot_reload_enabled(&self, enabled: bool) {
+         self.hot_reload_enabled
+             .store(enabled, std::sync::atomic::Ordering::Relaxed);
+@@ -512,6 +538,7 @@ impl PluginManager {
+             "Do you want to allow these permissions and load the plugin?".bold()
+         );
+ 
++        #[cfg(feature = "console")]
+         let mut rl_taken = if let Some(logger_option) = crate::LOGGER_IMPL.get()
+             && let Some((wrapper, _, _)) = logger_option
+             && let Some(rl) = wrapper.take_readline()
+@@ -520,7 +547,10 @@ impl PluginManager {
+         } else {
+             None
+         };
++        #[cfg(not(feature = "console"))]
++        let mut rl_taken: Option<((), ())> = None;
+ 
++        #[cfg(feature = "console")]
+         let result = if let Some((_, ref mut rl)) = rl_taken {
+             rl.readline(&prompt).is_ok_and(|line| {
+                 let input = line.trim().to_lowercase();
+@@ -533,7 +563,17 @@ impl PluginManager {
+             );
+             false
+         };
++        #[cfg(not(feature = "console"))]
++        let result = {
++            let _ = (&prompt, &mut rl_taken);
++            warn!(
++                "Console readline is not available; cannot prompt for plugin \"{}\" permissions",
++                metadata.name
++            );
++            false
++        };
+ 
++        #[cfg(feature = "console")]
+         if let Some((wrapper, rl)) = rl_taken {
+             wrapper.return_readline(rl);
+         }
+@@ -731,14 +771,17 @@ impl PluginManager {
+                                     .extension()
+                                     .is_some_and(|ext| ext.eq_ignore_ascii_case("wasm"))
+                             {
+-                                let wasm_bytes = std::fs::read(&path).unwrap_or_default();
+-                                if !crate::plugin::loader::wasm::wasm_host::signature::is_wasm_signed(&wasm_bytes) {
+-                                    error!(
+-                                        "Plugin \"{}\" ({:?}) is unsigned or invalid and allow_unsigned is disabled in configuration, skipping.",
+-                                        metadata.name, path
+-                                    );
+-                                    loader_found = true;
+-                                    break;
++                                #[cfg(feature = "plugin-loaders")]
++                                {
++                                    let wasm_bytes = std::fs::read(&path).unwrap_or_default();
++                                    if !crate::plugin::loader::wasm::wasm_host::signature::is_wasm_signed(&wasm_bytes) {
++                                        error!(
++                                            "Plugin \"{}\" ({:?}) is unsigned or invalid and allow_unsigned is disabled in configuration, skipping.",
++                                            metadata.name, path
++                                        );
++                                        loader_found = true;
++                                        break;
++                                    }
+                                 }
+                             }
+ 
+@@ -940,16 +983,19 @@ impl PluginManager {
+                         .extension()
+                         .is_some_and(|ext| ext.eq_ignore_ascii_case("wasm"))
+                 {
+-                    let wasm_bytes = std::fs::read(path).unwrap_or_default();
+-                    if !crate::plugin::loader::wasm::wasm_host::signature::is_wasm_signed(
+-                        &wasm_bytes,
+-                    ) {
+-                        return Err(ManagerError::LoaderError(LoaderError::RuntimeError(
+-                            format!(
+-                                "Plugin \"{}\" is unsigned or invalid and allow_unsigned is disabled",
+-                                metadata.name
+-                            ),
+-                        )));
++                    #[cfg(feature = "plugin-loaders")]
++                    {
++                        let wasm_bytes = std::fs::read(path).unwrap_or_default();
++                        if !crate::plugin::loader::wasm::wasm_host::signature::is_wasm_signed(
++                            &wasm_bytes,
++                        ) {
++                            return Err(ManagerError::LoaderError(LoaderError::RuntimeError(
++                                format!(
++                                    "Plugin \"{}\" is unsigned or invalid and allow_unsigned is disabled",
++                                    metadata.name
++                                ),
++                            )));
++                        }
+                     }
+                 }
+ 
+@@ -1257,6 +1303,7 @@ impl PluginManager {
+             return;
+         }
+ 
++        #[cfg(not(feature = "single-threaded"))]
+         if tokio::runtime::Handle::try_current().is_ok() {
+             tokio::task::block_in_place(|| {
+                 server.runtime.block_on(self.fire(server, event));
+@@ -1264,6 +1311,13 @@ impl PluginManager {
+         } else {
+             server.runtime.block_on(self.fire(server, event));
+         }
++        // Emscripten runs a single-thread cooperative runtime, so a sync blocking
++        // fire is impossible. Reaching here requires registered handlers, which only
++        // plugin loaders create (disabled on emscripten), so this is unreachable.
++        #[cfg(feature = "single-threaded")]
++        {
++            let _ = (server, event);
++        }
+     }
+ 
+     #[expect(clippy::result_unit_err)]
+diff --git a/crates/pumpkin/src/server/mod.rs b/crates/pumpkin/src/server/mod.rs
+index 28690a867..5f58b8b58 100644
+--- a/crates/pumpkin/src/server/mod.rs
++++ b/crates/pumpkin/src/server/mod.rs
+@@ -64,6 +64,7 @@ pub mod ticker;
+ pub use recipe::RecipeManager;
+ 
+ use crate::data::advancement_data::AdvancementManager;
++#[cfg(feature = "plugin-loaders")]
+ use crate::server::scheduler::TaskScheduler;
+ 
+ /// Represents a Minecraft server instance.
+@@ -143,6 +144,7 @@ pub struct Server {
+     /// Player idle timeout in minutes (0 = disabled)
+     pub player_idle_timeout: AtomicI32,
+     /// Manages scheduled tasks (e.g. from plugins)
++    #[cfg(feature = "plugin-loaders")]
+     pub task_scheduler: Arc<TaskScheduler>,
+     /// Manages scheduled datapack functions (`/schedule`)
+     pub scheduled_functions: Arc<crate::server::scheduler::ScheduledFunctionQueue>,
+@@ -314,6 +316,7 @@ impl Server {
+             debug_profiler: debug_profiler::DebugProfiler::new(),
+             tasks: TaskTracker::new(),
+             runtime: tokio::runtime::Handle::current(),
++            #[cfg(feature = "plugin-loaders")]
+             task_scheduler: Arc::new(TaskScheduler::new()),
+             scheduled_functions: Arc::new(crate::server::scheduler::ScheduledFunctionQueue::new()),
+             server_guid: rand::random(),
+@@ -1027,7 +1030,7 @@ impl Server {
+         self.key_store
+             .get_or_init(|| async {
+                 let (tx, rx) = tokio::sync::oneshot::channel();
+-                rayon::spawn(move || {
++                pumpkin_util::rayon_spawn(move || {
+                     let _ = tx.send(Arc::new(KeyStore::new()));
+                 });
+                 rx.await.unwrap_or_else(|_| Arc::new(KeyStore::new()))
+@@ -1051,7 +1054,7 @@ impl Server {
+         let key_store = self.get_or_init_key_store().await.clone();
+         let data = data.to_vec();
+         let (tx, rx) = tokio::sync::oneshot::channel();
+-        rayon::spawn(move || {
++        pumpkin_util::rayon_spawn(move || {
+             let _ = tx.send(key_store.decrypt(&data));
+         });
+         rx.await.map_err(|_| EncryptionError::FailedDecrypt)?
+@@ -1096,6 +1099,7 @@ impl Server {
+ 
+     /// Ticks the game logic for all worlds. This is the part that is affected by `/tick freeze`.
+     pub fn tick_worlds(self: &Arc<Self>) {
++        #[cfg(feature = "plugin-loaders")]
+         self.task_scheduler.tick(self);
+         self.scheduled_functions.tick(
+             self,
+diff --git a/crates/pumpkin/src/server/scheduler.rs b/crates/pumpkin/src/server/scheduler.rs
+index e2056b48a..f6221d64a 100644
+--- a/crates/pumpkin/src/server/scheduler.rs
++++ b/crates/pumpkin/src/server/scheduler.rs
+@@ -1,3 +1,4 @@
++#[cfg(feature = "plugin-loaders")]
+ use crate::plugin::loader::wasm::wasm_host::WasmPlugin;
+ use crate::server::Server;
+ use std::cmp::Ordering;
+@@ -7,6 +8,7 @@ use std::sync::{Arc, Mutex, Weak};
+ 
+ pub type TaskId = u32;
+ 
++#[cfg(feature = "plugin-loaders")]
+ pub struct ScheduledTask {
+     pub id: TaskId,
+     pub plugin: Arc<WasmPlugin>,
+@@ -15,20 +17,24 @@ pub struct ScheduledTask {
+     pub period: Option<u64>,
+ }
+ 
++#[cfg(feature = "plugin-loaders")]
+ impl PartialEq for ScheduledTask {
+     fn eq(&self, other: &Self) -> bool {
+         self.next_tick == other.next_tick
+     }
+ }
+ 
++#[cfg(feature = "plugin-loaders")]
+ impl Eq for ScheduledTask {}
+ 
++#[cfg(feature = "plugin-loaders")]
+ impl PartialOrd for ScheduledTask {
+     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+         Some(self.cmp(other))
+     }
+ }
+ 
++#[cfg(feature = "plugin-loaders")]
+ impl Ord for ScheduledTask {
+     fn cmp(&self, other: &Self) -> Ordering {
+         // Reverse order so BinaryHeap is a min-heap
+@@ -36,6 +42,7 @@ impl Ord for ScheduledTask {
+     }
+ }
+ 
++#[cfg(feature = "plugin-loaders")]
+ pub struct TaskScheduler {
+     tasks: Mutex<BinaryHeap<ScheduledTask>>,
+     cancelled_tasks: Mutex<HashSet<TaskId>>,
+@@ -43,12 +50,14 @@ pub struct TaskScheduler {
+     next_task_id: std::sync::atomic::AtomicU32,
+ }
+ 
++#[cfg(feature = "plugin-loaders")]
+ impl Default for TaskScheduler {
+     fn default() -> Self {
+         Self::new()
+     }
+ }
+ 
++#[cfg(feature = "plugin-loaders")]
+ impl TaskScheduler {
+     #[must_use]
+     pub fn new() -> Self {
+diff --git a/crates/pumpkin/src/server/ticker.rs b/crates/pumpkin/src/server/ticker.rs
+index ae45c2b05..1f35b272b 100644
+--- a/crates/pumpkin/src/server/ticker.rs
++++ b/crates/pumpkin/src/server/ticker.rs
+@@ -16,9 +16,14 @@ use tracing::debug;
+ pub struct Ticker;
+ 
+ impl Ticker {
+-    /// Runs the main server tick loop on a dedicated thread.
+-    pub fn run(server: &Arc<Server>) {
+-        let _guard = server.runtime.enter();
++    /// Runs the main server tick loop. One async implementation drives both execution modes
++    /// (see the spawn sites in `lib.rs`):
++    /// - multi-threaded: `block_on` on a dedicated OS thread, so tick timing is isolated.
++    /// - single-threaded: spawned as a cooperative task on the hosted runtime.
++    ///
++    /// Keeps an absolute tick schedule (`next_tick += tick_interval`) with catch-up clamping,
++    /// so ticks don't slew under load and a slow tick can't trigger a zero-sleep burst.
++    pub async fn run(server: &Arc<Server>) {
+         let mut next_tick = Instant::now();
+         let mut game_test_runner = GameTestRunner::new();
+ 
+@@ -30,11 +35,10 @@ impl Ticker {
+ 
+             let tick_number = server.tick_count.load(Ordering::Relaxed);
+             if server.plugin_manager.has_handlers::<ServerTickStartEvent>() {
+-                server.runtime.block_on(
+-                    server
+-                        .plugin_manager
+-                        .fire(server, &mut ServerTickStartEvent::new(tick_number)),
+-                );
++                server
++                    .plugin_manager
++                    .fire(server, &mut ServerTickStartEvent::new(tick_number))
++                    .await;
+             }
+ 
+             let should_tick_game_tests = manager.runs_normally() || manager.is_sprinting();
+@@ -51,20 +55,21 @@ impl Ticker {
+             }
+ 
+             if should_tick_game_tests {
+-                server.runtime.block_on(async {
+-                    drain_game_test_queue(server, &mut game_test_runner).await;
+-                    game_test_runner.tick().await;
+-                });
++                drain_game_test_queue(server, &mut game_test_runner).await;
++                game_test_runner.tick().await;
+             }
+ 
+             let tick_duration_nanos = tick_start_time.elapsed().as_nanos() as i64;
+ 
+             let tick_number = server.tick_count.load(Ordering::Relaxed);
+             if server.plugin_manager.has_handlers::<ServerTickEndEvent>() {
+-                server.runtime.block_on(server.plugin_manager.fire(
+-                    server,
+-                    &mut ServerTickEndEvent::new(tick_number, tick_duration_nanos),
+-                ));
++                server
++                    .plugin_manager
++                    .fire(
++                        server,
++                        &mut ServerTickEndEvent::new(tick_number, tick_duration_nanos),
++                    )
++                    .await;
+             }
+ 
+             server.update_tick_times(tick_duration_nanos);
+@@ -84,13 +89,10 @@ impl Ticker {
+             let now = Instant::now();
+             if next_tick > now {
+                 let sleep_duration = next_tick - now;
+-                let cancelled = STOP_INTERRUPT.clone();
+-                server.runtime.block_on(async {
+-                    tokio::select! {
+-                        () = tokio::time::sleep(sleep_duration) => {},
+-                        () = cancelled.cancelled() => {},
+-                    }
+-                });
++                tokio::select! {
++                    () = tokio::time::sleep(sleep_duration) => {},
++                    () = STOP_INTERRUPT.cancelled() => {},
++                }
+ 
+                 if STOP_INTERRUPT.is_cancelled() {
+                     break 'ticker;
+diff --git a/crates/pumpkin/src/world/portal/mod.rs b/crates/pumpkin/src/world/portal/mod.rs
+index aeadba752..85bf10aff 100644
+--- a/crates/pumpkin/src/world/portal/mod.rs
++++ b/crates/pumpkin/src/world/portal/mod.rs
+@@ -92,6 +92,7 @@ impl PortalType {
+                         let platform_pos = BlockPos::new(100, 49, 0);
+ 
+                         // Ensure chunks covering the platform are loaded/generated
++                        #[cfg(not(feature = "single-threaded"))]
+                         if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                             tokio::task::block_in_place(|| {
+                                 handle.block_on(async {
+@@ -207,6 +208,7 @@ impl PortalType {
+                 )
+                 .or_else(|| {
+                     // Ensure the chunks around approximate_exit_pos are generated/loaded in dest_world
++                    #[cfg(not(feature = "single-threaded"))]
+                     if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                         tokio::task::block_in_place(|| {
+                             handle.block_on(async {
+diff --git a/crates/pumpkin/src/net/bedrock/nethernet_stub.rs b/crates/pumpkin/src/net/bedrock/nethernet_stub.rs
+new file mode 100644
+index 000000000..90f0989c4
+--- /dev/null
++++ b/crates/pumpkin/src/net/bedrock/nethernet_stub.rs
+@@ -0,0 +1,56 @@
++//! WebRTC-free stub of the NetherNet transport, compiled when the `nethernet`
++//! feature is off (e.g. the emscripten/embedded Java-only build). The types
++//! exist so the always-compiled Bedrock client code type-checks, but no Bedrock
++//! connection is ever created (the listener is never bound), so the method
++//! bodies are unreachable.
++use std::net::SocketAddr;
++use std::sync::Arc;
++
++use bytes::Bytes;
++use pumpkin_util::p384::PublicKey;
++
++pub type IncomingSession = (Arc<NetherNetSession>, SocketAddr);
++
++/// Stub listener: never bound when `nethernet` is off, so `accept` never yields.
++pub struct NetherNetListener {
++    _private: (),
++}
++
++impl NetherNetListener {
++    pub async fn accept(&self) -> Option<IncomingSession> {
++        None
++    }
++
++    pub const fn local_addr(&self) -> SocketAddr {
++        SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
++    }
++}
++
++/// Stub session. Never constructed when `nethernet` is off.
++pub struct NetherNetSession {
++    _private: (),
++}
++
++impl NetherNetSession {
++    pub async fn recv(&self) -> Option<Bytes> {
++        None
++    }
++
++    pub async fn send(&self, _data: Bytes) -> Result<(), String> {
++        Err("NetherNet transport is disabled in this build".to_string())
++    }
++
++    pub async fn send_unreliable(&self, _data: Bytes) -> Result<(), String> {
++        Err("NetherNet transport is disabled in this build".to_string())
++    }
++
++    pub const fn is_closed(&self) -> bool {
++        true
++    }
++
++    pub async fn close(&self) {}
++
++    pub const fn client_public_key(&self) -> Option<&PublicKey> {
++        None
++    }
++}

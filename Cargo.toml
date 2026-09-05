@@ -1,0 +1,56 @@
+[package]
+name = "pumpkin-worker"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+publish = false
+description = "A Rust Minecraft server in a Cloudflare Durable Object"
+readme = "README.md"
+autobins = false
+
+[workspace]
+exclude = [".work"]
+resolver = "2"
+
+[features]
+test-fixtures = []
+
+[[bin]]
+name = "filesystem-probe"
+path = "tests/fixtures/filesystem.rs"
+required-features = ["test-fixtures"]
+
+[[bin]]
+name = "pumpkin-do"
+path = "src/main.rs"
+
+[dependencies]
+wasm-bindgen = { path = ".work/wasm-bindgen" }
+js-sys = { path = ".work/wasm-bindgen/crates/js-sys" }
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "sync", "time", "net", "io-util"] }
+pumpkin = { path = ".work/pumpkin/crates/pumpkin", default-features = false, features = ["single-threaded"] }
+pumpkin-config = { path = ".work/pumpkin/crates/pumpkin-config", default-features = false }
+rayon = "1.12"
+worker = { path = ".work/workers-rs/worker", default-features = false }
+
+[patch.crates-io]
+js-sys = { path = ".work/wasm-bindgen/crates/js-sys" }
+wasm-bindgen = { path = ".work/wasm-bindgen" }
+wasm-bindgen-futures = { path = ".work/wasm-bindgen/crates/futures" }
+wasm-bindgen-macro-support = { path = ".work/wasm-bindgen/crates/macro-support" }
+wasm-bindgen-shared = { path = ".work/wasm-bindgen/crates/shared" }
+web-sys = { path = ".work/wasm-bindgen/crates/web-sys" }
+wasm-streams = { path = ".work/wasm-streams" }
+libc = { path = ".work/libc" }
+mio = { git = "https://github.com/guybedford/mio", rev = "a62c9e46833fc255c9217ab9aa362c6221ed4401" }
+ring = { path = ".work/ring" }
+socket2 = { git = "https://github.com/rust-lang/socket2", rev = "239dd83a4ced08e514d2c38942aab99791119f0d" }
+tokio = { path = ".work/tokio/tokio" }
+tokio-macros = { path = ".work/tokio/tokio-macros" }
+
+[patch."https://github.com/guybedford/libc"]
+libc = { path = ".work/libc" }
+
+
+[profile.release]
+opt-level = "s"

@@ -1,0 +1,817 @@
+Subject: [PATCH] Reduce Pumpkin structure-template and generation memory
+
+Loaded structure templates previously retained a block-state description for
+every block and a second placement list. Store palette indices, share the first
+palette's block array with the placement accessors, and borrow descriptions for
+queries. Share immutable block-entity NBT until a placement needs an owned copy.
+Update template consumers and cover ordering, multiple palettes, round trips,
+entity data, and copy-on-placement behavior.
+
+Retain generation chunks as uniform or indexed sections instead of full-height
+dense arrays. Use a dense scratch buffer only during the active noise pass to
+avoid per-voxel palette bookkeeping, then compact it before retaining the chunk.
+Generation dependencies, dimensions, and block values remain unchanged.
+
+Base-commit: b5b9b9d7010e793806a83c495af223c67e1d35ee
+
+---
+diff --git a/crates/pumpkin-world/src/generation/feature/features/fossil.rs b/crates/pumpkin-world/src/generation/feature/features/fossil.rs
+index 226ee1833..0e774e8bc 100644
+--- a/crates/pumpkin-world/src/generation/feature/features/fossil.rs
++++ b/crates/pumpkin-world/src/generation/feature/features/fossil.rs
+@@ -169,7 +169,7 @@ fn place_fossil_template<T: GenerationCache>(
+     random: &mut RandomGenerator,
+     placement_box: &BlockBox,
+ ) {
+-    for block in &template.blocks {
++    for block in template.blocks.iter() {
+         let local_pos = rotation.transform_pos(block.pos, template.size);
+         let world_pos = origin + local_pos;
+
+diff --git a/crates/pumpkin-world/src/generation/proto_chunk.rs b/crates/pumpkin-world/src/generation/proto_chunk.rs
+index 727a58a31..cc4c8e77e 100644
+--- a/crates/pumpkin-world/src/generation/proto_chunk.rs
++++ b/crates/pumpkin-world/src/generation/proto_chunk.rs
+@@ -38,6 +38,7 @@ use super::{
+ };
+ use crate::biome::{BiomeSupplier, MultiNoiseBiomeSupplier, end::TheEndBiomeSupplier};
+ use crate::chunk::format::LightContainer;
++use crate::chunk::palette::BlockPalette;
+ use crate::chunk::{ChunkData, ChunkHeightmapType, ChunkLight};
+ use crate::chunk_system::{StagedChunkEnum, generation_cache::SurfaceBiomeNeighborhood};
+ use crate::generation::height_limit::HeightLimitView;
+@@ -138,7 +139,12 @@ pub struct ProtoChunk {
+     pub z: i32,
+     pub default_block: &'static BlockState,
+     biome_mixer_seed: i64,
+-    pub(crate) flat_block_map: Box<[BlockStateId]>,
++    // Generation retains many surrounding chunks. Keep untouched sections
++    // uniform and use the same indexed storage as finished chunks.
++    block_sections: Box<[BlockPalette]>,
++    // Only the active noise pass uses a dense scratch buffer. Palette mutation
++    // bookkeeping is expensive when writing every voxel in a chunk.
++    noise_blocks: Option<Box<[BlockStateId]>>,
+     pub flat_biome_map: Box<[u8]>,
+     pub flat_surface_height_map: [i16; CHUNK_AREA],
+     pub flat_ocean_floor_height_map: [i16; CHUNK_AREA],
+@@ -235,8 +241,9 @@ impl ProtoChunk {
+             z,
+             default_block,
+             biome_mixer_seed,
+-            flat_block_map: vec![BlockStateId::AIR; CHUNK_AREA * height as usize]
++            block_sections: vec![BlockPalette::Homogeneous(BlockStateId::AIR); section_count]
+                 .into_boxed_slice(),
++            noise_blocks: None,
+             flat_biome_map: vec![
+                 Biome::PLAINS.id;
+                 biome_coords::from_block(CHUNK_DIM as i32) as usize
+@@ -506,13 +513,6 @@ impl ProtoChunk {
+         x as usize * CHUNK_DIM as usize + z as usize
+     }
+
+-    #[inline]
+-    const fn local_pos_to_block_index(&self, x: i32, y: i32, z: i32) -> usize {
+-        self.height() as usize * CHUNK_DIM as usize * x as usize
+-            + CHUNK_DIM as usize * y as usize
+-            + z as usize
+-    }
+-
+     #[inline]
+     #[must_use]
+     pub const fn local_biome_pos_to_biome_index(&self, x: i32, y: i32, z: i32) -> usize {
+@@ -531,8 +531,10 @@ impl ProtoChunk {
+     #[inline]
+     #[must_use]
+     pub fn get_block_state_raw(&self, x: i32, y: i32, z: i32) -> BlockStateId {
+-        let index = self.local_pos_to_block_index(x, y, z);
+-        self.flat_block_map[index]
++        if let Some(blocks) = &self.noise_blocks {
++            return blocks[(x as usize * self.height as usize + y as usize) * 16 + z as usize];
++        }
++        self.block_sections[y as usize / 16].get(x as usize, y as usize & 15, z as usize)
+     }
+
+     #[inline]
+@@ -573,8 +575,17 @@ impl ProtoChunk {
+             }
+         }
+
+-        let index = self.local_pos_to_block_index(local_x, local_y, local_z);
+-        self.flat_block_map[index] = block_state.id;
++        if let Some(blocks) = &mut self.noise_blocks {
++            blocks[(local_x as usize * self.height as usize + local_y as usize) * 16
++                + local_z as usize] = block_state.id;
++        } else {
++            self.block_sections[local_y as usize / 16].set(
++                local_x as usize,
++                local_y as usize & 15,
++                local_z as usize,
++                block_state.id,
++            );
++        }
+     }
+
+     #[inline]
+@@ -869,6 +880,18 @@ impl ProtoChunk {
+         let volume = *noise_sampler.volume();
+         let densities = noise_sampler.sample_density();
+
++        let height = self.height as usize;
++        let mut blocks = vec![BlockStateId::AIR; CHUNK_AREA * height];
++        for x in 0..16 {
++            for y in 0..height {
++                for z in 0..16 {
++                    blocks[(x * height + y) * 16 + z] =
++                        self.get_block_state_raw(x as i32, y as i32, z as i32);
++                }
++            }
++        }
++        self.noise_blocks = Some(blocks.into_boxed_slice());
++
+         for z in 0..volume.size_z {
+             let block_z = volume.block_z(z);
+             for x in 0..volume.size_x {
+@@ -889,6 +912,11 @@ impl ProtoChunk {
+                 }
+             }
+         }
++        let blocks = self.noise_blocks.take().unwrap();
++        for (section, palette) in self.block_sections.iter_mut().enumerate() {
++            *palette =
++                BlockPalette::from_fn(|x, y, z| blocks[(x * height + section * 16 + y) * 16 + z]);
++        }
+     }
+
+     pub fn spawn_mobs<T: GenerationCache>(cache: &mut T, block_registry: &dyn WorldPortalExt) {
+diff --git a/crates/pumpkin-world/src/generation/structure/structures/end_city/layout.rs b/crates/pumpkin-world/src/generation/structure/structures/end_city/layout.rs
+index a7f29d8dc..ca0dc47dd 100644
+--- a/crates/pumpkin-world/src/generation/structure/structures/end_city/layout.rs
++++ b/crates/pumpkin-world/src/generation/structure/structures/end_city/layout.rs
+@@ -663,7 +663,7 @@ mod tests {
+             "tower_top",
+         ] {
+             let template = get_template(&format!("end_city/{name}")).unwrap();
+-            for palette in &template.palette {
++            for palette in template.palette.iter() {
+                 for rotation in [
+                     Rotation::None,
+                     Rotation::Clockwise90,
+diff --git a/crates/pumpkin-world/src/generation/structure/structures/end_city/mod.rs b/crates/pumpkin-world/src/generation/structure/structures/end_city/mod.rs
+index 8089b3e69..9bb82ed9c 100644
+--- a/crates/pumpkin-world/src/generation/structure/structures/end_city/mod.rs
++++ b/crates/pumpkin-world/src/generation/structure/structures/end_city/mod.rs
+@@ -98,7 +98,7 @@ impl EndCityTemplatePiece {
+         random: &mut RandomGenerator,
+         chunk_box: &BlockBox,
+     ) {
+-        for block in &self.descriptor.template.blocks {
++        for block in self.descriptor.template.blocks.iter() {
+             let palette = &self.descriptor.template.palette[block.state as usize];
+             if matches!(
+                 palette.name.as_str(),
+@@ -117,10 +117,10 @@ impl EndCityTemplatePiece {
+                 continue;
+             };
+             chunk.set_block_state(position.x, position.y, position.z, state);
+-            Self::place_block_entity(chunk, palette, block.nbt.as_ref(), position, random);
++            Self::place_block_entity(chunk, palette, block.nbt.as_deref(), position, random);
+         }
+
+-        for block in &self.descriptor.template.blocks {
++        for block in self.descriptor.template.blocks.iter() {
+             let palette = &self.descriptor.template.palette[block.state as usize];
+             if palette.name != "minecraft:structure_block" {
+                 continue;
+diff --git a/crates/pumpkin-world/src/generation/structure/structures/igloo.rs b/crates/pumpkin-world/src/generation/structure/structures/igloo.rs
+index 9130b4626..363993029 100644
+--- a/crates/pumpkin-world/src/generation/structure/structures/igloo.rs
++++ b/crates/pumpkin-world/src/generation/structure/structures/igloo.rs
+@@ -190,7 +190,7 @@ impl IglooPiece {
+             &mut context_rng,
+         );
+
+-        for block in &self.template.blocks {
++        for block in self.template.blocks.iter() {
+             let palette_entry = &self.template.palette[block.state as usize];
+
+             let local_pos =
+@@ -226,7 +226,7 @@ impl IglooPiece {
+                 continue;
+             }
+
+-            let mut block_entity_nbt = block.nbt.clone();
++            let mut block_entity_nbt = block.nbt.as_deref().cloned();
+             let placed_entry = palette_entry.clone();
+
+             let Some(state) = BlockStateResolver::resolve(&placed_entry, rotation, mirror) else {
+diff --git a/crates/pumpkin-world/src/generation/structure/structures/jigsaw.rs b/crates/pumpkin-world/src/generation/structure/structures/jigsaw.rs
+index ef4f28879..17adbfbf0 100644
+--- a/crates/pumpkin-world/src/generation/structure/structures/jigsaw.rs
++++ b/crates/pumpkin-world/src/generation/structure/structures/jigsaw.rs
+@@ -310,7 +310,7 @@ impl PoolElementKind {
+                     return Vec::new();
+                 };
+                 let mut jigsaws = Vec::new();
+-                for block in &template.blocks {
++                for block in template.blocks.iter() {
+                     if let Some(jigsaw) = JigsawBlock::from_template_block(
+                         block,
+                         &template.palette[block.state as usize],
+diff --git a/crates/pumpkin-world/src/generation/structure/structures/mansion/mod.rs b/crates/pumpkin-world/src/generation/structure/structures/mansion/mod.rs
+index e4cb49032..53b67b4a6 100644
+--- a/crates/pumpkin-world/src/generation/structure/structures/mansion/mod.rs
++++ b/crates/pumpkin-world/src/generation/structure/structures/mansion/mod.rs
+@@ -276,7 +276,7 @@ impl MansionTemplatePiece {
+         random: &mut RandomGenerator,
+         chunk_box: &BlockBox,
+     ) {
+-        for template_block in &self.template.blocks {
++        for template_block in self.template.blocks.iter() {
+             let palette = &self.template.palette[template_block.state as usize];
+             let position = self.world_position(template_block.pos);
+             if !chunk_box.contains_pos(&position) {
+@@ -313,7 +313,7 @@ impl MansionTemplatePiece {
+             Self::place_block_entity(
+                 chunk,
+                 palette,
+-                template_block.nbt.as_ref(),
++                template_block.nbt.as_deref(),
+                 position,
+                 random,
+             );
+diff --git a/crates/pumpkin-world/src/generation/structure/structures/nether_fossil.rs b/crates/pumpkin-world/src/generation/structure/structures/nether_fossil.rs
+index 73047f6d6..da14d13c1 100644
+--- a/crates/pumpkin-world/src/generation/structure/structures/nether_fossil.rs
++++ b/crates/pumpkin-world/src/generation/structure/structures/nether_fossil.rs
+@@ -182,10 +182,10 @@ impl NetherFossilPiece {
+             &mut context_rng,
+         );
+
+-        for block in &self.template.blocks {
++        for block in self.template.blocks.iter() {
+             let palette_entry = &self.template.palette[block.state as usize];
+
+-            let mut block_entity_nbt = block.nbt.clone();
++            let mut block_entity_nbt = block.nbt.as_deref().cloned();
+             let placed_entry = palette_entry.clone();
+
+             let Some(state) = BlockStateResolver::resolve(&placed_entry, rotation, mirror) else {
+diff --git a/crates/pumpkin-world/src/generation/structure/structures/ocean_ruin.rs b/crates/pumpkin-world/src/generation/structure/structures/ocean_ruin.rs
+index 5823f93bd..abe91eba9 100644
+--- a/crates/pumpkin-world/src/generation/structure/structures/ocean_ruin.rs
++++ b/crates/pumpkin-world/src/generation/structure/structures/ocean_ruin.rs
+@@ -459,7 +459,7 @@ impl StructurePieceBase for OceanRuinPiece {
+
+         let mut suspicious_count = 0;
+
+-        for block in &self.template.blocks {
++        for block in self.template.blocks.iter() {
+             let palette_entry = &self.template.palette[block.state as usize];
+
+             if palette_entry.name == "minecraft:structure_void"
+diff --git a/crates/pumpkin-world/src/generation/structure/structures/ruined_portal.rs b/crates/pumpkin-world/src/generation/structure/structures/ruined_portal.rs
+index 404a63b21..a486ec2a9 100644
+--- a/crates/pumpkin-world/src/generation/structure/structures/ruined_portal.rs
++++ b/crates/pumpkin-world/src/generation/structure/structures/ruined_portal.rs
+@@ -293,10 +293,10 @@ impl RuinedPortalPiece {
+             &mut context_rng,
+         );
+
+-        for block in &self.template.blocks {
++        for block in self.template.blocks.iter() {
+             let palette_entry = &self.template.palette[block.state as usize];
+
+-            let mut block_entity_nbt = block.nbt.clone();
++            let mut block_entity_nbt = block.nbt.as_deref().cloned();
+             let placed_entry = palette_entry.clone();
+
+             let Some(mut state) = BlockStateResolver::resolve(&placed_entry, rotation, mirror)
+diff --git a/crates/pumpkin-world/src/generation/structure/structures/shipwreck.rs b/crates/pumpkin-world/src/generation/structure/structures/shipwreck.rs
+index 53ced600c..029775470 100644
+--- a/crates/pumpkin-world/src/generation/structure/structures/shipwreck.rs
++++ b/crates/pumpkin-world/src/generation/structure/structures/shipwreck.rs
+@@ -307,7 +307,7 @@ impl StructurePieceBase for ShipwreckPiece {
+
+         // Place non-marker blocks
+         let box_limit = self.piece.bounding_box;
+-        for block in &self.template.blocks {
++        for block in self.template.blocks.iter() {
+             let palette_entry = &self.template.palette[block.state as usize];
+
+             if palette_entry.name == "minecraft:structure_block"
+@@ -393,7 +393,7 @@ impl StructurePieceBase for ShipwreckPiece {
+         }
+
+         // Process data markers
+-        for block in &self.template.blocks {
++        for block in self.template.blocks.iter() {
+             let palette_entry = &self.template.palette[block.state as usize];
+             if palette_entry.name == "minecraft:structure_block"
+                 && let Some(nbt) = &block.nbt
+diff --git a/crates/pumpkin-world/src/generation/structure/template/mod.rs b/crates/pumpkin-world/src/generation/structure/template/mod.rs
+index 5e1f6636c..aa7938006 100644
+--- a/crates/pumpkin-world/src/generation/structure/template/mod.rs
++++ b/crates/pumpkin-world/src/generation/structure/template/mod.rs
+@@ -117,7 +117,7 @@ pub fn place_template_with_options(
+     let mut context_rng = LegacyRand::from_seed(hash_block_pos(world_x, origin.y, world_z) as u64);
+     let mut context = processor::ProcessorContext::new(origin, processors, &mut context_rng);
+
+-    for block in &template.blocks {
++    for block in template.blocks.iter() {
+         let palette_entry = &template.palette[block.state as usize];
+
+         // Structure blocks are data markers.
+@@ -125,7 +125,7 @@ pub fn place_template_with_options(
+             continue;
+         }
+
+-        let mut block_entity_nbt = block.nbt.clone();
++        let mut block_entity_nbt = block.nbt.as_deref().cloned();
+         let mut placed_entry = palette_entry.clone();
+
+         // Jigsaw blocks are replaced during template processing, before block entities are
+diff --git a/crates/pumpkin-world/src/generation/structure/template/structure_template.rs b/crates/pumpkin-world/src/generation/structure/template/structure_template.rs
+index 211c79e90..bd0406775 100644
+--- a/crates/pumpkin-world/src/generation/structure/template/structure_template.rs
++++ b/crates/pumpkin-world/src/generation/structure/template/structure_template.rs
+@@ -4,6 +4,7 @@
+ //! into a runtime representation with palettes, entities, block info, and transformations.
+
+ use std::io::Cursor;
++use std::sync::Arc;
+
+ use pumpkin_data::{Mirror, Rotation};
+ use pumpkin_nbt::{compound::NbtCompound, nbt_compress::read_gzip_compound_tag, tag::NbtTag};
+@@ -195,9 +196,9 @@ pub struct StructureTemplate {
+     pub size: Vector3<i32>,
+     pub author: String,
+
+-    // Backward-compatible fields
+-    pub palette: Vec<PaletteEntry>,
+-    pub blocks: Vec<TemplateBlock>,
++    // Views of the first palette. Both APIs share the same indexed storage.
++    pub palette: Arc<[PaletteEntry]>,
++    pub blocks: Arc<[TemplateBlock]>,
+     pub entities: Vec<TemplateEntity>,
+ }
+
+@@ -332,6 +333,20 @@ pub struct StructureBlockInfo {
+     pub nbt: Option<NbtCompound>,
+ }
+
++/// A borrowed view over an indexed template block. Only callers producing a
++/// transformed/mutable block need to materialize owned strings and NBT.
++pub struct StructureBlockInfoRef<'a> {
++    pub pos: Vector3<i32>,
++    pub state: &'a PaletteEntry,
++    pub nbt: Option<&'a NbtCompound>,
++}
++
++impl StructureBlockInfoRef<'_> {
++    fn into_owned(self) -> StructureBlockInfo {
++        StructureBlockInfo::new(self.pos, self.state.clone(), self.nbt.cloned())
++    }
++}
++
+ impl StructureBlockInfo {
+     #[must_use]
+     pub const fn new(pos: Vector3<i32>, state: PaletteEntry, nbt: Option<NbtCompound>) -> Self {
+@@ -422,41 +437,61 @@ impl JigsawBlockInfo {
+ /// Represents a palette of block placements within a template.
+ #[derive(Debug, Clone)]
+ pub struct Palette {
+-    blocks: Vec<StructureBlockInfo>,
++    blocks: Arc<[TemplateBlock]>,
++    entries: Arc<[PaletteEntry]>,
+     cached_jigsaws: Option<Vec<JigsawBlockInfo>>,
+ }
+
+ impl Palette {
+     #[must_use]
+-    pub const fn new(blocks: Vec<StructureBlockInfo>) -> Self {
++    pub fn new(blocks: Vec<StructureBlockInfo>) -> Self {
++        let mut palette = SimplePalette::new();
++        let blocks = blocks
++            .into_iter()
++            .map(|block| TemplateBlock {
++                pos: block.pos,
++                state: palette.id_for(block.state),
++                nbt: block.nbt.map(Arc::new),
++            })
++            .collect();
+         Self {
+             blocks,
++            entries: palette.entries.into(),
+             cached_jigsaws: None,
+         }
+     }
+
+     #[must_use]
+-    pub fn blocks(&self) -> &[StructureBlockInfo] {
+-        &self.blocks
++    pub fn blocks(&self) -> impl ExactSizeIterator<Item = StructureBlockInfoRef<'_>> {
++        self.blocks.iter().map(|block| self.block_view(block))
++    }
++
++    fn block_view<'a>(&'a self, block: &'a TemplateBlock) -> StructureBlockInfoRef<'a> {
++        StructureBlockInfoRef {
++            pos: block.pos,
++            state: &self.entries[block.state as usize],
++            nbt: block.nbt.as_deref(),
++        }
+     }
+
+     #[must_use]
+     pub fn blocks_by_name(&self, filter: &str) -> Vec<StructureBlockInfo> {
+-        self.blocks
+-            .iter()
++        self.blocks()
+             .filter(|b| b.state.name == filter)
+-            .cloned()
++            .map(StructureBlockInfoRef::into_owned)
+             .collect()
+     }
+
+     pub fn jigsaws(&mut self) -> &[JigsawBlockInfo] {
+-        self.cached_jigsaws.get_or_insert_with(|| {
+-            self.blocks
+-                .iter()
+-                .filter(|b| b.state.name == "minecraft:jigsaw")
+-                .map(|b| JigsawBlockInfo::of(b.clone()))
+-                .collect()
+-        })
++        if self.cached_jigsaws.is_none() {
++            self.cached_jigsaws = Some(
++                self.blocks()
++                    .filter(|b| b.state.name == "minecraft:jigsaw")
++                    .map(|b| JigsawBlockInfo::of(b.into_owned()))
++                    .collect(),
++            );
++        }
++        self.cached_jigsaws.as_deref().unwrap()
+     }
+ }
+
+@@ -507,11 +542,11 @@ impl SimplePalette {
+ }
+
+ /// A single block placement in the template (legacy format).
+-#[derive(Debug, Clone)]
++#[derive(Debug, Clone, PartialEq)]
+ pub struct TemplateBlock {
+     pub pos: Vector3<i32>,
+     pub state: u32,
+-    pub nbt: Option<NbtCompound>,
++    pub nbt: Option<Arc<NbtCompound>>,
+ }
+
+ /// An entity to spawn when placing the template (legacy format).
+@@ -842,7 +877,7 @@ impl StructureTemplate {
+                     result.push(StructureBlockInfo::new(
+                         block_pos,
+                         block_info.state.rotate(settings.get_rotation()),
+-                        block_info.nbt.clone(),
++                        block_info.nbt.cloned(),
+                     ));
+                 }
+             }
+@@ -971,81 +1006,71 @@ impl StructureTemplate {
+         palette_list: &[NbtTag],
+         block_list: &[NbtTag],
+     ) -> Result<(), TemplateError> {
+-        let mut palette = SimplePalette::new();
+-        for (i, tag) in palette_list.iter().enumerate() {
++        let mut entries = Vec::with_capacity(palette_list.len());
++        for tag in palette_list {
+             let NbtTag::Compound(entry_compound) = tag else {
+                 return Err(TemplateError::InvalidFieldType("palette entry"));
+             };
+-            let entry = PaletteEntry::from_nbt_compound(entry_compound)?;
+-            palette.add_mapping(entry, i);
++            entries.push(PaletteEntry::from_nbt_compound(entry_compound)?);
+         }
+-
+-        let mut full_block_list = Vec::new();
+-        let mut block_entities_list = Vec::new();
+-        let mut other_blocks_list = Vec::new();
+-
++        let mut blocks = Vec::with_capacity(block_list.len());
++        let mut fallback_air = None;
+         for tag in block_list {
+             let NbtTag::Compound(block_compound) = tag else {
+                 return Err(TemplateError::InvalidFieldType("blocks entry"));
+             };
+-
+             let pos_list = block_compound
+                 .get_list(Self::BLOCK_TAG_POS)
+                 .ok_or(TemplateError::MissingField("blocks.pos"))?;
+             if pos_list.len() != 3 {
+                 return Err(TemplateError::InvalidFieldType("blocks.pos"));
+             }
+-
+-            let x =
+-                Self::extract_int(&pos_list[0]).ok_or(TemplateError::InvalidFieldType("pos"))?;
+-            let y =
+-                Self::extract_int(&pos_list[1]).ok_or(TemplateError::InvalidFieldType("pos"))?;
+-            let z =
+-                Self::extract_int(&pos_list[2]).ok_or(TemplateError::InvalidFieldType("pos"))?;
+-
+-            let state_idx = block_compound
++            let mut pos = [0; 3];
++            for (value, tag) in pos.iter_mut().zip(pos_list) {
++                *value = Self::extract_int(tag).ok_or(TemplateError::InvalidFieldType("pos"))?;
++            }
++            let index = block_compound
+                 .get_int(Self::BLOCK_TAG_STATE)
+                 .ok_or(TemplateError::MissingField("blocks.state"))?
+                 as usize;
+-
+-            let state = palette
+-                .state_for(state_idx)
+-                .cloned()
+-                .unwrap_or_else(|| PaletteEntry::new("minecraft:air".to_string()));
+-
+-            let nbt = block_compound.get_compound(Self::BLOCK_TAG_NBT).cloned();
+-
+-            let info = StructureBlockInfo::new(Vector3::new(x, y, z), state, nbt);
+-            Self::add_to_lists(
+-                info,
+-                &mut full_block_list,
+-                &mut block_entities_list,
+-                &mut other_blocks_list,
+-            );
++            let state = if index < entries.len() {
++                index as u32
++            } else {
++                *fallback_air.get_or_insert_with(|| {
++                    let index = entries.len() as u32;
++                    entries.push(PaletteEntry::new("minecraft:air".to_string()));
++                    index
++                })
++            };
++            blocks.push(TemplateBlock {
++                pos: Vector3::new(pos[0], pos[1], pos[2]),
++                state,
++                nbt: block_compound
++                    .get_compound(Self::BLOCK_TAG_NBT)
++                    .cloned()
++                    .map(Arc::new),
++            });
+         }
+-
+-        let block_info_list =
+-            Self::build_info_list(full_block_list, block_entities_list, other_blocks_list);
+-        self.palettes.push(Palette::new(block_info_list));
+-
++        // Preserve the old stable full-cube / other / block-entity ordering,
++        // without allocating three lists of owned block-state descriptions.
++        blocks.sort_by_key(|block| {
++            let group = if block.nbt.is_some() {
++                2
++            } else if Self::is_full_cube_block(&entries[block.state as usize].name) {
++                0
++            } else {
++                1
++            };
++            (group, block.pos.y, block.pos.x, block.pos.z)
++        });
++        self.palettes.push(Palette {
++            blocks: blocks.into(),
++            entries: entries.into(),
++            cached_jigsaws: None,
++        });
+         Ok(())
+     }
+
+-    fn add_to_lists(
+-        info: StructureBlockInfo,
+-        full_block_list: &mut Vec<StructureBlockInfo>,
+-        block_entities_list: &mut Vec<StructureBlockInfo>,
+-        other_blocks_list: &mut Vec<StructureBlockInfo>,
+-    ) {
+-        if info.nbt.is_some() {
+-            block_entities_list.push(info);
+-        } else if Self::is_full_cube_block(&info.state.name) {
+-            full_block_list.push(info);
+-        } else {
+-            other_blocks_list.push(info);
+-        }
+-    }
+-
+     fn is_full_cube_block(name: &str) -> bool {
+         let stripped = name.strip_prefix("minecraft:").unwrap_or(name);
+         !(stripped.contains("air")
+@@ -1066,48 +1091,13 @@ impl StructureTemplate {
+             || stripped.contains("scaffolding"))
+     }
+
+-    fn build_info_list(
+-        mut full_block_list: Vec<StructureBlockInfo>,
+-        mut block_entities_list: Vec<StructureBlockInfo>,
+-        mut other_blocks_list: Vec<StructureBlockInfo>,
+-    ) -> Vec<StructureBlockInfo> {
+-        let comparator = |a: &StructureBlockInfo, b: &StructureBlockInfo| {
+-            a.pos
+-                .y
+-                .cmp(&b.pos.y)
+-                .then_with(|| a.pos.x.cmp(&b.pos.x))
+-                .then_with(|| a.pos.z.cmp(&b.pos.z))
+-        };
+-        full_block_list.sort_by(comparator);
+-        other_blocks_list.sort_by(comparator);
+-        block_entities_list.sort_by(comparator);
+-
+-        let mut result = Vec::with_capacity(
+-            full_block_list.len() + other_blocks_list.len() + block_entities_list.len(),
+-        );
+-        result.extend(full_block_list);
+-        result.extend(other_blocks_list);
+-        result.extend(block_entities_list);
+-        result
+-    }
+-
+     fn sync_legacy_fields(&mut self) {
+         if let Some(main_palette) = self.palettes.first() {
+-            let mut simple_palette = SimplePalette::new();
+-            let mut blocks = Vec::with_capacity(main_palette.blocks().len());
+-            for b in main_palette.blocks() {
+-                let state_id = simple_palette.id_for(b.state.clone());
+-                blocks.push(TemplateBlock {
+-                    pos: b.pos,
+-                    state: state_id,
+-                    nbt: b.nbt.clone(),
+-                });
+-            }
+-            self.palette = simple_palette.entries;
+-            self.blocks = blocks;
++            self.palette = main_palette.entries.clone();
++            self.blocks = main_palette.blocks.clone();
+         } else {
+-            self.palette.clear();
+-            self.blocks.clear();
++            self.palette = Arc::default();
++            self.blocks = Arc::default();
+         }
+
+         self.entities = self
+@@ -1140,7 +1130,7 @@ impl StructureTemplate {
+             let mut block_list = Vec::new();
+             let main_palette_blocks = self.palettes[0].blocks();
+
+-            for (i, block_info) in main_palette_blocks.iter().enumerate() {
++            for (i, block_info) in main_palette_blocks.enumerate() {
+                 let mut block_tag = NbtCompound::new();
+                 let pos_tags = vec![
+                     NbtTag::Int(block_info.pos.x),
+@@ -1152,14 +1142,15 @@ impl StructureTemplate {
+                 let id = palettes[0].id_for(block_info.state.clone());
+                 block_tag.put_int(Self::BLOCK_TAG_STATE, id as i32);
+
+-                if let Some(nbt) = &block_info.nbt {
++                if let Some(nbt) = block_info.nbt {
+                     block_tag.put_compound(Self::BLOCK_TAG_NBT, nbt.clone());
+                 }
+
+                 block_list.push(NbtTag::Compound(block_tag));
+
+                 for p in 1..self.palettes.len() {
+-                    let state = self.palettes[p].blocks()[i].state.clone();
++                    let state =
++                        self.palettes[p].entries[self.palettes[p].blocks[i].state as usize].clone();
+                     palettes[p].add_mapping(state, id as usize);
+                 }
+             }
+@@ -1263,7 +1254,7 @@ impl StructureTemplate {
+     }
+
+     #[must_use]
+-    pub const fn block_count(&self) -> usize {
++    pub fn block_count(&self) -> usize {
+         self.blocks.len()
+     }
+
+@@ -1282,6 +1273,102 @@ impl StructureTemplate {
+ mod tests {
+     use super::*;
+
++    fn assert_same_blocks(before: &Palette, after: &Palette) {
++        assert_eq!(before.blocks.len(), after.blocks.len());
++        for (index, (a, b)) in before.blocks().zip(after.blocks()).enumerate() {
++            let mut a = a.into_owned();
++            let mut b = b.into_owned();
++            // NBT compounds are unordered maps; property order is not semantic.
++            a.state.properties.sort_unstable();
++            b.state.properties.sort_unstable();
++            assert_eq!(a, b, "block {index}");
++        }
++    }
++
++    #[test]
++    fn indexed_template_roundtrip_preserves_palettes_order_and_nbt() {
++        let state =
++            |name: &str| NbtTag::Compound(PaletteEntry::new(name.to_owned()).to_nbt_compound());
++        let mut source = NbtCompound::new();
++        source.put_list("size", vec![NbtTag::Int(3), NbtTag::Int(1), NbtTag::Int(1)]);
++        source.put_list(
++            "palettes",
++            vec![
++                NbtTag::List(vec![
++                    state("minecraft:stone"),
++                    state("minecraft:oak_log"),
++                    state("minecraft:chest"),
++                ]),
++                NbtTag::List(vec![
++                    state("minecraft:dirt"),
++                    state("minecraft:spruce_log"),
++                    state("minecraft:chest"),
++                ]),
++            ],
++        );
++        let blocks = [(1, 2), (2, 1), (0, 0)]
++            .into_iter()
++            .map(|(x, state)| {
++                let mut block = NbtCompound::new();
++                block.put_list("pos", vec![NbtTag::Int(x), NbtTag::Int(0), NbtTag::Int(0)]);
++                block.put_int("state", state);
++                if state == 2 {
++                    let mut nbt = NbtCompound::new();
++                    nbt.put_string("LootTable", "minecraft:chests/simple_dungeon".to_owned());
++                    block.put_compound("nbt", nbt);
++                }
++                NbtTag::Compound(block)
++            })
++            .collect();
++        source.put_list("blocks", blocks);
++        let template = StructureTemplate::from_nbt_compound(&source).unwrap();
++        assert_eq!(
++            template.blocks.iter().map(|b| b.pos.x).collect::<Vec<_>>(),
++            [0, 2, 1]
++        );
++        assert!(Arc::ptr_eq(&template.blocks, &template.palettes[0].blocks));
++        assert!(Arc::ptr_eq(
++            &template.palette,
++            &template.palettes[0].entries
++        ));
++        assert!(std::mem::size_of::<TemplateBlock>() <= 24);
++
++        let restored = StructureTemplate::from_nbt_compound(&template.save()).unwrap();
++        for (before, after) in template.palettes.iter().zip(&restored.palettes) {
++            assert_same_blocks(before, after);
++        }
++        let mut placed = template.palettes[0].blocks().last().unwrap().into_owned();
++        placed
++            .nbt
++            .as_mut()
++            .unwrap()
++            .put_string("LootTable", "changed".to_owned());
++        assert_eq!(
++            template
++                .blocks
++                .last()
++                .unwrap()
++                .nbt
++                .as_ref()
++                .unwrap()
++                .get_string("LootTable"),
++            Some("minecraft:chests/simple_dungeon")
++        );
++    }
++
++    #[test]
++    fn indexed_embedded_template_roundtrip_preserves_entities_and_blocks() {
++        let bytes = super::super::cache::template_bytes("end_city/ship").unwrap();
++        let template = StructureTemplate::from_nbt_bytes(bytes).unwrap();
++        let restored = StructureTemplate::from_nbt_compound(&template.save()).unwrap();
++        assert_eq!(template.size, restored.size);
++        assert_eq!(template.entity_info_list, restored.entity_info_list);
++        assert_eq!(template.palettes.len(), restored.palettes.len());
++        for (before, after) in template.palettes.iter().zip(&restored.palettes) {
++            assert_same_blocks(before, after);
++        }
++    }
++
+     #[test]
+     fn palette_entry_creation() {
+         let entry = PaletteEntry::new("minecraft:stone".to_string());
+diff --git a/crates/pumpkin-world/src/generation/structure/template/template_piece.rs b/crates/pumpkin-world/src/generation/structure/template/template_piece.rs
+index e3f9357b6..68c33f67a 100644
+--- a/crates/pumpkin-world/src/generation/structure/template/template_piece.rs
++++ b/crates/pumpkin-world/src/generation/structure/template/template_piece.rs
+@@ -176,7 +176,7 @@ impl TemplatePiece {
+             .get_bounding_box(&self.place_settings, self.template_position);
+         let box_limit = self.piece.bounding_box;
+
+-        for block in &self.template.blocks {
++        for block in self.template.blocks.iter() {
+             let palette_entry = &self.template.palette[block.state as usize];
+
+             // Structure blocks are data markers
+@@ -185,7 +185,7 @@ impl TemplatePiece {
+             }
+
+             let mut placed_entry = palette_entry.clone();
+-            let mut block_entity_nbt = block.nbt.clone();
++            let mut block_entity_nbt = block.nbt.as_deref().cloned();
+
+             // Jigsaw blocks are replaced with final_state
+             if palette_entry.name == "minecraft:jigsaw" {

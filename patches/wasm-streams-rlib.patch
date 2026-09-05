@@ -1,0 +1,25 @@
+Subject: [PATCH] Build wasm-streams as an rlib for Emscripten
+
+The embedded application links wasm-streams into its final WebAssembly
+module. Declaring both rlib and cdylib also makes Cargo attempt a standalone
+library link, which is incompatible with this static Emscripten build.
+
+Build only the rlib so the application supplies the final link and host
+bindings. The Rust stream adapter API is unchanged.
+
+Base-commit: 35665f7b1da830b5ac51b4c6c3ff13f5c1a09ccb
+
+---
+diff --git a/Cargo.toml b/Cargo.toml
+index c57b1c6..52f6805 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -16,7 +16,7 @@ exclude = [
+ ]
+ 
+ [lib]
+-crate-type = ["cdylib", "rlib"]
++crate-type = ["rlib"]
+ 
+ [dependencies]
+ js-sys = "^0.3.85"

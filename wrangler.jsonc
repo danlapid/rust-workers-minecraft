@@ -1,0 +1,12 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "rust-workers-minecraft",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-09-05",
+  "compatibility_flags": ["nodejs_compat", "new_module_registry", "no_handle_cross_request_promise_resolution"],
+  "dev": { "ip": "127.0.0.1", "port": 8787 },
+  "connect": [{ "protocol": "tcp", "address": "127.0.0.1", "port": 25565 }],
+  "exports": { "MinecraftWorld": { "type": "durable-object", "storage": "sqlite" } },
+  "vars": { "WORLD_NAME": "world" },
+  "observability": { "enabled": true, "head_sampling_rate": 1 }
+}
