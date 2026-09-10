@@ -19,7 +19,7 @@ process to free a port.
 
 ## Reproducibility and data
 
-Changes to patched checkouts (Pumpkin, wasm-bindgen, workers-rs, wasm-streams) must
+Changes to patched checkouts (Pumpkin, wasm-bindgen, workers-rs) must
 be reflected in `patches/`. Keep unpatched checkouts unmodified; update pins for
 upstream changes. Preserve the unified ticker and cooperative scheduler unless
 the task requires a runtime change. Do not reintroduce old Tokio/libc networking

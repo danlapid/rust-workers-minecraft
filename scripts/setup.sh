@@ -50,12 +50,10 @@ checkout libc https://github.com/guybedford/libc libc-0.2-emscripten 4091fe0b0dc
 checkout ring https://github.com/guybedford/ring emscripten 6671f7cfbb13f249b571ffa6326275a8596e0ca2
 checkout pumpkin https://github.com/Pumpkin-MC/Pumpkin master b5b9b9d7010e793806a83c495af223c67e1d35ee
 checkout workers-rs https://github.com/ThomasRubini/workers-rs connect-bindings 7db011ec97658a5d907f3e3102028ce86c044f19
-checkout wasm-streams https://github.com/MattiasBuelens/wasm-streams main 35665f7b1da830b5ac51b4c6c3ff13f5c1a09ccb
 apply_patch wasm-bindgen wasm-bindgen-emscripten-closures.patch
 apply_patch pumpkin pumpkin-emscripten.patch
 apply_patch pumpkin pumpkin-memory.patch
 apply_patch workers-rs workers-rs-emscripten-toolchain.patch
-apply_patch wasm-streams wasm-streams-rlib.patch
 
 if [ "${1:-}" = --sources-only ]; then exit 0; fi
 

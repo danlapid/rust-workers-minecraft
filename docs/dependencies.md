@@ -14,7 +14,6 @@ are ignored under `.work/`. Both Cargo and npm dependency graphs are locked.
 | ring | [emscripten](https://github.com/guybedford/ring) | `6671f7cfbb13f249b571ffa6326275a8596e0ca2` | Portable Emscripten crypto backend; unmodified |
 | pumpkin | [master](https://github.com/Pumpkin-MC/Pumpkin) | `b5b9b9d7010e793806a83c495af223c67e1d35ee` | Headless embedding, shared async scheduler, compact templates/generation chunks, and build-script fixes |
 | workers-rs | [connect-bindings](https://github.com/ThomasRubini/workers-rs) | `7db011ec97658a5d907f3e3102028ce86c044f19` | TCP ingress PR #1041; pinned ABI, Emscripten Tokio promise adapter, host-owned initialization, and socket shutdown flushing |
-| wasm-streams | [v0.6.0](https://github.com/MattiasBuelens/wasm-streams) | `35665f7b1da830b5ac51b4c6c3ff13f5c1a09ccb` | Build only the Rust library; its standalone `cdylib` is incompatible with static Emscripten linking |
 
 Patches are relative to the pinned commits above. Setup checks reverse application
 before applying a patch and refuses to repin a modified checkout.
@@ -29,7 +28,7 @@ commit.
 | Crate | Source | Commit |
 | --- | --- | --- |
 | mio | https://github.com/guybedford/mio | `a62c9e46833fc255c9217ab9aa362c6221ed4401` |
-| socket2 | https://github.com/rust-lang/socket2 | `239dd83a4ced08e514d2c38942aab99791119f0d` |
+| wasm-streams | https://github.com/guybedford/wasm-streams | `115f0f27380a4f5fa33cbd9427a7107ec94cb557` |
 
 The root Cargo.toml applies these overrides and the local checkouts. Cargo.lock
 pins the full application graph. `toolchain/wasm-bindgen.Cargo.lock` separately pins
@@ -61,7 +60,6 @@ git -C .work/pumpkin diff b5b9b9d7010e793806a83c495af223c67e1d35ee -- \
   crates/pumpkin-world/src/generation > .work/pumpkin-memory.diff
 git -C .work/wasm-bindgen diff 4b69f3b3ba4212c857be6854f77fa5aec8b62871 -- crates/cli-support/src/js/mod.rs > .work/wasm-bindgen-emscripten-closures.diff
 git -C .work/workers-rs diff 7db011ec97658a5d907f3e3102028ce86c044f19 > .work/workers-rs-emscripten-toolchain.diff
-git -C .work/wasm-streams diff 35665f7b1da830b5ac51b4c6c3ff13f5c1a09ccb > .work/wasm-streams-rlib.diff
 ```
 
 Replace the corresponding patch's contents from its first `diff --git` line onward
