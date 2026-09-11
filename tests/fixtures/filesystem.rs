@@ -1,31 +1,42 @@
+#![allow(deprecated)]
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use wasm_bindgen::prelude::*;
-use worker::emscripten::{future_to_promise, js_error, socket_from_value};
 
 fn main() {}
 
-#[wasm_bindgen]
-pub fn echo(socket: JsValue) -> js_sys::Promise {
-    future_to_promise(async move {
-        let mut socket = socket_from_value(socket)?;
-        let mut bytes = [0u8; 16 * 1024];
-        loop {
-            let count = socket.read(&mut bytes).await.map_err(js_error)?;
-            if count == 0 {
-                break;
-            }
-            socket.write_all(&bytes[..count]).await.map_err(js_error)?;
-        }
-        socket.shutdown().await.map_err(js_error)?;
-        Ok(JsValue::UNDEFINED)
-    })
+fn js_error(error: impl std::fmt::Display) -> JsValue {
+    js_sys::Error::new(&error.to_string()).into()
 }
 
-#[wasm_bindgen]
-pub fn tick_after(milliseconds: u32) -> js_sys::Promise {
-    future_to_promise(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(milliseconds.into())).await;
-        Ok(JsValue::TRUE)
+/// Echo every accepted connection for the lifetime of the instance.
+#[wasm_bindgen(jspi)]
+pub fn echo_server(ready: js_sys::Function) -> Result<(), JsValue> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(js_error)?;
+    runtime.block_on(async {
+        let listener = TcpListener::bind("0.0.0.0:25565").await.map_err(js_error)?;
+        ready.call0(&JsValue::UNDEFINED)?;
+        loop {
+            let (mut socket, _) = listener.accept().await.map_err(js_error)?;
+            tokio::spawn(async move {
+                let mut bytes = [0u8; 16 * 1024];
+                loop {
+                    match socket.read(&mut bytes).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(count) => {
+                            if socket.write_all(&bytes[..count]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let _ = socket.shutdown().await;
+            });
+        }
     })
 }
 

@@ -11,11 +11,8 @@ diff below it. Preserve the description when regenerating the diff.
 | --- | --- | --- |
 | `pumpkin-emscripten.patch` | `.work/pumpkin` | Headless optional subsystems, single-threaded runtime and blocking-task helper, shared async chunk scheduler with backpressure and timed draining, unified ticker, and platform guards |
 | `pumpkin-memory.patch` | `.work/pumpkin` | Shared indexed structure templates, immutable block-entity NBT, paletted generation chunks, and a temporary dense noise buffer |
-| `wasm-bindgen-emscripten-closures.patch` | `.work/wasm-bindgen` | Escape generated closure-finalizer postsets as JavaScript strings |
-| `workers-rs-emscripten-toolchain.patch` | `.work/workers-rs` | Match the pinned wasm-bindgen ABI, provide the Emscripten Tokio promise adapter, leave initialization/recovery to the host, and flush pending writes before socket shutdown |
 
-`pumpkin-emscripten.patch` includes the injected-stream connection entry point used
-by the DO. Setup applies it before `pumpkin-memory.patch`. The two patches use the
+Setup applies `pumpkin-emscripten.patch` before `pumpkin-memory.patch`. The two patches use the
 same pinned base and currently modify separate files, so each can also be applied
 and checked independently.
 

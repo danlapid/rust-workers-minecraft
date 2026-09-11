@@ -39,6 +39,7 @@ export class MinecraftWorld extends DurableObject<Env> {
         const pending = Promise.resolve().then(() => this.loadRuntime()).then(runtime => {
           this.startupMilliseconds = Date.now() - started;
           this.state = { phase: 'running', runtime };
+          runtime.finished.catch(error => this.fail(error));
           return runtime;
         }).catch(error => { this.fail(error); throw error; });
         this.state = { phase: 'starting', pending };

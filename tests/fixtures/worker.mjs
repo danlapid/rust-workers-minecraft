@@ -1,9 +1,12 @@
 import { DurableObject, exports } from 'cloudflare:workers';
+import { handleAsNodeConnection } from 'cloudflare:node';
 export { StartupFailure } from './startup-failure.mjs';
 import createModule from '../../target/workers/wasm32-unknown-emscripten/release/filesystem-probe.js';
 import wasm from '../../target/workers/wasm32-unknown-emscripten/release/filesystem_probe.wasm';
 import { createWorldRuntime } from '../../worker/filesystem';
 import { forwardSocket } from '../../worker/socket';
+
+const PORT = 25565;
 
 export class FilesystemTest extends DurableObject {
   runtime;
@@ -16,18 +19,23 @@ export class FilesystemTest extends DurableObject {
         receive(instance);
         return instance.exports;
       },
-    }));
+    })).then(async runtime => {
+      await new Promise((ready, reject) => {
+        runtime.run(() => runtime.instance.echo_server(ready)).catch(reject);
+      });
+      return runtime;
+    });
   }
 
   async connect(socket) {
     void socket.closed.catch(() => undefined);
-    const runtime = await this.getRuntime();
-    await runtime.run(() => runtime.instance.echo(socket));
+    await this.getRuntime();
+    await handleAsNodeConnection(socket);
   }
 
   async status() {
-    const runtime = await this.getRuntime();
-    return { timer: await runtime.run(() => runtime.instance.tick_after(20)) };
+    await this.getRuntime();
+    return { listening: true };
   }
 
   async filesystemProbe(value) {
@@ -38,7 +46,7 @@ export class FilesystemTest extends DurableObject {
 
 export default {
   async connect(socket, env) {
-    const target = exports.FilesystemTest.getByName(env.WORLD_NAME).connect('world:25565', { allowHalfOpen: true });
+    const target = exports.FilesystemTest.getByName(env.WORLD_NAME).connect(`world:${PORT}`, { allowHalfOpen: true });
     await forwardSocket(socket, target);
   },
   async fetch(request, env) {

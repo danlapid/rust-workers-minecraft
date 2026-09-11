@@ -5,13 +5,13 @@ Read [README.md](README.md), [architecture](docs/architecture.md), and
 
 ## Project layout
 
-- `src/`: Pumpkin entry points and configuration. The hosted Tokio bridge lives in workers-rs.
+- `src/`: Pumpkin entry points and configuration.
 - `worker/`: TCP ingress, Durable Object lifecycle, and SQLite filesystem.
 - `tests/`: protocol clients, integration tests, and isolated filesystem fixtures.
 - `scripts/setup.sh`: provision pinned sources and build the toolchain.
 - `scripts/{build,serve,test}.sh`: build, run, and validate the Workers server.
 
-Use Node 24+ (26 recommended) and the pinned Rust nightly. Run `npm test` after
+Use Node 24+ (26 recommended) and the pinned Rust toolchain. Run `npm test` after
 build/runtime changes; it must print `PUMPKIN-DO-SQLITE-RESTART-OK` after verifying
 player and chunk restoration. Keep test fixtures out of the production bundle.
 Scripts bind to loopback and fail if their ports are occupied. Do not kill another
@@ -19,8 +19,7 @@ process to free a port.
 
 ## Reproducibility and data
 
-Changes to patched checkouts (Pumpkin, wasm-bindgen, workers-rs) must
-be reflected in `patches/`. Keep unpatched checkouts unmodified; update pins for
+Changes to the patched Pumpkin checkout must be reflected in `patches/`. Keep unpatched checkouts unmodified; update pins for
 upstream changes. Preserve the unified ticker and cooperative scheduler unless
 the task requires a runtime change. Do not reintroduce old Tokio/libc networking
 patches.

@@ -11,10 +11,16 @@ declare module '*pumpkin-do.js' {
     printErr(message: string): void;
   }
   interface Pumpkin {
-    pumpkin_start(): Promise<void>;
-    pumpkin_connect(socket: Socket): Promise<void>;
+    pumpkin_run(ready: () => void): Promise<void>;
+    pumpkin_stop(): void;
     pumpkin_status(): { players: number; ticks: number; wasm_memory_bytes: number };
-    pumpkin_shutdown(): Promise<void>;
   }
   export default function create(options: Options): Promise<Pumpkin>;
+}
+
+// Routes an inbound socket to the net.Server listening on its local address's
+// port within the current Durable Object's port table; resolves when the
+// connection closes.
+declare module 'cloudflare:node' {
+  export function handleAsNodeConnection(socket: Socket): Promise<void>;
 }

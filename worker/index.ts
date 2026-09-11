@@ -1,10 +1,11 @@
 import { exports } from 'cloudflare:workers';
+import { PORT } from './pumpkin';
 import { forwardSocket } from './socket';
 export { MinecraftWorld } from './world';
 
 export default {
   async connect(socket: Socket, env: Env): Promise<void> {
-    const target = exports.MinecraftWorld.getByName(env.WORLD_NAME).connect('world:25565', { allowHalfOpen: true });
+    const target = exports.MinecraftWorld.getByName(env.WORLD_NAME).connect(`world:${PORT}`, { allowHalfOpen: true });
     await forwardSocket(socket, target);
   },
   async fetch(request: Request, env: Env): Promise<Response> {

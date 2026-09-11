@@ -1,8 +1,11 @@
+import { handleAsNodeConnection } from 'cloudflare:node';
 import createPumpkin from '../target/workers/wasm32-unknown-emscripten/release/pumpkin-do.js';
 import pumpkinWasm from '../target/workers/wasm32-unknown-emscripten/release/pumpkin_do.wasm';
 import { createWorldRuntime } from './filesystem';
 
-/** Bind the server API to its instance's filesystem and async context once. */
+export const PORT = 25565;
+
+/** Start the server in its instance's filesystem context and resolve once it is listening. */
 export async function startPumpkin(storage: DurableObjectStorage) {
   const { instance, run } = await createWorldRuntime(storage, options => createPumpkin({
     ...options,
@@ -13,10 +16,18 @@ export async function startPumpkin(storage: DurableObjectStorage) {
     },
     printErr: console.error,
   }));
-  await run(() => instance.pumpkin_start());
+  // The single JSPI activation runs the whole server lifetime, suspending
+  // whenever Tokio parks. It settles after `stop` completes the final save, or
+  // rejects if the server fails.
+  let finished!: Promise<void>;
+  await new Promise<void>((ready, reject) => {
+    finished = run(() => instance.pumpkin_run(ready));
+    finished.catch(reject);
+  });
   return {
-    connect: (socket: Socket) => run(() => instance.pumpkin_connect(socket)),
-    stop: () => run(() => instance.pumpkin_shutdown()),
-    status: () => run(() => instance.pumpkin_status()),
+    finished,
+    connect: (socket: Socket) => handleAsNodeConnection(socket),
+    stop: () => { instance.pumpkin_stop(); return finished; },
+    status: () => instance.pumpkin_status(),
   };
 }

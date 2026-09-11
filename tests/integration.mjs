@@ -58,7 +58,7 @@ async function marker(world, value) {
 let worker = await startWorker(true);
 try {
   await Promise.all([echo(), echo()]);
-  assert.equal((await request('/')).timer, true);
+  assert.equal((await request('/')).listening, true);
   const failure = await request('/startup-failure');
   assert.equal(failure.starting.phase, 'starting');
   assert.equal(failure.failed.phase, 'failed');

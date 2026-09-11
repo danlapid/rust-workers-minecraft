@@ -1,7 +1,8 @@
 # Development
 
 Follow the [README setup instructions](../README.md#try-it) to install the pinned
-Rust toolchain, provision dependency sources, and build the matching wasm-bindgen CLI.
+Rust toolchain, provision dependency sources and Emscripten, and install the
+wasm-bindgen CLI.
 The initial Pumpkin compilation takes several minutes. Later builds use Cargo's
 cache. `build.rs` owns the Emscripten library arguments and tracks changes to the
 compatibility library.

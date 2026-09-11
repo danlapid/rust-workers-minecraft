@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Clone pinned sources, apply dependency patches, and build the host toolchain.
+# Clone pinned sources, apply dependency patches, and provision the toolchain.
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
@@ -12,7 +12,7 @@ mkdir -p "$WORK"
 
 checkout() { # name url branch commit
   local name="$1" url="$2" branch="$3" commit="$4" dir="$WORK/$1"
-  if [ ! -d "$dir/.git" ]; then
+  if [ ! -d "$dir/.git" ] && [ ! -f "$dir/.git" ]; then
     if [ -e "$dir" ]; then
       echo "error: $dir exists but is not a Git checkout." >&2
       exit 1
@@ -43,51 +43,60 @@ apply_patch() {
 }
 
 echo "==> Pinned dependencies"
-checkout emscripten https://github.com/guybedford/emscripten cf 21166256c4c4d73d39b3685c8973d7cbe427ce8c
-checkout wasm-bindgen https://github.com/guybedford/wasm-bindgen emscripten-non-identifier-names 4b69f3b3ba4212c857be6854f77fa5aec8b62871
-checkout tokio https://github.com/guybedford/tokio emscripten-layering 7c1d4977c510866775ed6164b58b2218a6a2955b
-checkout libc https://github.com/guybedford/libc libc-0.2-emscripten 4091fe0b0dc5f9c1a27bed75be1ff02bb27e756d
-checkout ring https://github.com/guybedford/ring emscripten 6671f7cfbb13f249b571ffa6326275a8596e0ca2
 checkout pumpkin https://github.com/Pumpkin-MC/Pumpkin master b5b9b9d7010e793806a83c495af223c67e1d35ee
-checkout workers-rs https://github.com/ThomasRubini/workers-rs connect-bindings 7db011ec97658a5d907f3e3102028ce86c044f19
-apply_patch wasm-bindgen wasm-bindgen-emscripten-closures.patch
+checkout tokio https://github.com/guybedford/tokio emscripten-epoll 8d0a2a845c546e93a4cf0e8ff2c21ac50a3d1931
 apply_patch pumpkin pumpkin-emscripten.patch
 apply_patch pumpkin pumpkin-memory.patch
-apply_patch workers-rs workers-rs-emscripten-toolchain.patch
 
 if [ "${1:-}" = --sources-only ]; then exit 0; fi
 
-echo "==> Pinned Rust toolchain"
+echo "==> Rust toolchain"
 RUST_CHANNEL="$(python3 -c 'import tomllib,sys; print(tomllib.load(open(sys.argv[1],"rb"))["toolchain"]["channel"])' "$REPO/rust-toolchain.toml")"
 rustup toolchain install "$RUST_CHANNEL" --profile minimal --target wasm32-unknown-emscripten --no-self-update
 
-echo "==> Emscripten frontend and Homebrew compiler backend"
-EM_PREFIX="$(brew --prefix emscripten)" || {
-  echo "error: install the backend with 'brew install emscripten'." >&2
-  exit 1
-}
-# Resolve NODE before entering the checkout (it may be a relative path).
+echo "==> wasm-bindgen CLI"
+WASM_BINDGEN_VERSION="$(python3 -c 'import tomllib,sys; print(tomllib.load(open(sys.argv[1],"rb"))["dependencies"]["wasm-bindgen"])' "$REPO/Cargo.toml")"
+if [ "$("$WASM_BINDGEN_BIN/wasm-bindgen" --version 2>/dev/null || true)" != "wasm-bindgen $WASM_BINDGEN_VERSION" ]; then
+  cargo "+$RUST_CHANNEL" install --force --locked wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --root "$(dirname "$WASM_BINDGEN_BIN")"
+fi
+
+echo "==> Emscripten"
+# Frontend: upstream main plus the pending JSPI hooks, reentrant JSPI, and epoll
+# listener PRs. LLVM comes from the emscripten-releases build paired with that
+# main, and Binaryen from the branch carrying the jspi-hooks pass the frontend
+# needs; setup builds it. EMSDK selects an activated emsdk for LLVM instead.
+EMSDK_RELEASE=e8579ea489b44a6792f5abf95377a6ee38a16cce
+checkout emscripten https://github.com/guybedford/emscripten cf-final a5013dd597ec9d48856370f5707d438937a7b4e8
 NODE_PATH="$("$NODE" -p 'process.execPath')"
-export PATH="$(dirname "$NODE_PATH"):$PATH"
-(cd "$WORK/emscripten" && npm ci --no-audit --no-fund && python3 bootstrap.py)
-python3 - "$WORK/emscripten/.emscripten_cf" "$EM_PREFIX" "$NODE_PATH" <<'PY'
+(cd "$EMSCRIPTEN" && PATH="$(dirname "$NODE_PATH"):$PATH" npm ci --no-audit --no-fund && python3 bootstrap.py)
+if [ -n "${EMSDK:-}" ]; then
+  LLVM_ROOT="$EMSDK/upstream/bin"
+else
+  checkout emsdk https://github.com/emscripten-core/emsdk main 5eb0bde7585670252e8ba05e9d361627bffd08b5
+  if [ "$(cat "$WORK/emsdk/upstream/.emsdk_version" 2>/dev/null)" != "releases-$EMSDK_RELEASE-64bit" ]; then
+    (cd "$WORK/emsdk" && ./emsdk install "$EMSDK_RELEASE" && ./emsdk activate "$EMSDK_RELEASE")
+  fi
+  LLVM_ROOT="$WORK/emsdk/upstream/bin"
+fi
+checkout binaryen https://github.com/guybedford/binaryen jspi-hooks d6483a04d7dab0ef83e5c43f87343061d97a3b8d
+BINARYEN_ROOT="$WORK/binaryen/build"
+if [ ! -x "$BINARYEN_ROOT/bin/wasm-opt" ] || [ "$(cat "$BINARYEN_ROOT/.pinned" 2>/dev/null)" != "$(git -C "$WORK/binaryen" rev-parse HEAD)" ]; then
+  cmake -S "$WORK/binaryen" -B "$BINARYEN_ROOT" -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF >/dev/null
+  cmake --build "$BINARYEN_ROOT" --target wasm-opt wasm-metadce wasm-emscripten-finalize wasm-split wasm-as wasm-dis wasm2js wasm-merge >/dev/null
+  git -C "$WORK/binaryen" rev-parse HEAD > "$BINARYEN_ROOT/.pinned"
+fi
+if [ ! -x "$LLVM_ROOT/clang" ] || [ ! -x "$BINARYEN_ROOT/bin/wasm-opt" ]; then
+  echo "error: no Emscripten backend at LLVM_ROOT=$LLVM_ROOT BINARYEN_ROOT=$BINARYEN_ROOT." >&2
+  exit 1
+fi
+python3 - "$EMSCRIPTEN/.emscripten_cf" "$LLVM_ROOT" "$BINARYEN_ROOT" "$NODE_PATH" <<'PY'
 from pathlib import Path
 import sys
-config, prefix, node = sys.argv[1:]
+config, llvm, binaryen, node = sys.argv[1:]
 Path(config).write_text(
-    f"LLVM_ROOT={prefix + '/libexec/llvm/bin'!r}\n"
-    f"BINARYEN_ROOT={prefix + '/libexec/binaryen'!r}\n"
+    f"LLVM_ROOT={llvm!r}\n"
+    f"BINARYEN_ROOT={binaryen!r}\n"
     f"NODE_JS={node!r}\n"
 )
 PY
-
-echo "==> Patched wasm-bindgen CLI"
-# Upstream does not commit this workspace lockfile. Preserve the proven CLI resolution.
-cp "$REPO/toolchain/wasm-bindgen.Cargo.lock" "$WORK/wasm-bindgen/Cargo.lock"
-# Override nested dependency toolchain files with the repository's dated nightly.
-HOST_TARGET="$(rustc "+$RUST_CHANNEL" -vV | sed -n 's/^host: //p')"
-(cd "$WORK/wasm-bindgen" && cargo "+$RUST_CHANNEL" build --locked --release -p wasm-bindgen-cli \
-  --target "$HOST_TARGET" --target-dir "$WORK/wasm-bindgen/target")
-mkdir -p "$WORK/bin"
-cp "$WORK/wasm-bindgen/target/$HOST_TARGET/release/wasm-bindgen" "$WORK/bin/wasm-bindgen"
 echo "Setup complete. Run: bash scripts/test.sh  or  bash scripts/serve.sh"

@@ -25,31 +25,26 @@ name = "pumpkin-do"
 path = "src/main.rs"
 
 [dependencies]
-wasm-bindgen = { path = ".work/wasm-bindgen" }
-js-sys = { path = ".work/wasm-bindgen/crates/js-sys" }
+wasm-bindgen = "0.2.128"
+js-sys = "0.3.105"
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "sync", "time", "net", "io-util"] }
 pumpkin = { path = ".work/pumpkin/crates/pumpkin", default-features = false, features = ["single-threaded"] }
 pumpkin-config = { path = ".work/pumpkin/crates/pumpkin-config", default-features = false }
 rayon = "1.12"
-worker = { path = ".work/workers-rs/worker", default-features = false }
 
+# wasm32-unknown-emscripten support pending upstream releases.
 [patch.crates-io]
-js-sys = { path = ".work/wasm-bindgen/crates/js-sys" }
-wasm-bindgen = { path = ".work/wasm-bindgen" }
-wasm-bindgen-futures = { path = ".work/wasm-bindgen/crates/futures" }
-wasm-bindgen-macro-support = { path = ".work/wasm-bindgen/crates/macro-support" }
-wasm-bindgen-shared = { path = ".work/wasm-bindgen/crates/shared" }
-web-sys = { path = ".work/wasm-bindgen/crates/web-sys" }
-wasm-streams = { git = "https://github.com/guybedford/wasm-streams", rev = "115f0f27380a4f5fa33cbd9427a7107ec94cb557" }
-libc = { path = ".work/libc" }
-mio = { git = "https://github.com/guybedford/mio", rev = "a62c9e46833fc255c9217ab9aa362c6221ed4401" }
-ring = { path = ".work/ring" }
 tokio = { path = ".work/tokio/tokio" }
 tokio-macros = { path = ".work/tokio/tokio-macros" }
+# tokio-rs/mio#1969; its emscripten epoll bindings come from libc's unreleased libc-0.2 branch.
+mio = { git = "https://github.com/guybedford/mio", rev = "a62c9e46833fc255c9217ab9aa362c6221ed4401" }
+libc = { git = "https://github.com/rust-lang/libc", branch = "libc-0.2" }
+# getrandom-backed SystemRandom on emscripten.
+ring = { git = "https://github.com/guybedford/ring", branch = "emscripten" }
 
+# mio's own libc source, unified with the crates.io users above.
 [patch."https://github.com/guybedford/libc"]
-libc = { path = ".work/libc" }
-
+libc = { git = "https://github.com/rust-lang/libc", branch = "libc-0.2" }
 
 [profile.release]
 opt-level = "s"

@@ -13,8 +13,9 @@ pub fn configuration() -> (BasicConfiguration, AdvancedConfiguration) {
     }
 
     let mut adv = AdvancedConfiguration::default();
-    // Offline Java server with a bounded view distance.
-    adv.networking.java.enabled = false; // Connections are supplied by the Durable Object.
+    // Offline Java server with a bounded view distance. The listener binds the
+    // default 0.0.0.0:25565 in the Durable Object's port table; the host routes
+    // inbound sockets to it by port.
     adv.networking.java.online_mode = false;
     adv.networking.java.encryption = false;
     adv.networking.java.view_distance = NonZero::new(3).unwrap();

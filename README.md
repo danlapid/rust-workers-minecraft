@@ -13,20 +13,25 @@ Minecraft → Workers TCP ingress → MinecraftWorld → Pumpkin + SQLite
 
 ## Try it
 
-The supported build host is macOS with Homebrew. Install Git,
-[rustup](https://rustup.rs/), Python 3.11+, and Node 24+ (26 recommended).
-From a checkout of this repository:
+Linux and macOS build hosts are supported. Install Git,
+[rustup](https://rustup.rs/), Python 3.11+, CMake and Ninja, and Node 24+ (26
+recommended). From a checkout of this repository:
 
 ```sh
-brew install emscripten
 npm ci
 bash scripts/setup.sh
 npm run dev
 ```
 
-Setup installs the pinned Rust toolchain, fetches dependency sources, and builds
-the matching wasm-bindgen CLI. `npm run dev` compiles Pumpkin and starts Wrangler.
-The first build takes several minutes; later builds use Cargo's cache.
+Setup installs the pinned Rust toolchain, fetches dependency sources and the
+Emscripten toolchain under `.work/` (building Binaryen), and installs the
+wasm-bindgen CLI. `npm run
+dev` compiles Pumpkin and starts Wrangler. The first build takes several
+minutes; later builds use Cargo's cache.
+
+Until Wrangler's bundled workerd routes inbound sockets to `net.Server` listeners
+inside Durable Objects, point Miniflare at a workerd build that does:
+`MINIFLARE_WORKERD_PATH=/path/to/workerd npm run dev`.
 
 Connect **Minecraft Java 26.2** to **`localhost:25565`**. Status is available at
 **http://localhost:8787/**.
@@ -72,9 +77,8 @@ Provision the public TCP endpoint separately and route it to this Worker's
 ## Credits and license
 
 Built on [Pumpkin](https://github.com/Pumpkin-MC/Pumpkin),
-[Guy Bedford's Rust/Emscripten work](https://github.com/guybedford),
-[workers-rs](https://github.com/cloudflare/workers-rs), Thomas Rubini's TCP ingress
-work, and [worker-fs-mount](https://github.com/danlapid/worker-fs-mount).
+[Guy Bedford's Rust/Emscripten work](https://github.com/guybedford), and
+[worker-fs-mount](https://github.com/danlapid/worker-fs-mount).
 
 Licensed under [GPL-3.0-only](LICENSE), consistent with Pumpkin. The
 [original MIT notice](LICENSES/rust-workers-minecraft-MIT.txt) is retained for

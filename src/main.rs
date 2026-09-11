@@ -1,71 +1,70 @@
+// `#[wasm_bindgen(jspi)]` is experimental and warns as deprecated.
+#![allow(deprecated)]
+
 mod config;
 mod memory;
 
-use pumpkin::{data::VanillaData, PumpkinServer};
+use pumpkin::{data::VanillaData, server::Server, PumpkinServer};
 use std::{cell::RefCell, sync::atomic::Ordering, sync::Arc};
 use wasm_bindgen::prelude::*;
-use worker::emscripten::{future_to_promise, js_error, socket_from_value};
 
 fn main() {}
 
 thread_local! {
     static FAILURE: RefCell<Option<String>> = const { RefCell::new(None) };
-    static SERVER: RefCell<Option<Arc<PumpkinServer>>> = const { RefCell::new(None) };
-    static NEXT_CLIENT: RefCell<u64> = const { RefCell::new(0) };
+    static SERVER: RefCell<Option<Arc<Server>>> = const { RefCell::new(None) };
 }
 
-fn server() -> Result<Arc<PumpkinServer>, JsValue> {
+fn js_error(error: impl std::fmt::Display) -> JsValue {
+    js_sys::Error::new(&error.to_string()).into()
+}
+
+fn server() -> Result<Arc<Server>, JsValue> {
     if let Some(error) = FAILURE.with(|failure| failure.borrow().clone()) {
         return Err(js_error(error));
     }
     SERVER
         .with(|server| server.borrow().clone())
-        .ok_or_else(|| js_error("Server is not started"))
+        .ok_or_else(|| js_error("Server is not running"))
 }
 
-#[wasm_bindgen]
-pub fn pumpkin_start() -> js_sys::Promise {
-    future_to_promise(async {
-        if SERVER.with(|server| server.borrow().is_some()) {
-            return Ok(JsValue::UNDEFINED);
-        }
-        std::panic::set_hook(Box::new(|info| {
-            FAILURE.with(|failure| {
-                failure.borrow_mut().get_or_insert_with(|| info.to_string());
-            });
-            eprintln!("RUST PANIC: {info}");
-        }));
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
-            .use_current_thread()
-            .build_global()
-            .map_err(js_error)?;
-        let (basic, advanced) = config::configuration();
-        pumpkin::init_logger(&advanced);
-        let server = Arc::new(PumpkinServer::new(basic, advanced, VanillaData::load()).await);
-        server.init_plugins().await;
-        SERVER.with(|slot| *slot.borrow_mut() = Some(server));
-        Ok(JsValue::UNDEFINED)
-    })
-}
-
-#[wasm_bindgen]
-pub fn pumpkin_connect(raw: JsValue) -> js_sys::Promise {
-    future_to_promise(async move {
-        let server = server()?;
-        let socket = socket_from_value(raw)?;
-        let id = NEXT_CLIENT.with(|slot| {
-            let mut id = slot.borrow_mut();
-            *id += 1;
-            *id
+/// Runs the server on a Tokio runtime that parks by suspending this activation.
+/// `ready` is called once the listener is bound. Resolves after `pumpkin_stop`
+/// once the final save completes.
+#[wasm_bindgen(jspi)]
+pub fn pumpkin_run(ready: js_sys::Function) -> Result<(), JsValue> {
+    std::panic::set_hook(Box::new(|info| {
+        FAILURE.with(|failure| {
+            failure.borrow_mut().get_or_insert_with(|| info.to_string());
         });
-        // The SDK's socket is the injected Tokio byte stream. Its adapter handles
-        // backpressure, EOF and JS stream errors; no emulated TCP listener is used.
-        server
-            .serve_connection(socket, ([127, 0, 0, 1], 0).into(), id)
-            .await;
-        Ok(JsValue::UNDEFINED)
+        eprintln!("RUST PANIC: {info}");
+    }));
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .use_current_thread()
+        .build_global()
+        .map_err(js_error)?;
+    let (basic, advanced) = config::configuration();
+    pumpkin::init_logger(&advanced);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(js_error)?;
+    runtime.block_on(async {
+        let server = PumpkinServer::new(basic, advanced, VanillaData::load()).await;
+        server.init_plugins().await;
+        SERVER.with(|slot| *slot.borrow_mut() = Some(server.server.clone()));
+        ready.call0(&JsValue::UNDEFINED)?;
+        server.start().await;
+        SERVER.with(|slot| slot.borrow_mut().take());
+        Ok(())
     })
+}
+
+/// Requests shutdown; `pumpkin_run` completes the save and returns.
+#[wasm_bindgen]
+pub fn pumpkin_stop() {
+    pumpkin::stop_server();
 }
 
 #[wasm_bindgen]
@@ -75,12 +74,12 @@ pub fn pumpkin_status() -> Result<JsValue, JsValue> {
     js_sys::Reflect::set(
         &result,
         &"players".into(),
-        &(server.server.get_all_players().len() as f64).into(),
+        &(server.get_all_players().len() as f64).into(),
     )?;
     js_sys::Reflect::set(
         &result,
         &"ticks".into(),
-        &(server.server.tick_count.load(Ordering::Relaxed) as f64).into(),
+        &(server.tick_count.load(Ordering::Relaxed) as f64).into(),
     )?;
     js_sys::Reflect::set(
         &result,
@@ -91,21 +90,4 @@ pub fn pumpkin_status() -> Result<JsValue, JsValue> {
         js_sys::Reflect::set(&result, &name.into(), &(bytes as f64).into())?;
     }
     Ok(result.into())
-}
-
-#[wasm_bindgen]
-pub fn pumpkin_shutdown() -> js_sys::Promise {
-    future_to_promise(async {
-        let server = server()?;
-        if !server.server.get_all_players().is_empty() {
-            return Err(js_error(
-                "Disconnect clients before shutting down the world",
-            ));
-        }
-        pumpkin::stop_server();
-        server.server.save_all().await.map_err(js_error)?;
-        server.server.shutdown().await;
-        SERVER.with(|slot| slot.borrow_mut().take());
-        Ok(JsValue::UNDEFINED)
-    })
 }

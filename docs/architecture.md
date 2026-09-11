@@ -3,17 +3,31 @@
 ## Runtime and connections
 
 The Worker forwards TCP streams to a named Durable Object using the platform's
-stream-piping API. The object lazily creates an Emscripten module and passes a
-workers-rs `Socket` to Pumpkin's injected connection entry point.
+stream-piping API. The object lazily creates an Emscripten module and calls its
+single `pumpkin_run` export. That export is a `#[wasm_bindgen(jspi)]` function: it
+builds a current-thread Tokio runtime and `block_on`s the whole server lifetime,
+and every park (`epoll_wait`, timers) suspends the Wasm stack on the host event
+loop. There is no host-driven scheduling and no Rust promise adapter; the run
+promise settles only when the server has stopped and saved. `-sREENTRANT_JSPI`
+gives each promising activation its own shadow stack, so status calls and
+connection routing enter the module while the server is suspended without
+touching its frames.
+
+Pumpkin binds its stock `TcpListener` on port 25565. Emscripten's Node socket
+backend implements that with `net.BoundSocket`/`net.Server`, which workerd scopes
+to the Durable Object's own port table, so every object binds the same port. The
+object's `connect` handler routes each inbound socket to that listener with
+`handleAsNodeConnection`; the accepted connection then surfaces through epoll
+readiness and Pumpkin's normal accept loop. Accepted sockets report the bound
+address and an unspecified peer.
 
 Each object owns separate wasm memory, Rust statics, filesystem descriptors, and
-one hosted Tokio runtime, supplied by workers-rs. Pumpkin's `single-threaded` feature selects cooperative
-inline chunk generation and the async ticker. The same scheduler loop serves
-native builds, which dispatch generation onto Rayon. Save batches await queue
-capacity; shutdown drains results with an elapsed-time timeout before the final
-flush. Bounded CPU tasks use
-regular Tokio tasks because the pinned fork's public `spawn_blocking` still
-requires OS threads. JSPI supplies stack suspension, not threads.
+its Tokio runtime. Pumpkin's `single-threaded` feature selects cooperative inline
+chunk generation and the async ticker. The same scheduler loop serves native
+builds, which dispatch generation onto Rayon. Save batches await queue capacity;
+shutdown drains results with an elapsed-time timeout before the final flush.
+Bounded CPU tasks use regular Tokio tasks because `spawn_blocking` requires OS
+threads. JSPI supplies stack suspension, not threads.
 
 Structure templates store palette indices and share their block arrays between
 the placement and query APIs. Block-entity NBT is shared until a placement needs
@@ -53,8 +67,8 @@ The upstream `entries` table stores metadata, and `file_pages` stores contents i
 sparse files, and file writes and native rename use SQLite transactions. Whole-file
 reads still require a buffer large enough for the result.
 
-After the final connection leaves, Pumpkin saves and shuts down, and the object
-awaits `storage.sync()`. New connections wait for this checkpoint, then create a
+After the final connection leaves, the object requests a stop; Pumpkin saves,
+`pumpkin_run` resolves, and the object awaits `storage.sync()`. New connections wait for this checkpoint, then create a
 fresh runtime from the stored files. Checkpoint failures remain visible in status.
 This preserves issued writes; terminating a server with active clients can still
 lose changes in Pumpkin's in-memory caches.
@@ -81,14 +95,13 @@ storage under `.data/probes/` and restart Wrangler to verify restoration. The ec
 and large-file test fixture has its own Worker configuration and wasm binary; it
 is excluded from the application bundle.
 
-Current workerd versions can report `Network connection lost` when TCP clients
-disconnect. Rust panics, Rust error logs, and runtime crashes fail the integration
-test.
+Rust panics, Rust error logs, and runtime crashes fail the integration test.
 
 ## Build constraints
 
-- Use the pinned Rust nightly and matching wasm-bindgen CLI from setup.
-- Keep static relocation, unwind semantics, the 8 MiB stack, and memory growth.
+- Use the pinned Rust toolchain, Emscripten, and wasm-bindgen CLI from setup.
+- Keep static relocation, exnref exception handling on both the C and Rust
+  sides, the 8 MiB stack, and memory growth.
 - Pass Emscripten link settings through rustc so they do not affect C compilation.
 - Keep the compatibility initializer linked even when Rust does not call `fd_sync`;
   `build.rs` configures this and tracks the library as a build input.
