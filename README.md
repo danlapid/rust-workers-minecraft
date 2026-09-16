@@ -25,13 +25,13 @@ npm run dev
 
 Setup installs the pinned Rust toolchain, fetches dependency sources and the
 Emscripten toolchain under `.work/` (building Binaryen), and installs the
-wasm-bindgen CLI. `npm run
-dev` compiles Pumpkin and starts Wrangler. The first build takes several
-minutes; later builds use Cargo's cache.
+wasm-bindgen CLI. `npm run dev` compiles Pumpkin and starts Wrangler. The first
+build takes several minutes; later builds use Cargo's cache.
 
 Until Wrangler's bundled workerd routes inbound sockets to `net.Server` listeners
-inside Durable Objects, point Miniflare at a workerd build that does:
-`MINIFLARE_WORKERD_PATH=/path/to/workerd npm run dev`.
+inside Durable Objects and carries the `node:fs` fixes listed in
+[dependency pins](docs/dependencies.md#host-tools), point Miniflare at a workerd
+build that does: `MINIFLARE_WORKERD_PATH=/path/to/workerd npm run dev`.
 
 Connect **Minecraft Java 26.2** to **`localhost:25565`**. Status is available at
 **http://localhost:8787/**.
@@ -48,10 +48,9 @@ Wrangler; changes held in memory can be lost if the process is terminated early.
 ## Build and contribute
 
 ```sh
-npm run build        # Compile the server without starting Wrangler
+npm run build        # Compile the Worker without starting Wrangler
 npm test             # Two-player gameplay, a persistent block edit, and restart
 npm run test:scheduler
-npm run typecheck
 ```
 
 The tests use separate data under `.data/probes/`. They verify that two clients
@@ -77,8 +76,9 @@ Provision the public TCP endpoint separately and route it to this Worker's
 ## Credits and license
 
 Built on [Pumpkin](https://github.com/Pumpkin-MC/Pumpkin),
-[Guy Bedford's Rust/Emscripten work](https://github.com/guybedford), and
-[worker-fs-mount](https://github.com/danlapid/worker-fs-mount).
+[Tokio](https://github.com/tokio-rs/tokio), [Emscripten](https://emscripten.org/),
+[wasm-bindgen](https://github.com/wasm-bindgen/wasm-bindgen), and
+[Guy Bedford's Rust/Emscripten work](https://github.com/guybedford).
 
 Licensed under [GPL-3.0-only](LICENSE), consistent with Pumpkin. The
 [original MIT notice](LICENSES/rust-workers-minecraft-MIT.txt) is retained for

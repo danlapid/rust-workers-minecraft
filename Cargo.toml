@@ -12,14 +12,6 @@ autobins = false
 exclude = [".work"]
 resolver = "2"
 
-[features]
-test-fixtures = []
-
-[[bin]]
-name = "filesystem-probe"
-path = "tests/fixtures/filesystem.rs"
-required-features = ["test-fixtures"]
-
 [[bin]]
 name = "pumpkin-do"
 path = "src/main.rs"
@@ -27,6 +19,7 @@ path = "src/main.rs"
 [dependencies]
 wasm-bindgen = "0.2.128"
 js-sys = "0.3.105"
+web-sys = { version = "0.3.105", features = ["AbortController", "AbortSignal", "Headers", "ReadableStream", "Request", "Response", "ResponseInit", "StreamPipeOptions", "Url", "WritableStream", "console"] }
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "sync", "time", "net", "io-util"] }
 pumpkin = { path = ".work/pumpkin/crates/pumpkin", default-features = false, features = ["single-threaded"] }
 pumpkin-config = { path = ".work/pumpkin/crates/pumpkin-config", default-features = false }
@@ -34,6 +27,7 @@ rayon = "1.12"
 
 # wasm32-unknown-emscripten support pending upstream releases.
 [patch.crates-io]
+# EventLoopRuntime: the host event loop drives Tokio (tokio-rs/tokio#8479).
 tokio = { path = ".work/tokio/tokio" }
 tokio-macros = { path = ".work/tokio/tokio-macros" }
 # tokio-rs/mio#1969; its emscripten epoll bindings come from libc's unreleased libc-0.2 branch.

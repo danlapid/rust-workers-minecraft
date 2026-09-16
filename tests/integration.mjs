@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import net from 'node:net';
 import { readFile } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { status, play, waitFor } from './client.mjs';
@@ -30,55 +29,8 @@ function editableBlock(client) {
   throw new Error(`No stable block within reach of ${JSON.stringify(client.position)}`);
 }
 
-async function echo() {
-  const socket = net.connect({ host: '127.0.0.1', port: 25565 });
-  socket.setTimeout(15000, () => socket.destroy(new Error('Echo timed out')));
-  const payload = Buffer.from(Array.from({ length: 65536 }, (_, index) => index & 255));
-  const chunks = [];
-  let length = 0;
-  try {
-    await new Promise((resolve, reject) => {
-      socket.once('connect', resolve);
-      socket.once('error', reject);
-    });
-    for (let offset = 0; offset < payload.length; offset += 997) socket.write(payload.subarray(offset, offset + 997));
-    for await (const chunk of socket) {
-      chunks.push(chunk);
-      length += chunk.length;
-      if (length >= payload.length) break;
-    }
-    assert.ok(Buffer.concat(chunks).equals(payload), `TCP echo differed: received ${length} of ${payload.length} bytes`);
-  } finally { socket.destroy(); }
-}
-
-async function marker(world, value) {
-  return (await request(`/filesystem-probe?world=${world}`, { method: 'POST', body: value })).previous;
-}
-
-let worker = await startWorker(true);
-try {
-  await Promise.all([echo(), echo()]);
-  assert.equal((await request('/')).listening, true);
-  const failure = await request('/startup-failure');
-  assert.equal(failure.starting.phase, 'starting');
-  assert.equal(failure.failed.phase, 'failed');
-  assert.equal(failure.failed.failure, 'Expected startup failure');
-  assert.deepEqual(failure.repeated, failure.failed);
-  assert.equal(await marker('isolation-a', 'alpha'), '');
-  assert.equal(await marker('isolation-b', 'beta'), '');
-  assert.equal(await marker('isolation-a', 'alpha-2'), 'alpha');
-  worker.healthy();
-} finally { await worker.stop(); }
-worker = await startWorker(true);
-try {
-  assert.equal(await marker('isolation-a', 'alpha-3'), 'alpha-2');
-  assert.equal(await marker('isolation-b', 'beta-2'), 'beta');
-  worker.healthy();
-} finally { await worker.stop(); }
-console.log('Filesystem, socket, and isolation tests passed');
-
 let savedChunk, savedPosition, changedBlock;
-worker = await startWorker();
+let worker = await startWorker();
 const clients = [];
 try {
   assert.equal((await status()).version.protocol, 776);

@@ -44,7 +44,7 @@ apply_patch() {
 
 echo "==> Pinned dependencies"
 checkout pumpkin https://github.com/Pumpkin-MC/Pumpkin master b5b9b9d7010e793806a83c495af223c67e1d35ee
-checkout tokio https://github.com/guybedford/tokio emscripten-epoll 8d0a2a845c546e93a4cf0e8ff2c21ac50a3d1931
+checkout tokio https://github.com/guybedford/tokio emscripten-event-loop 5315798b6a62a47d03dc40e7d04fbf83c80f3246
 apply_patch pumpkin pumpkin-emscripten.patch
 apply_patch pumpkin pumpkin-memory.patch
 
@@ -66,7 +66,7 @@ echo "==> Emscripten"
 # main, and Binaryen from the branch carrying the jspi-hooks pass the frontend
 # needs; setup builds it. EMSDK selects an activated emsdk for LLVM instead.
 EMSDK_RELEASE=e8579ea489b44a6792f5abf95377a6ee38a16cce
-checkout emscripten https://github.com/guybedford/emscripten cf-final a5013dd597ec9d48856370f5707d438937a7b4e8
+checkout emscripten https://github.com/guybedford/emscripten cf-final 4e034c65a18c0034c68e7eb628477fe4428fa1f9
 NODE_PATH="$("$NODE" -p 'process.execPath')"
 (cd "$EMSCRIPTEN" && PATH="$(dirname "$NODE_PATH"):$PATH" npm ci --no-audit --no-fund && python3 bootstrap.py)
 if [ -n "${EMSDK:-}" ]; then

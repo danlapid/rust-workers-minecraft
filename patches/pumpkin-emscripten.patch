@@ -12,6 +12,10 @@ and track cooperative tasks through shutdown. Drop the Tokio features that
 need OS threads and signals from single-threaded builds and guard
 unsupported Emscripten system calls and synchronous HTTP lookups.
 
+Make the process-wide stop token replaceable behind a StopSignal wrapper
+and add reset_stop, so an embedding can start another server in the same
+process after one has stopped.
+
 Reserve save-queue capacity before transferring chunks or marking writes
 pending, and widen pending-write counters to usize. Drain late generation
 results with an elapsed-time timeout before the final save. Regression
@@ -1276,7 +1280,7 @@ index a19825bc..45d6783e 100644
              || {
                  self.chunk_sender
 diff --git a/crates/pumpkin/src/lib.rs b/crates/pumpkin/src/lib.rs
-index 7110bc9e..060225ea 100644
+index 7110bc9e..f45cadbe 100644
 --- a/crates/pumpkin/src/lib.rs
 +++ b/crates/pumpkin/src/lib.rs
 @@ -8,12 +8,14 @@ extern crate pumpkin_macros;
@@ -1340,7 +1344,66 @@ index 7110bc9e..060225ea 100644
      });
  
      assert!(
-@@ -251,7 +263,7 @@ impl PumpkinServer {
+@@ -204,16 +216,57 @@ pub fn init_logger(advanced_config: &AdvancedConfiguration) {
+ }
+ 
+ pub static SHOULD_STOP: AtomicBool = AtomicBool::new(false);
+-pub static STOP_INTERRUPT: LazyLock<CancellationToken> = LazyLock::new(CancellationToken::new);
++pub static STOP_INTERRUPT: StopSignal = StopSignal(std::sync::RwLock::new(None));
+ pub static SERVER_IS_STOPPING: AtomicBool = AtomicBool::new(false);
+ pub static CRASH_REPORT: OnceLock<CrashReport> = OnceLock::new();
+ pub static SERVER_EXIT_CODE: AtomicI32 = AtomicI32::new(0);
+ 
++/// The process-wide stop token, replaceable so an embedding can start another
++/// server in the same process after one has stopped.
++pub struct StopSignal(std::sync::RwLock<Option<CancellationToken>>);
++
++impl StopSignal {
++    fn token(&self) -> CancellationToken {
++        if let Some(token) = self.0.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
++            return token.clone();
++        }
++        self.0
++            .write()
++            .unwrap_or_else(|e| e.into_inner())
++            .get_or_insert_with(CancellationToken::new)
++            .clone()
++    }
++
++    pub fn cancel(&self) {
++        self.token().cancel();
++    }
++
++    pub fn is_cancelled(&self) -> bool {
++        self.token().is_cancelled()
++    }
++
++    pub fn cancelled(&self) -> tokio_util::sync::WaitForCancellationFutureOwned {
++        self.token().cancelled_owned()
++    }
++
++    #[allow(clippy::should_implement_trait)]
++    pub fn clone(&self) -> CancellationToken {
++        self.token()
++    }
++}
++
+ pub fn stop_server() {
+     SHOULD_STOP.store(true, Ordering::Relaxed);
+     STOP_INTERRUPT.cancel();
+ }
+ 
++/// Clears the stop state so `PumpkinServer::start` can run again in this process.
++pub fn reset_stop() {
++    SHOULD_STOP.store(false, Ordering::Relaxed);
++    SERVER_IS_STOPPING.store(false, Ordering::Release);
++    *STOP_INTERRUPT.0.write().unwrap_or_else(|e| e.into_inner()) = Some(CancellationToken::new());
++}
++
+ pub fn stop_or_exit_server() {
+     if SERVER_IS_STOPPING.load(Ordering::Acquire) {
+         // Server is already stopping, so we forcefully exit.
+@@ -251,7 +304,7 @@ impl PumpkinServer {
      ) -> Self {
          let server = Server::new(basic_config, advanced_config, vanilla_data).await;
  
@@ -1349,7 +1412,7 @@ index 7110bc9e..060225ea 100644
          adjust_file_descriptor_limit();
  
          let rcon = server.advanced_config.networking.rcon.clone();
-@@ -320,19 +332,30 @@ impl PumpkinServer {
+@@ -320,19 +373,30 @@ impl PumpkinServer {
              None
          };
  
@@ -1382,7 +1445,7 @@ index 7110bc9e..060225ea 100644
  
          let (bedrock_status, ice_socket) = Self::bind_bedrock_status(&server).await;
          let nethernet_listener = Self::bind_nethernet(&server, ice_socket).await;
-@@ -345,6 +368,15 @@ impl PumpkinServer {
+@@ -345,6 +409,15 @@ impl PumpkinServer {
          }
      }
  
@@ -1398,7 +1461,7 @@ index 7110bc9e..060225ea 100644
      async fn bind_nethernet(
          server: &Arc<Server>,
          ice_socket: Option<IceSocket>,
-@@ -441,6 +473,7 @@ impl PumpkinServer {
+@@ -441,6 +514,7 @@ impl PumpkinServer {
      }
  
      pub async fn start(&self) {
@@ -1406,7 +1469,7 @@ index 7110bc9e..060225ea 100644
          if self.server.advanced_config.commands.use_console
              && let Some((wrapper, _, _)) = LOGGER_IMPL.wait()
          {
-@@ -527,6 +560,7 @@ impl PumpkinServer {
+@@ -527,6 +601,7 @@ impl PumpkinServer {
  
          info!("Completed save!");
  
@@ -1414,7 +1477,7 @@ index 7110bc9e..060225ea 100644
          if let Some((wrapper, _, _)) = LOGGER_IMPL.wait()
              && let Some(rl) = wrapper.take_readline()
          {
-@@ -618,7 +652,7 @@ impl PumpkinServer {
+@@ -618,7 +693,7 @@ impl PumpkinServer {
                          });
                      }
                      Err(e) => {
@@ -1423,7 +1486,7 @@ index 7110bc9e..060225ea 100644
                          if e.raw_os_error() == Some(libc::EMFILE) {
                              error!(
                                  "Too many open files! Server reached file descriptor limit. \
-@@ -719,6 +753,7 @@ impl PumpkinServer {
+@@ -719,6 +794,7 @@ impl PumpkinServer {
      }
  }
  
@@ -1431,7 +1494,7 @@ index 7110bc9e..060225ea 100644
  fn setup_stdin_console(server: &Arc<Server>) {
      let (tx, mut rx) = tokio::sync::mpsc::channel(1);
      let rt = tokio::runtime::Handle::current();
-@@ -759,6 +794,7 @@ fn setup_stdin_console(server: &Arc<Server>) {
+@@ -759,6 +835,7 @@ fn setup_stdin_console(server: &Arc<Server>) {
      });
  }
  
@@ -1439,7 +1502,7 @@ index 7110bc9e..060225ea 100644
  fn setup_console(mut rl: Editor<PumpkinCommandCompleter, FileHistory>, server: Arc<Server>) {
      let (tx, mut rx) = tokio::sync::mpsc::channel(1);
      let (tx_reply, mut rx_reply) = tokio::sync::mpsc::channel(1);
-@@ -839,7 +875,7 @@ fn scrub_address(ip: &str) -> String {
+@@ -839,7 +916,7 @@ fn scrub_address(ip: &str) -> String {
          .collect()
  }
  

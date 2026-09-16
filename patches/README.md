@@ -9,7 +9,7 @@ diff below it. Preserve the description when regenerating the diff.
 
 | Patch | Checkout | Purpose |
 | --- | --- | --- |
-| `pumpkin-emscripten.patch` | `.work/pumpkin` | Headless optional subsystems, single-threaded runtime and blocking-task helper, shared async chunk scheduler with backpressure and timed draining, unified ticker, and platform guards |
+| `pumpkin-emscripten.patch` | `.work/pumpkin` | Headless optional subsystems, single-threaded runtime and blocking-task helper, shared async chunk scheduler with backpressure and timed draining, unified ticker, restartable stop signal, and platform guards |
 | `pumpkin-memory.patch` | `.work/pumpkin` | Shared indexed structure templates, immutable block-entity NBT, paletted generation chunks, and a temporary dense noise buffer |
 
 Setup applies `pumpkin-emscripten.patch` before `pumpkin-memory.patch`. The two patches use the

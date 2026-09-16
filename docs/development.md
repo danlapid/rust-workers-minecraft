@@ -4,12 +4,13 @@ Follow the [README setup instructions](../README.md#try-it) to install the pinne
 Rust toolchain, provision dependency sources and Emscripten, and install the
 wasm-bindgen CLI.
 The initial Pumpkin compilation takes several minutes. Later builds use Cargo's
-cache. `build.rs` owns the Emscripten library arguments and tracks changes to the
-compatibility library.
+cache. `.cargo/config.toml` owns the link settings; `build.rs` adds the JS library
+(`src/workerd.js`) and tracks changes to it. The build output Wrangler serves is
+`target/workers/wasm32-unknown-emscripten/release/pumpkin-do.js`, re-exported by
+`worker/index.mjs`.
 
 ```sh
-npm run build          # Compile the production server
-npm run typecheck      # Regenerate Worker types and check TypeScript
+npm run build          # Compile the production Worker
 npm test               # Full Wrangler integration suite
 npm run test:scheduler # Native queue/backpressure and shutdown regressions
 npm run test:memory    # Two-player memory probe on a fresh, fixed-seed world
@@ -19,9 +20,9 @@ Tests fail if their loopback ports (25565 and 8787) are occupied. They start and
 stop only their own Wrangler process groups. Their databases and logs live in
 `.data/probes/`; playable worlds are separate under `.data/workers/server/`.
 
-`npm test` must finish with `PUMPKIN-DO-SQLITE-RESTART-OK`. It checks filesystem
-isolation, synchronous descriptors, large files, failed-startup status, two-player
-gameplay, a real block edit, and player/block restoration after a restart.
+`npm test` must finish with `PUMPKIN-DO-SQLITE-RESTART-OK`. It checks two-player
+gameplay, a real block edit, and player/block restoration after a restart, which
+exercises the tree-to-SQLite checkpoint and restore.
 
 The memory probe waits for both clients to receive 81 chunks, observes 30 seconds
 of stationary play, then checkpoints. Each run creates a fresh isolated world

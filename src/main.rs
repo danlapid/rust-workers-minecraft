@@ -1,93 +1,92 @@
-// `#[wasm_bindgen(jspi)]` is experimental and warns as deprecated.
-#![allow(deprecated)]
-
 mod config;
+mod host;
 mod memory;
+mod persist;
+mod world;
 
-use pumpkin::{data::VanillaData, server::Server, PumpkinServer};
-use std::{cell::RefCell, sync::atomic::Ordering, sync::Arc};
+use host::{method, property, then};
 use wasm_bindgen::prelude::*;
 
 fn main() {}
 
-thread_local! {
-    static FAILURE: RefCell<Option<String>> = const { RefCell::new(None) };
-    static SERVER: RefCell<Option<Arc<Server>>> = const { RefCell::new(None) };
+fn stub(env: &JsValue) -> Result<JsValue, JsValue> {
+    let name = property(env, "WORLD_NAME")?;
+    let namespace = property(env, "WORLD")?;
+    method(&namespace, "getByName", &[&name])
 }
 
-fn js_error(error: impl std::fmt::Display) -> JsValue {
-    js_sys::Error::new(&error.to_string()).into()
-}
-
-fn server() -> Result<Arc<Server>, JsValue> {
-    if let Some(error) = FAILURE.with(|failure| failure.borrow().clone()) {
-        return Err(js_error(error));
+/// Pipes an inbound TCP connection to the world's object until either side closes.
+#[wasm_bindgen]
+pub fn connect(socket: JsValue, env: JsValue, _ctx: JsValue) -> Result<JsValue, JsValue> {
+    let target = host::stub_connect(&stub(&env)?, &world::authority())?;
+    // Read/write failures are observed by the pumps; a normal peer disconnect
+    // must not surface as an unhandled rejection of the lifetime promise.
+    let swallow = Closure::<dyn FnMut(JsValue)>::new(|_| ()).into_js_value();
+    for side in [&socket, &target] {
+        then(&property(side, "closed")?, None, Some(&swallow))?;
     }
-    SERVER
-        .with(|server| server.borrow().clone())
-        .ok_or_else(|| js_error("Server is not running"))
-}
-
-/// Runs the server on a Tokio runtime that parks by suspending this activation.
-/// `ready` is called once the listener is bound. Resolves after `pumpkin_stop`
-/// once the final save completes.
-#[wasm_bindgen(jspi)]
-pub fn pumpkin_run(ready: js_sys::Function) -> Result<(), JsValue> {
-    std::panic::set_hook(Box::new(|info| {
-        FAILURE.with(|failure| {
-            failure.borrow_mut().get_or_insert_with(|| info.to_string());
+    let abort = web_sys::AbortController::new()?;
+    let pipe = |from: &JsValue, to: &JsValue| -> Result<JsValue, JsValue> {
+        let readable: web_sys::ReadableStream = property(from, "readable")?.unchecked_into();
+        let writable: web_sys::WritableStream = property(to, "writable")?.unchecked_into();
+        let options = web_sys::StreamPipeOptions::new();
+        options.set_signal(&abort.signal());
+        let abort = abort.clone();
+        let on_error = Closure::once_into_js(move |error: JsValue| -> Result<JsValue, JsValue> {
+            abort.abort();
+            Err(error)
         });
-        eprintln!("RUST PANIC: {info}");
-    }));
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(1)
-        .use_current_thread()
-        .build_global()
-        .map_err(js_error)?;
-    let (basic, advanced) = config::configuration();
-    pumpkin::init_logger(&advanced);
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(js_error)?;
-    runtime.block_on(async {
-        let server = PumpkinServer::new(basic, advanced, VanillaData::load()).await;
-        server.init_plugins().await;
-        SERVER.with(|slot| *slot.borrow_mut() = Some(server.server.clone()));
-        ready.call0(&JsValue::UNDEFINED)?;
-        server.start().await;
-        SERVER.with(|slot| slot.borrow_mut().take());
-        Ok(())
-    })
+        then(&readable.pipe_to_with_options(&writable, &options), None, Some(&on_error))
+    };
+    let pumps = js_sys::Array::of2(&pipe(&socket, &target)?, &pipe(&target, &socket)?);
+    let close_both = Closure::once_into_js(move |results: JsValue| -> Result<JsValue, JsValue> {
+        for result in js_sys::Array::from(&results).iter() {
+            if property(&result, "status")? != "rejected" {
+                continue;
+            }
+            let reason = property(&result, "reason")?;
+            let text = reason
+                .as_string()
+                .unwrap_or_else(|| js_sys::Error::from(reason.clone()).message().into())
+                .to_lowercase();
+            let expected = ["closed", "closing", "abort", "cancel", "reset", "network connection lost"];
+            if !expected.iter().any(|e| text.contains(e)) {
+                web_sys::console::error_2(&"TCP forwarding failed".into(), &reason);
+            }
+        }
+        let closes = js_sys::Array::new();
+        for side in [&socket, &target] {
+            closes.push(&method(side, "close", &[])?);
+        }
+        Ok(js_sys::Promise::all_settled(&closes).into())
+    });
+    then(&js_sys::Promise::all_settled(&pumps).into(), Some(&close_both), None)
 }
 
-/// Requests shutdown; `pumpkin_run` completes the save and returns.
-#[wasm_bindgen]
-pub fn pumpkin_stop() {
-    pumpkin::stop_server();
+fn json_response(value: &JsValue, status: u16) -> Result<JsValue, JsValue> {
+    let init = web_sys::ResponseInit::new();
+    init.set_status(status);
+    let headers = web_sys::Headers::new()?;
+    headers.set("content-type", "application/json")?;
+    init.set_headers(&headers);
+    let body = js_sys::JSON::stringify(value)?;
+    Ok(web_sys::Response::new_with_opt_str_and_init(body.as_string().as_deref(), &init)?.into())
 }
 
 #[wasm_bindgen]
-pub fn pumpkin_status() -> Result<JsValue, JsValue> {
-    let server = server()?;
-    let result = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &result,
-        &"players".into(),
-        &(server.get_all_players().len() as f64).into(),
-    )?;
-    js_sys::Reflect::set(
-        &result,
-        &"ticks".into(),
-        &(server.tick_count.load(Ordering::Relaxed) as f64).into(),
-    )?;
-    js_sys::Reflect::set(
-        &result,
-        &"wasm_memory_bytes".into(),
-        &((core::arch::wasm32::memory_size::<0>() * 65536) as f64).into(),
-    )?;
-    for (name, bytes) in memory::heap_usage() {
-        js_sys::Reflect::set(&result, &name.into(), &(bytes as f64).into())?;
+pub fn fetch(request: web_sys::Request, env: JsValue, _ctx: JsValue) -> Result<JsValue, JsValue> {
+    let url = web_sys::Url::new(&request.url())?;
+    match url.pathname().as_str() {
+        "/health" => {
+            let body = js_sys::Object::new();
+            js_sys::Reflect::set(&body, &"ready".into(), &JsValue::TRUE)?;
+            json_response(&body, 200)
+        }
+        "/" if request.method() == "GET" => {
+            let status = method(&stub(&env)?, "status", &[])?;
+            let respond = Closure::once_into_js(|value: JsValue| json_response(&value, 200));
+            then(&status, Some(&respond), None)
+        }
+        _ => json_response(&"Not found".into(), 404),
     }
-    Ok(result.into())
 }

@@ -5,15 +5,16 @@ Read [README.md](README.md), [architecture](docs/architecture.md), and
 
 ## Project layout
 
-- `src/`: Pumpkin entry points and configuration.
-- `worker/`: TCP ingress, Durable Object lifecycle, and SQLite filesystem.
-- `tests/`: protocol clients, integration tests, and isolated filesystem fixtures.
+- `src/`: the Worker: TCP ingress, the Durable Object, world persistence,
+  Pumpkin configuration, and the Emscripten JS library (`workerd.js`).
+- `worker/index.mjs`: the module Wrangler loads; re-exports the generated build.
+- `tests/`: protocol clients and the integration test.
 - `scripts/setup.sh`: provision pinned sources and build the toolchain.
 - `scripts/{build,serve,test}.sh`: build, run, and validate the Workers server.
 
 Use Node 24+ (26 recommended) and the pinned Rust toolchain. Run `npm test` after
 build/runtime changes; it must print `PUMPKIN-DO-SQLITE-RESTART-OK` after verifying
-player and chunk restoration. Keep test fixtures out of the production bundle.
+player and chunk restoration.
 Scripts bind to loopback and fail if their ports are occupied. Do not kill another
 process to free a port.
 
@@ -21,8 +22,9 @@ process to free a port.
 
 Changes to the patched Pumpkin checkout must be reflected in `patches/`. Keep unpatched checkouts unmodified; update pins for
 upstream changes. Preserve the unified ticker and cooperative scheduler unless
-the task requires a runtime change. Do not reintroduce old Tokio/libc networking
-patches.
+the task requires a runtime change. Keep the `EventLoopRuntime` model: exports
+return promises and nothing blocks or suspends; do not reintroduce JSPI, old
+Tokio/libc networking patches, or a JS-side driver.
 
 Worlds under `.data/` are user data; do not remove or copy them into commits.
 Playable databases live in `.data/workers/server/`; tests use `.data/probes/`.

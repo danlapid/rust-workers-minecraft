@@ -23,11 +23,11 @@ export async function testServer({ seed = '1789195700909824175' } = {}) {
   }
 
   let phase = 0;
-  async function startWorker(fixture = false) {
-    const log = path.join(probe, `${++phase}-${fixture ? "filesystem" : "minecraft"}.log`);
+  async function startWorker() {
+    const log = path.join(probe, `${++phase}-minecraft.log`);
     const child = spawn(process.execPath, [
       path.join(repo, 'node_modules/wrangler/bin/wrangler.js'), 'dev', '--local',
-      '--config', path.join(repo, fixture ? 'tests/fixtures/wrangler.jsonc' : 'wrangler.jsonc'),
+      '--config', path.join(repo, 'wrangler.jsonc'),
       '--persist-to', persistence, '--var', 'WORLD_NAME:integration',
       // Known terrain with a stable editable spawn block; random water spawns
       // cannot exercise the integration test's shared block-edit assertions.

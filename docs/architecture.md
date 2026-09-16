@@ -2,32 +2,44 @@
 
 ## Runtime and connections
 
-The Worker forwards TCP streams to a named Durable Object using the platform's
-stream-piping API. The object lazily creates an Emscripten module and calls its
-single `pumpkin_run` export. That export is a `#[wasm_bindgen(jspi)]` function: it
-builds a current-thread Tokio runtime and `block_on`s the whole server lifetime,
-and every park (`epoll_wait`, timers) suspends the Wasm stack on the host event
-loop. There is no host-driven scheduling and no Rust promise adapter; the run
-promise settles only when the server has stopped and saved. `-sREENTRANT_JSPI`
-gives each promising activation its own shadow stack, so status calls and
-connection routing enter the module while the server is suspended without
-touching its frames.
+The whole Worker is Rust. Cargo links the `pumpkin-do` bin for
+`wasm32-unknown-emscripten` with emcc, which emits an ES module instance
+(`-sMODULARIZE=instance`, `-sWASM_BINDGEN`) that `worker/index.mjs` re-exports
+for Wrangler. The entrypoint's `connect` handler forwards each TCP connection to
+the named `MinecraftWorld` object with `stub.connect` and pipes both directions;
+`fetch` serves status. Both are plain exports composing the platform's promises.
+
+`MinecraftWorld` is a `#[wasm_bindgen]` class constructed with the object's state
+and owning Tokio's `EventLoopRuntime` (tokio-rs/tokio#8479): the current-thread
+scheduler and drivers with the host event loop as their wait. Nothing blocks or
+suspends. Work is scheduled as roots that complete by callback, and each export
+wraps its root in a Promise. The first `connect` after idle schedules the server
+lifetime as a root: it restores the world, starts Pumpkin, awaits the server's
+return after its final save, checkpoints, and settles the connection's promise.
+Later connections and `status` calls enter the same instance as ordinary calls
+while that root is parked. A connection arriving while the server is starting
+or stopping waits for the next phase change and then retries, so a client that
+connects as the previous server checkpoints starts the next one. The runtime's epoll and timer waits register with the
+host through Emscripten's Node backend (emscripten-core/emscripten#27547), so a
+readiness or timer callback resumes the scheduler on the host loop.
 
 Pumpkin binds its stock `TcpListener` on port 25565. Emscripten's Node socket
 backend implements that with `net.BoundSocket`/`net.Server`, which workerd scopes
-to the Durable Object's own port table, so every object binds the same port. The
-object's `connect` handler routes each inbound socket to that listener with
-`handleAsNodeConnection`; the accepted connection then surfaces through epoll
-readiness and Pumpkin's normal accept loop. Accepted sockets report the bound
+to the Durable Object's own port table. `connect` routes each inbound socket to
+that listener with `handleAsNodeConnection`; the accepted connection surfaces
+through epoll readiness and Pumpkin's normal accept loop, reporting the bound
 address and an unspecified peer.
 
-Each object owns separate wasm memory, Rust statics, filesystem descriptors, and
-its Tokio runtime. Pumpkin's `single-threaded` feature selects cooperative inline
-chunk generation and the async ticker. The same scheduler loop serves native
-builds, which dispatch generation onto Rayon. Save batches await queue capacity;
-shutdown drains results with an elapsed-time timeout before the final flush.
-Bounded CPU tasks use regular Tokio tasks because `spawn_blocking` requires OS
-threads. JSPI supplies stack suspension, not threads.
+One wasm instance serves the isolate, so one object hosts one server at a time;
+`WORLD_NAME` selects it. When the last connection closes, the server root calls
+`stop_server`, Pumpkin saves and returns, and `reset_stop` clears the process-wide
+stop state so the next connection can start a fresh server in the same instance.
+
+Pumpkin's `single-threaded` feature selects cooperative inline chunk generation
+and the async ticker. The same scheduler loop serves native builds, which
+dispatch generation onto Rayon. Save batches await queue capacity; shutdown
+drains results with an elapsed-time timeout before the final flush. Bounded CPU
+tasks use regular Tokio tasks because `spawn_blocking` requires OS threads.
 
 Structure templates store palette indices and share their block arrays between
 the placement and query APIs. Block-entity NBT is shared until a placement needs
@@ -37,41 +49,19 @@ neighborhood compact without changing its dependency rules. Emscripten grows
 memory in 2 MiB increments, configured by `build.rs`, while retaining the 8 MiB
 stack. See [memory measurements](memory-reduction.md).
 
-Emscripten factory mode (`MODULARIZE=1`) isolates module instances. Wrangler
-provides the compiled wasm through `instantiateWasm`; the generated host glue uses
-Workers' Node compatibility APIs. The SDK's standalone-loader initialization and
-recovery hook is disabled for this embedding.
-
 ## Filesystem and checkpoints
 
-The host mounts `LocalDOFilesystem(ctx.storage)` from durable-object-fs at `/data`.
-Emscripten's `NODERAWFS` routes Rust filesystem calls through worker-fs-mount's
-synchronous Node API, including descriptors, positional I/O, rename, and sync.
-World metadata, chunks, entities, players, and configuration use this mount.
-Logging goes to the host console.
+Pumpkin runs against workerd's own Node filesystem through Emscripten's
+`NODERAWFS`, with the world under `/tmp/world`. That tree lives for the Durable
+Object's lifetime. Between runs it lives in the object's SQLite storage, one row
+per file: the server root restores the tree before starting Pumpkin and, after
+the server's final save, writes every changed file back, deletes rows for removed
+files, and awaits `storage.sync()` before the last connection is reported closed.
+Status shows the checkpoint time. Terminating a server with active clients can
+lose changes since the previous checkpoint.
 
-Each wasm instance retains its own mount context across requests and Tokio
-callbacks using `AsyncLocalStorage.snapshot()`. Descriptors opened at startup
-therefore remain valid until that runtime shuts down, without exposing one world's
-mount to another object.
-
-The Emscripten compatibility library in `worker/fs-library.js` supplies the mounted Node
-filesystem to the factory: the generated loader's runtime `createRequire` calls
-cannot use Wrangler's build-time aliases. It also initializes file flags from
-public `fs.constants` and implements synchronous `fd_sync`. Paths resolve against
-the wasm instance's working directory (initially `/data`), without changing the
-isolate-wide Node process directory.
-
-The upstream `entries` table stores metadata, and `file_pages` stores contents in
-64 KiB rows. Descriptor writes update only affected pages. Truncation supports
-sparse files, and file writes and native rename use SQLite transactions. Whole-file
-reads still require a buffer large enough for the result.
-
-After the final connection leaves, the object requests a stop; Pumpkin saves,
-`pumpkin_run` resolves, and the object awaits `storage.sync()`. New connections wait for this checkpoint, then create a
-fresh runtime from the stored files. Checkpoint failures remain visible in status.
-This preserves issued writes; terminating a server with active clients can still
-lose changes in Pumpkin's in-memory caches.
+Logging goes to the host console: `src/workerd.js` keeps Emscripten's stdio
+descriptors on its console callbacks, since workerd exposes no process stdio.
 
 ## Development interfaces
 
@@ -85,28 +75,17 @@ Runtime statistics include Wasm capacity and allocator in-use/free/arena bytes.
 Allocator counters include allocation metadata and unused container capacity;
 Wasm capacity additionally includes static data, stack, and growth headroom.
 
-The public status path reads no filesystem internals and remains available when
-startup fails. Checkpointing is internal to the connection lifecycle. The
-`worker/pumpkin.ts` facade binds exports to the module context once, so the
-Durable Object deals with `connect`, `stop`, and `status` methods.
-
 Local databases live in `.data/workers/server/`. Integration tests use separate
-storage under `.data/probes/` and restart Wrangler to verify restoration. The echo
-and large-file test fixture has its own Worker configuration and wasm binary; it
-is excluded from the application bundle.
-
-Rust panics, Rust error logs, and runtime crashes fail the integration test.
+storage under `.data/probes/` and restart Wrangler to verify restoration. Rust
+panics, Rust error logs, and runtime crashes fail the integration test.
 
 ## Build constraints
 
 - Use the pinned Rust toolchain, Emscripten, and wasm-bindgen CLI from setup.
 - Keep static relocation, exnref exception handling on both the C and Rust
-  sides, the 8 MiB stack, and memory growth.
-- Pass Emscripten link settings through rustc so they do not affect C compilation.
-- Keep the compatibility initializer linked even when Rust does not call `fd_sync`;
-  `build.rs` configures this and tracks the library as a build input.
+  sides, the 8 MiB stack, and memory growth. `.cargo/config.toml` holds the link
+  settings; `build.rs` adds the JS library and growth step.
+- Build with `--cfg tokio_unstable`; `EventLoopRuntime` is unstable API.
 - Prefix Rust exports to avoid collisions with libc and Emscripten symbols.
-- The synchronous SQLite mount supplies `fd_sync`; checkpoint completion separately
-  awaits Durable Object storage synchronization.
 
 [Dependency pins and patch maintenance](dependencies.md)
