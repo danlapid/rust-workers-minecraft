@@ -1,21 +1,22 @@
 # Dependency sources and pins
 
-A clean checkout is self-contained after `bash scripts/setup.sh`. Dependency sources
-and toolchains are ignored under `.work/`. Both Cargo and npm dependency graphs are
-locked.
+A clean checkout is self-contained after `bash scripts/setup.sh`. The patched
+Pumpkin checkout and the worker-build CLI live under `.work/` (ignored);
+worker-build provisions its own Emscripten and wasm-bindgen CLI under
+`~/.cache/worker-build`. Both Cargo and npm dependency graphs are locked.
 
-## Direct checkouts
+## Pinned sources
 
-| Component | Source / branch | Commit | Local changes or purpose |
+| Component | Source / ref | Commit or tag | Local changes or purpose |
 | --- | --- | --- | --- |
-| pumpkin | [master](https://github.com/Pumpkin-MC/Pumpkin) | `b5b9b9d7010e793806a83c495af223c67e1d35ee` | Headless embedding, shared async scheduler, restartable stop signal, compact templates/generation chunks, and build-script fixes |
-| tokio | [emscripten-event-loop](https://github.com/guybedford/tokio) | `5315798b6a62a47d03dc40e7d04fbf83c80f3246` | `EventLoopRuntime` (tokio-rs/tokio#8479) and `net` over epoll on Emscripten; unmodified |
-| emscripten | [cf-final](https://github.com/guybedford/emscripten) | `4e034c65a18c0034c68e7eb628477fe4428fa1f9` | Upstream main plus emscripten-core/emscripten#27547 (epoll listeners on the host loop), #27698, #27699, and pending fixes: side-module accept, exnref ordering, `fs.constants` in NODEFS; unmodified |
-| binaryen | [jspi-hooks](https://github.com/guybedford/binaryen) | `d6483a04d7dab0ef83e5c43f87343061d97a3b8d` | The frontend pin expects this Binaryen; built by setup |
-| emsdk | [main](https://github.com/emscripten-core/emsdk) | `5eb0bde7585670252e8ba05e9d361627bffd08b5` | LLVM from emscripten-releases build `e8579ea489b44a6792f5abf95377a6ee38a16cce`, paired with the frontend's main |
+| pumpkin | [master](https://github.com/Pumpkin-MC/Pumpkin) | `b5b9b9d7010e793806a83c495af223c67e1d35ee` | Checkout under `.work/pumpkin`: headless embedding, shared async scheduler, restartable stop signal, compact templates/generation chunks, and build-script fixes |
+| workers-rs | [gbedford/worker-build-emscripten](https://github.com/cloudflare/workers-rs/pull/1061) | `490b6baa6e45d98a4c6f40565e9eb7d214ee2a93` | cloudflare/workers-rs#1061: the `worker` crate (`experimental_tokio` feature, a git dependency in Cargo.toml) and `worker-build --emscripten` (installed by setup from the same revision); unmodified |
+| tokio | [guybedford/tokio](https://github.com/guybedford/tokio) | tag `1.53.1-cf.emscripten` | `LocalEventLoop` (tokio-rs/tokio#8484) and `net` over epoll on Emscripten; a `[patch.crates-io]` git dependency; unmodified |
+| emscripten | [guybedford/emscripten](https://github.com/guybedford/emscripten) | tag `6.0.10-cf.emscripten` | The 6.0.10 release plus emscripten-core/emscripten#27547 (epoll listeners on the host loop) and #27742 (async DNS lookup). worker-build installs emsdk 6.0.10 and applies these as its bundled patches |
 
-Patches are relative to the pinned commits above. Setup checks reverse application
-before applying a patch and refuses to repin a modified checkout.
+The Pumpkin patches are relative to the pinned commit above. Setup checks
+reverse application before applying a patch and refuses to repin a modified
+checkout.
 
 Pumpkin has two patches: `pumpkin-emscripten.patch` for embedding/runtime support,
 followed by `pumpkin-memory.patch` for compact templates and generation chunks.
@@ -26,14 +27,14 @@ commit.
 
 | Crate | Source | Purpose |
 | --- | --- | --- |
-| mio | https://github.com/guybedford/mio `a62c9e46833fc255c9217ab9aa362c6221ed4401` | Emscripten epoll selector (tokio-rs/mio#1969) |
+| mio | https://github.com/guybedford/mio tag `1.2.3-cf.emscripten` | Emscripten epoll selector (tokio-rs/mio#1969) |
 | libc | https://github.com/rust-lang/libc branch `libc-0.2` | Emscripten epoll bindings, unreleased |
 | ring | https://github.com/guybedford/ring branch `emscripten` | getrandom-backed `SystemRandom` on Emscripten |
 
-The root Cargo.toml applies these overrides and the local checkouts. Cargo.lock
-pins the full application graph, including the branch commits. The Worker uses
-`wasm-bindgen`, `js-sys`, and `web-sys` from crates.io directly; there is no
-`worker` crate dependency.
+The root Cargo.toml applies these overrides and the local checkouts; the
+wasm-bindgen crates (0.2.129, with `#[wasm_bindgen(experimental_tokio)]`) and
+wasm-streams 0.7 come from crates.io. Cargo.lock pins the full application
+graph, including the branch commits.
 
 ## Host tools
 
@@ -41,20 +42,21 @@ pins the full application graph, including the branch commits. The Worker uses
   `wasm32-unknown-emscripten`; setup installs both through rustup. rustc needs a
   larger compile-thread stack for pumpkin-data's generated tables; the scripts
   set `RUST_MIN_STACK`.
-- wasm-bindgen CLI: the release matching the `wasm-bindgen` crate version in
-  Cargo.toml, installed by setup into `.work/bin/`. emcc runs it as a post-link
-  step under `-sWASM_BINDGEN`.
+- worker-build: installed by setup with `cargo install --git` at the workers-rs
+  revision Cargo.toml pins, into `.work/bin/`. It provisions emsdk 6.0.10 with
+  its bundled Emscripten patches and the matching wasm-bindgen CLI under
+  `~/.cache/worker-build`, drives cargo and emcc with the common link settings,
+  wraps the exports into the entrypoint and Durable Object classes, and emits
+  `build/`. `EMSCRIPTEN`/`EMSDK` select a local toolchain instead.
 - Node: 24+; 26 recommended and selected in CI. Used for build tools and tests.
-- Python: 3.11+ (Emscripten scripts and TOML parsing).
-- Emscripten backend: LLVM through emsdk under `.work/emsdk` (or an activated
-  emsdk selected with `EMSDK` during setup), and Binaryen built from the checkout
-  above with CMake and Ninja. Setup writes the frontend's `.emscripten_cf` config
-  pointing at both, and `scripts/common.sh` selects it with `EM_CONFIG`.
-- workerd: Wrangler must run a workerd with per-Durable-Object port tables,
-  `net.Server` inbound routing (`handleAsNodeConnection`), and the `node:fs`
-  fixes for positional buffer I/O, `O_TRUNC`, `O_CREAT`, and rename over an
-  existing path. Until those ship in Wrangler's bundled version, set
-  `MINIFLARE_WORKERD_PATH`.
+- Python: 3.11+ (Emscripten scripts, emsdk and TOML parsing).
+- workerd: Wrangler must run a workerd with `net.Server` inbound routing into
+  Durable Objects (`handleAsNodeConnection`, cloudflare/workerd#7306, #7313) and
+  the `node:fs` fixes for positional buffer I/O (#7368), `O_TRUNC` (#7369),
+  `O_CREAT` (#7393), and rename over an existing path (#7394). All are in
+  workerd main; until Wrangler's bundled version catches up, build main
+  (`bazel build //src/workerd/server:workerd`) and set `MINIFLARE_WORKERD_PATH`
+  to `bazel-bin/src/workerd/server/workerd`.
 
 ## Updating a patch
 
@@ -94,9 +96,9 @@ bash scripts/setup.sh --sources-only
 
 ## JavaScript dependencies
 
-`package-lock.json` pins Wrangler 4.129.0. The only application JavaScript is
-`worker/index.mjs`, which re-exports the generated module and derives the
-Durable Object class from `DurableObject` for RPC.
+`package-lock.json` pins Wrangler 4.129.0. There is no application JavaScript;
+worker-build generates `build/index.js`, which wraps the exports into the
+entrypoint and derives the Durable Object class from `DurableObject` for RPC.
 
 After moving a checkout with cached build output, run `cargo clean` before rebuilding.
 Generated data can contain absolute paths. This leaves databases under `.data/` intact.

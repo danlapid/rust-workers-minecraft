@@ -1,7 +1,8 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "rust-workers-minecraft",
-  "main": "worker/index.mjs",
+  "main": "build/index.js",
+  "build": { "command": "bash scripts/build.sh" },
   "compatibility_date": "2026-09-05",
   "compatibility_flags": ["nodejs_compat", "new_module_registry", "no_handle_cross_request_promise_resolution"],
   "dev": { "ip": "127.0.0.1", "port": 8787 },

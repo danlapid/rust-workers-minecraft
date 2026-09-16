@@ -2,26 +2,26 @@
 
 ## Runtime and connections
 
-The whole Worker is Rust. Cargo links the `pumpkin-do` bin for
-`wasm32-unknown-emscripten` with emcc, which emits an ES module instance
-(`-sMODULARIZE=instance`, `-sWASM_BINDGEN`) that `worker/index.mjs` re-exports
-for Wrangler. The entrypoint's `connect` handler forwards each TCP connection to
-the named `MinecraftWorld` object with `stub.connect` and pipes both directions;
-`fetch` serves status. Both are plain exports composing the platform's promises.
+The whole Worker is Rust: `worker-build --emscripten`, with the `worker` crate's
+`experimental_tokio` feature, links the `pumpkin-do` bin for `wasm32-unknown-emscripten`
+through emcc and emits the module Wrangler serves. The entrypoint's `connect` handler forwards each TCP
+connection to the named `MinecraftWorld` object with `stub.connect` and pipes
+both directions; `fetch` (a `worker` crate `#[event(fetch)]`) serves status.
 
-`MinecraftWorld` is a `#[wasm_bindgen]` class constructed with the object's state
-and owning Tokio's `EventLoopRuntime` (tokio-rs/tokio#8479): the current-thread
-scheduler and drivers with the host event loop as their wait. Nothing blocks or
-suspends. Work is scheduled as roots that complete by callback, and each export
-wraps its root in a Promise. The first `connect` after idle schedules the server
-lifetime as a root: it restores the world, starts Pumpkin, awaits the server's
-return after its final save, checkpoints, and settles the connection's promise.
-Later connections and `status` calls enter the same instance as ordinary calls
-while that root is parked. A connection arriving while the server is starting
-or stopping waits for the next phase change and then retries, so a client that
-connects as the previous server checkpoints starts the next one. The runtime's epoll and timer waits register with the
-host through Emscripten's Node backend (emscripten-core/emscripten#27547), so a
-readiness or timer callback resumes the scheduler on the host loop.
+`MinecraftWorld` is a `#[wasm_bindgen]` class constructed with the object's
+state. Its `connect` is a `#[wasm_bindgen(experimental_tokio)]` export: the future runs on
+the thread's Tokio `LocalEventLoop` (tokio-rs/tokio#8484), the current-thread
+scheduler and drivers with the host event loop as their wait, and the export
+returns the Promise of its outcome. Nothing blocks or suspends. The first
+`connect` after idle runs the server lifetime: it restores the world, starts
+Pumpkin, awaits the server's return after its final save, checkpoints, and
+settles the connection's promise. Later connections and `status` calls enter
+the same instance as ordinary calls while that future is parked. A connection
+arriving while the server is starting or stopping waits for the next phase
+change and then retries, so a client that connects as the previous server
+checkpoints starts the next one. The runtime's epoll and timer waits register
+with the host through Emscripten's Node backend (emscripten-core/emscripten#27547),
+so a readiness or timer callback resumes the scheduler on the host loop.
 
 Pumpkin binds its stock `TcpListener` on port 25565. Emscripten's Node socket
 backend implements that with `net.BoundSocket`/`net.Server`, which workerd scopes
@@ -81,11 +81,13 @@ panics, Rust error logs, and runtime crashes fail the integration test.
 
 ## Build constraints
 
-- Use the pinned Rust toolchain, Emscripten, and wasm-bindgen CLI from setup.
+- Use the pinned Rust toolchain and the worker-build from setup, which
+  provisions Emscripten and the wasm-bindgen CLI.
 - Keep static relocation, exnref exception handling on both the C and Rust
-  sides, the 8 MiB stack, and memory growth. `.cargo/config.toml` holds the link
-  settings; `build.rs` adds the JS library and growth step.
-- Build with `--cfg tokio_unstable`; `EventLoopRuntime` is unstable API.
+  sides, the 8 MiB stack, and memory growth. worker-build supplies the common
+  codegen and link settings (including `--cfg tokio_unstable`; `LocalEventLoop`
+  is unstable API); `build.rs` adds the application's own: `NODERAWFS`, the
+  stack size, the growth step, and the JS library.
 - Prefix Rust exports to avoid collisions with libc and Emscripten symbols.
 
 [Dependency pins and patch maintenance](dependencies.md)

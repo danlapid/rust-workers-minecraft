@@ -4,10 +4,9 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$REPO/.work"
 NODE="${NODE:-node}"
-# Setup provisions the frontend checkout, compiler backend config, and the
-# wasm-bindgen CLI under .work/; WASM_BINDGEN_BIN may point at another CLI directory.
-EMSCRIPTEN="$WORK/emscripten"
-WASM_BINDGEN_BIN="${WASM_BINDGEN_BIN:-$WORK/bin}"
+# Setup provisions the patched Pumpkin checkout and the worker-build CLI under
+# .work/; worker-build provisions Emscripten and the wasm-bindgen CLI itself.
+BIN="$WORK/bin"
 
 require_node() {
   local major
@@ -19,19 +18,12 @@ require_node() {
 }
 
 require_toolchain() {
-  if [ ! -f "$EMSCRIPTEN/.emscripten_cf" ] ||
-     [ ! -x "$EMSCRIPTEN/emcc" ] ||
-     [ ! -x "$WASM_BINDGEN_BIN/wasm-bindgen" ] ||
-     [ ! -f "$WORK/pumpkin/crates/pumpkin/Cargo.toml" ] ||
-     [ ! -f "$WORK/tokio/tokio/Cargo.toml" ]; then
+  if [ ! -x "$BIN/worker-build" ] ||
+     [ ! -f "$WORK/pumpkin/crates/pumpkin/Cargo.toml" ]; then
     echo "error: run bash scripts/setup.sh first." >&2
     exit 1
   fi
-  export EM_CONFIG="$EMSCRIPTEN/.emscripten_cf"
-  export PATH="$EMSCRIPTEN:$WASM_BINDGEN_BIN:$PATH"
-  export CARGO_TARGET_WASM32_UNKNOWN_EMSCRIPTEN_LINKER="$EMSCRIPTEN/emcc"
-  # Uniform exnref exception handling for C and Rust objects (see .cargo/config.toml).
-  export EMCC_CFLAGS="${EMCC_CFLAGS:-} -fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0"
+  export PATH="$BIN:$PATH"
   export CARGO_TARGET_DIR="$REPO/target/workers"
   # rustc's LLVM const emission recurses deeply on pumpkin-data's generated tables
   # and overflows its default 8 MiB compile-thread stack on current toolchains.

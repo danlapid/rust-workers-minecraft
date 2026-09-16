@@ -1,11 +1,11 @@
 //! The Durable Object hosting one Pumpkin server.
 //!
-//! The object owns an `EventLoopRuntime`: Tokio's current-thread scheduler and
-//! drivers with the host event loop as its wait. Work is scheduled as roots
-//! that complete by callback, so every export returns a Promise and nothing
-//! blocks or suspends. The server lifetime is one such root: the first
-//! `connect` after idle schedules it, and its completion (after the final save)
-//! is the checkpoint. Later connections are routed to the running listener.
+//! `connect` is a `#[wasm_bindgen(experimental_tokio)]` export: its future runs on the
+//! thread's Tokio event loop, whose wait is the host event loop, so nothing
+//! blocks or suspends and the export returns a Promise. The server lifetime is
+//! one such future: the first `connect` after idle runs it, and its completion
+//! (after the final save) is the checkpoint. Later connections are routed to
+//! the running listener.
 
 use crate::{config, host, memory, persist};
 use host::{js_error, method, property, then};
@@ -15,8 +15,8 @@ use std::{
     rc::Rc,
     sync::{atomic::Ordering, Arc},
 };
-use tokio::runtime::EventLoopRuntime;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen_futures::JsFuture;
 
 pub const PORT: u16 = 25565;
 
@@ -48,11 +48,10 @@ thread_local! {
     static LOGGER: Cell<bool> = const { Cell::new(false) };
 }
 
-/// State shared between the exports and the scheduled roots.
+/// State shared between the exports and the server future.
 struct Shared {
     /// `ctx.storage`
     storage: JsValue,
-    runtime: EventLoopRuntime,
     phase: Cell<Phase>,
     failure: RefCell<Option<String>>,
     connections: Cell<u32>,
@@ -66,7 +65,7 @@ struct Shared {
 }
 
 // Closures run under catch_unwind; the object is only ever touched from this
-// thread through the runtime's calls, so a poisoned borrow cannot be observed.
+// thread, so a poisoned borrow cannot be observed.
 impl std::panic::RefUnwindSafe for Shared {}
 
 #[wasm_bindgen]
@@ -86,14 +85,9 @@ impl MinecraftWorld {
         }));
         let storage = property(&state, "storage")?;
         persist::prepare(&storage)?;
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build_event_loop_runtime()
-            .map_err(js_error)?;
         Ok(MinecraftWorld {
             shared: Rc::new(Shared {
                 storage,
-                runtime,
                 phase: Cell::new(Phase::Idle),
                 failure: RefCell::new(None),
                 connections: Cell::new(0),
@@ -107,8 +101,10 @@ impl MinecraftWorld {
 
     /// Serves one inbound connection; resolves when it closes. The first call
     /// while idle also runs the server, resolving once the world is checkpointed.
-    pub fn connect(&self, socket: JsValue) -> Result<JsValue, JsValue> {
-        self.shared.connect(socket)
+    #[wasm_bindgen(experimental_tokio)]
+    pub async fn connect(&self, socket: JsValue) -> Result<JsValue, JsValue> {
+        let shared = self.shared.clone();
+        shared.connect(socket).await
     }
 
     pub fn status(&self) -> Result<JsValue, JsValue> {
@@ -139,23 +135,31 @@ impl MinecraftWorld {
 }
 
 impl Shared {
-    fn connect(self: &Rc<Self>, socket: JsValue) -> Result<JsValue, JsValue> {
-        match self.phase.get() {
-            Phase::Running => return self.route(socket),
-            Phase::Failed => {
-                return Err(js_error(self.failure.borrow().as_deref().unwrap_or("failed")))
+    async fn connect(self: Rc<Self>, socket: JsValue) -> Result<JsValue, JsValue> {
+        loop {
+            match self.phase.get() {
+                Phase::Running => return self.route(socket),
+                Phase::Failed => {
+                    return Err(js_error(self.failure.borrow().as_deref().unwrap_or("failed")))
+                }
+                Phase::Starting | Phase::Stopping => {
+                    JsFuture::from(self.transition()?).await?;
+                }
+                Phase::Idle => break,
             }
-            Phase::Starting | Phase::Stopping => {
-                let shared = self.clone();
-                let retry = Closure::once_into_js(move |_: JsValue| shared.connect(socket));
-                return then(&self.transition()?.into(), Some(&retry), None);
-            }
-            Phase::Idle => {}
         }
         self.set_phase(Phase::Starting);
         let started = js_sys::Date::now();
-        let root = self.clone();
-        self.promise(async move { root.run(socket, started).await })
+        // A task of its own so a panic arrives as a `JoinError` and fails the
+        // object rather than escaping the export.
+        let outcome = match tokio::task::spawn_local(self.clone().run(socket, started)).await {
+            Ok(outcome) => outcome,
+            Err(panic) => Err(js_error(format!("server task failed: {panic}"))),
+        };
+        if let Err(error) = &outcome {
+            self.fail(error);
+        }
+        outcome
     }
 
     /// The promise of the next phase change.
@@ -175,32 +179,6 @@ impl Shared {
         if let Some((_, resolve)) = self.transition.borrow_mut().take() {
             let _ = resolve.call0(&JsValue::UNDEFINED);
         }
-    }
-
-    /// Schedules `future` as a root and returns the Promise of its outcome.
-    fn promise(
-        self: &Rc<Self>,
-        future: impl std::future::Future<Output = Result<JsValue, JsValue>> + 'static,
-    ) -> Result<JsValue, JsValue> {
-        let resolvers = with_resolvers()?;
-        let promise = property(&resolvers, "promise")?;
-        let resolve: js_sys::Function = property(&resolvers, "resolve")?.unchecked_into();
-        let reject: js_sys::Function = property(&resolvers, "reject")?.unchecked_into();
-        let shared = self.clone();
-        self.runtime.schedule(future, move |outcome| {
-            let outcome =
-                outcome.unwrap_or_else(|panic| Err(js_error(format!("server task failed: {panic}"))));
-            match outcome {
-                Ok(value) => {
-                    let _ = resolve.call1(&JsValue::UNDEFINED, &value);
-                }
-                Err(error) => {
-                    shared.fail(&error);
-                    let _ = reject.call1(&JsValue::UNDEFINED, &error);
-                }
-            }
-        });
-        Ok(promise)
     }
 
     fn fail(&self, error: &JsValue) {

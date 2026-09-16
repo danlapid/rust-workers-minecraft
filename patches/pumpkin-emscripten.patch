@@ -6,9 +6,10 @@ plugin loading, the console, and system crash reporting. Native builds
 retain these subsystems and thread-backed execution by default.
 
 Share asynchronous ticker and chunk-scheduler loops between native and
-single-threaded builds. Route Rayon and blocking jobs through helpers that
-can run on the current thread, await scheduler notifications and results,
-and track cooperative tasks through shutdown. Drop the Tokio features that
+single-threaded builds. Run Rayon, chunk-generation and blocking jobs as
+Tokio tasks on single-threaded builds so each takes its own turn of the
+event loop, await scheduler notifications and results, and track
+cooperative tasks through shutdown. Drop the Tokio features that
 need OS threads and signals from single-threaded builds and guard
 unsupported Emscripten system calls and synchronous HTTP lookups.
 
@@ -70,25 +71,23 @@ index f4fb121f..0a4a3076 100644
  
  [[bench]]
 diff --git a/crates/pumpkin-util/src/lib.rs b/crates/pumpkin-util/src/lib.rs
-index 5119797b..a1ae947a 100644
+index 5119797b..35d78184 100644
 --- a/crates/pumpkin-util/src/lib.rs
 +++ b/crates/pumpkin-util/src/lib.rs
-@@ -310,3 +310,42 @@ impl TryFrom<i32> for Hand {
+@@ -310,3 +310,39 @@ impl TryFrom<i32> for Hand {
          }
      }
  }
 +
 +/// Spawn a fire-and-forget CPU task.
 +///
-+/// On normal targets this hands the closure to rayon's global thread pool. On
-+/// `wasm32-unknown-emscripten` there are no OS threads and rayon has no worker to
-+/// run an injected job (a bare `rayon::spawn` would never execute, so any code that
-+/// then `.await`s the result over a channel would deadlock). There we run the
-+/// closure inline on the calling thread instead.
++/// On normal targets this hands the closure to rayon's global thread pool.
++/// Single-threaded builds have no rayon workers (a bare `rayon::spawn` would never
++/// run), so the closure becomes a Tokio task and runs on a later turn of the loop.
 +pub fn rayon_spawn<F: FnOnce() + Send + 'static>(f: F) {
 +    #[cfg(feature = "single-threaded")]
 +    {
-+        f();
++        tokio::spawn(async move { f() });
 +    }
 +    #[cfg(not(feature = "single-threaded"))]
 +    {
@@ -101,7 +100,6 @@ index 5119797b..a1ae947a 100644
 +/// Single-threaded builds run the closure in a regular Tokio task, preserving
 +/// panic reporting through `JoinError` without creating a blocking-pool thread.
 +/// The closure itself must finish without waiting for another task on this thread.
-+/// JSPI does not make the public Tokio `spawn_blocking` API threadless.
 +pub fn spawn_blocking<F, R>(f: F) -> tokio::task::JoinHandle<R>
 +where
 +    F: FnOnce() -> R + Send + 'static,
@@ -297,7 +295,7 @@ index f670ad37..b9d9a867 100644
  )>;
  
 diff --git a/crates/pumpkin-world/src/chunk_system/schedule.rs b/crates/pumpkin-world/src/chunk_system/schedule.rs
-index 145e15de..2942a1d3 100644
+index 145e15de..0d388726 100644
 --- a/crates/pumpkin-world/src/chunk_system/schedule.rs
 +++ b/crates/pumpkin-world/src/chunk_system/schedule.rs
 @@ -69,13 +69,14 @@ pub struct GenerationSchedule {
@@ -568,7 +566,7 @@ index 145e15de..2942a1d3 100644
                              break 'out2;
                          }
  
-@@ -1552,12 +1567,19 @@ impl GenerationSchedule {
+@@ -1552,12 +1567,16 @@ impl GenerationSchedule {
                          let send_chunk = self.send_chunk.clone();
                          let level = level.clone();
  
@@ -583,14 +581,11 @@ index 145e15de..2942a1d3 100644
 +                        #[cfg(not(feature = "single-threaded"))]
 +                        self.generation_pool.spawn(generate);
 +                        #[cfg(feature = "single-threaded")]
-+                        {
-+                            generate();
-+                            tokio::task::yield_now().await;
-+                        }
++                        tokio::spawn(async move { generate() });
                      }
                  }
              }
-@@ -1566,82 +1588,39 @@ impl GenerationSchedule {
+@@ -1566,82 +1585,39 @@ impl GenerationSchedule {
              if !io_batch.is_empty()
                  && self
                      .io_read
@@ -659,11 +654,11 @@ index 145e15de..2942a1d3 100644
 -                    if self.resort_work(self.send_level.wait_and_get(level)) {
 -                        self.garbage_collect_dependencies();
 -                    }
-                 }
+-                }
 -                if self.queue_dirty {
 -                    self.sort_queue();
 -                    self.queue_dirty = false;
--                }
+                 }
 -            } else if self.running_task_count >= self.max_in_flight {
 -                // Queue has tasks, but we are at maximum in-flight capacity.
 -                // Wait for an in-flight worker to finish instead of busy-spinning.
@@ -678,12 +673,12 @@ index 145e15de..2942a1d3 100644
 -                        if self.resort_work(self.send_level.get()) {
 -                            self.garbage_collect_dependencies();
 -                        }
--                    }
+                     }
 -                    Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
 -                        if self.resort_work(self.send_level.get()) {
 -                            self.garbage_collect_dependencies();
 -                        }
-                     }
+-                    }
 -                    Err(crossbeam::channel::RecvTimeoutError::Disconnected) => break,
 +                    () = self.send_level.changed() => {}
 +                    () = tokio::time::sleep(Duration::from_millis(50)) => {}
@@ -696,7 +691,7 @@ index 145e15de..2942a1d3 100644
                  }
              }
          }
-@@ -1649,24 +1628,10 @@ impl GenerationSchedule {
+@@ -1649,24 +1625,10 @@ impl GenerationSchedule {
              "schedule: waiting for {} generation tasks to finish",
              self.running_task_count
          );
@@ -725,7 +720,7 @@ index 145e15de..2942a1d3 100644
  
          if self.running_task_count > 0 {
              warn!(
-@@ -1716,6 +1681,15 @@ impl GenerationSchedule {
+@@ -1716,6 +1678,15 @@ impl GenerationSchedule {
          self.graph.edges.clear();
      }
  
@@ -741,7 +736,7 @@ index 145e15de..2942a1d3 100644
      fn debug_check(&self) -> bool {
          if !self.graph.nodes.is_empty() {
              for (key, value) in &self.graph.nodes {
-@@ -1746,3 +1720,123 @@ impl GenerationSchedule {
+@@ -1746,3 +1717,123 @@ impl GenerationSchedule {
          true
      }
  }

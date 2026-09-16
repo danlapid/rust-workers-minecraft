@@ -2,26 +2,13 @@
 target = "wasm32-unknown-emscripten"
 target-dir = "target/workers"
 
+# worker-build --emscripten supplies these (and the link settings) through
+# RUSTFLAGS when building with the `worker/experimental_tokio` feature; they are repeated
+# here so `cargo check` sees the same cfgs.
 [target.wasm32-unknown-emscripten]
 rustflags = [
     "-Crelocation-model=static",
-    "--cfg=tokio_unstable",
-    # exnref exception handling throughout: the C side gets `-fwasm-exceptions
-    # -sWASM_LEGACY_EXCEPTIONS=0` from EMCC_CFLAGS (scripts/common.sh) and the
-    # prebuilt std is translated at link. V8 rejects a module mixing the two.
     "-Cllvm-args=-wasm-use-legacy-eh=false",
-    "-Clink-arg=-sBINARYEN_EXTRA_PASSES=--translate-to-exnref",
-    # Link-only settings stay out of EMCC_CFLAGS so they do not reach C compiles.
-    "-Clink-arg=-sWASM_BINDGEN",
-    "-Clink-arg=-sMODULARIZE=instance",
-    "-Clink-arg=-sEXPORT_ES6",
-    "-Clink-arg=-sAUTO_INIT",
-    "-Clink-arg=-sSOURCE_PHASE_IMPORTS",
-    # Generated host glue uses Workers' Node compatibility APIs.
-    "-Clink-arg=-sENVIRONMENT=node",
-    "-Clink-arg=-sNODERAWSOCKETS",
-    "-Clink-arg=-sNODERAWFS",
-    "-Clink-arg=-sASSERTIONS=0",
-    "-Clink-arg=-sSTACK_SIZE=8MB",
-    "-Clink-arg=-sALLOW_MEMORY_GROWTH=1",
+    "--cfg=tokio_unstable",
+    "--cfg=wasm_bindgen_unstable_tokio",
 ]

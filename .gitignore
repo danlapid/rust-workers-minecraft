@@ -2,6 +2,7 @@
 /.work/
 /target/
 **/target/
+/build/
 node_modules/
 .wrangler/
 /worker/env.d.ts

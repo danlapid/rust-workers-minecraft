@@ -7,7 +7,6 @@ Read [README.md](README.md), [architecture](docs/architecture.md), and
 
 - `src/`: the Worker: TCP ingress, the Durable Object, world persistence,
   Pumpkin configuration, and the Emscripten JS library (`workerd.js`).
-- `worker/index.mjs`: the module Wrangler loads; re-exports the generated build.
 - `tests/`: protocol clients and the integration test.
 - `scripts/setup.sh`: provision pinned sources and build the toolchain.
 - `scripts/{build,serve,test}.sh`: build, run, and validate the Workers server.
@@ -22,7 +21,7 @@ process to free a port.
 
 Changes to the patched Pumpkin checkout must be reflected in `patches/`. Keep unpatched checkouts unmodified; update pins for
 upstream changes. Preserve the unified ticker and cooperative scheduler unless
-the task requires a runtime change. Keep the `EventLoopRuntime` model: exports
+the task requires a runtime change. Keep the event-loop model: exports
 return promises and nothing blocks or suspends; do not reintroduce JSPI, old
 Tokio/libc networking patches, or a JS-side driver.
 

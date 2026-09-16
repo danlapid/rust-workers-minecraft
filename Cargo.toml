@@ -17,9 +17,11 @@ name = "pumpkin-do"
 path = "src/main.rs"
 
 [dependencies]
-wasm-bindgen = "0.2.128"
-js-sys = "0.3.105"
-web-sys = { version = "0.3.105", features = ["AbortController", "AbortSignal", "Headers", "ReadableStream", "Request", "Response", "ResponseInit", "StreamPipeOptions", "Url", "WritableStream", "console"] }
+worker = { git = "https://github.com/cloudflare/workers-rs", rev = "490b6baa6e45d98a4c6f40565e9eb7d214ee2a93", features = ["experimental_tokio"] }
+wasm-bindgen = "0.2.129"
+wasm-bindgen-futures = "0.4.79"
+js-sys = "0.3.106"
+web-sys = { version = "0.3.106", features = ["AbortController", "AbortSignal", "ReadableStream", "StreamPipeOptions", "WritableStream", "console"] }
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "sync", "time", "net", "io-util"] }
 pumpkin = { path = ".work/pumpkin/crates/pumpkin", default-features = false, features = ["single-threaded"] }
 pumpkin-config = { path = ".work/pumpkin/crates/pumpkin-config", default-features = false }
@@ -27,11 +29,11 @@ rayon = "1.12"
 
 # wasm32-unknown-emscripten support pending upstream releases.
 [patch.crates-io]
-# EventLoopRuntime: the host event loop drives Tokio (tokio-rs/tokio#8479).
-tokio = { path = ".work/tokio/tokio" }
-tokio-macros = { path = ".work/tokio/tokio-macros" }
+# LocalEventLoop: the host event loop drives Tokio (tokio-rs/tokio#8484).
+tokio = { git = "https://github.com/guybedford/tokio", tag = "1.53.1-cf.emscripten" }
+tokio-macros = { git = "https://github.com/guybedford/tokio", tag = "1.53.1-cf.emscripten" }
 # tokio-rs/mio#1969; its emscripten epoll bindings come from libc's unreleased libc-0.2 branch.
-mio = { git = "https://github.com/guybedford/mio", rev = "a62c9e46833fc255c9217ab9aa362c6221ed4401" }
+mio = { git = "https://github.com/guybedford/mio", tag = "1.2.3-cf.emscripten" }
 libc = { git = "https://github.com/rust-lang/libc", branch = "libc-0.2" }
 # getrandom-backed SystemRandom on emscripten.
 ring = { git = "https://github.com/guybedford/ring", branch = "emscripten" }

@@ -14,8 +14,7 @@ Minecraft → Workers TCP ingress → MinecraftWorld → Pumpkin + SQLite
 ## Try it
 
 Linux and macOS build hosts are supported. Install Git,
-[rustup](https://rustup.rs/), Python 3.11+, CMake and Ninja, and Node 24+ (26
-recommended). From a checkout of this repository:
+[rustup](https://rustup.rs/), Python 3.11+, and Node 24+ (26 recommended). From a checkout of this repository:
 
 ```sh
 npm ci
@@ -23,15 +22,16 @@ bash scripts/setup.sh
 npm run dev
 ```
 
-Setup installs the pinned Rust toolchain, fetches dependency sources and the
-Emscripten toolchain under `.work/` (building Binaryen), and installs the
-wasm-bindgen CLI. `npm run dev` compiles Pumpkin and starts Wrangler. The first
-build takes several minutes; later builds use Cargo's cache.
+Setup installs the pinned Rust toolchain, fetches and patches Pumpkin under
+`.work/`, and installs worker-build, which provisions Emscripten and
+wasm-bindgen itself. `npm run dev` compiles Pumpkin with
+`worker-build --emscripten` and starts Wrangler. The first build takes several
+minutes; later builds use Cargo's cache.
 
-Until Wrangler's bundled workerd routes inbound sockets to `net.Server` listeners
-inside Durable Objects and carries the `node:fs` fixes listed in
-[dependency pins](docs/dependencies.md#host-tools), point Miniflare at a workerd
-build that does: `MINIFLARE_WORKERD_PATH=/path/to/workerd npm run dev`.
+The runtime support this needs (`net.Server` routing into Durable Objects and
+the `node:fs` fixes listed in [dependency pins](docs/dependencies.md#host-tools))
+is in workerd main. Until Wrangler's bundled workerd catches up, point Miniflare
+at a build of main: `MINIFLARE_WORKERD_PATH=/path/to/workerd npm run dev`.
 
 Connect **Minecraft Java 26.2** to **`localhost:25565`**. Status is available at
 **http://localhost:8787/**.
@@ -76,6 +76,7 @@ Provision the public TCP endpoint separately and route it to this Worker's
 ## Credits and license
 
 Built on [Pumpkin](https://github.com/Pumpkin-MC/Pumpkin),
+[workers-rs](https://github.com/cloudflare/workers-rs),
 [Tokio](https://github.com/tokio-rs/tokio), [Emscripten](https://emscripten.org/),
 [wasm-bindgen](https://github.com/wasm-bindgen/wasm-bindgen), and
 [Guy Bedford's Rust/Emscripten work](https://github.com/guybedford).
