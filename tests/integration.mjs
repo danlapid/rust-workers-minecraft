@@ -59,7 +59,7 @@ try {
   assert.equal(b.block(changedBlock), 0, 'Second client lost the edit before checkpoint');
   await a.close(); await b.close(); clients.length = 0;
   const saved = await checkpoint(worker);
-  console.log(`World checkpoint completed at ${saved.checkpointed_at}`);
+  console.log(`World saved at ${saved.saved_at}`);
 } finally {
   await Promise.all(clients.map(client => client.close()));
   await worker.stop();

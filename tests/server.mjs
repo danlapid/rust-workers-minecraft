@@ -95,7 +95,7 @@ export async function testServer({ seed = '1789195700909824175' } = {}) {
         throw error;
       }
       if (state.failure) throw new Error(state.failure);
-      return state.phase === 'idle' && state.checkpointed_at && state.connections === 0 && state;
+      return state.phase === 'idle' && state.saved_at && state.connections === 0 && state;
     }, 'world checkpoint');
   }
 

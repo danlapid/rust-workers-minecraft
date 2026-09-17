@@ -2,6 +2,16 @@
 
 use wasm_bindgen::prelude::*;
 
+#[wasm_bindgen(module = "/src/js/mount.js")]
+extern "C" {
+    /// Mounts the object's SQLite storage as the world's filesystem and routes
+    /// NODERAWFS through it; `ROOT` is the mount path.
+    #[wasm_bindgen(js_name = mountStorage)]
+    pub fn mount_storage(storage: &JsValue);
+    #[wasm_bindgen(js_name = ROOT, thread_local_v2)]
+    pub static MOUNT_ROOT: JsValue;
+}
+
 #[wasm_bindgen(module = "cloudflare:node")]
 extern "C" {
     /// Routes an inbound socket to the `net.Server` listening on its local
@@ -50,18 +60,3 @@ pub fn js_error(error: impl std::fmt::Display) -> JsValue {
     js_sys::Error::new(&error.to_string()).into()
 }
 
-/// `storage.sql.exec(query, ...bindings)` with the rows read out eagerly as
-/// arrays of column values.
-pub fn sql(storage: &JsValue, query: &str, bindings: &[JsValue]) -> Result<Vec<Vec<JsValue>>, JsValue> {
-    let sql = property(storage, "sql")?;
-    let exec: js_sys::Function = property(&sql, "exec")?.unchecked_into();
-    let args = js_sys::Array::new();
-    args.push(&query.into());
-    for binding in bindings {
-        args.push(binding);
-    }
-    let cursor = js_sys::Reflect::apply(&exec, &sql, &args)?;
-    let raw = method(&cursor, "raw", &[])?;
-    let rows = js_sys::Array::from(&method(&raw, "toArray", &[])?);
-    Ok(rows.iter().map(|row| js_sys::Array::from(&row).to_vec()).collect())
-}

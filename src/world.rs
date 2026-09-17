@@ -3,11 +3,11 @@
 //! `connect` is a `#[wasm_bindgen(experimental_tokio)]` export: its future runs on the
 //! thread's Tokio event loop, whose wait is the host event loop, so nothing
 //! blocks or suspends and the export returns a Promise. The server lifetime is
-//! one such future: the first `connect` after idle runs it, and its completion
-//! (after the final save) is the checkpoint. Later connections are routed to
-//! the running listener.
+//! one such future: the first `connect` after idle runs it on the world mounted
+//! from the object's storage, and it completes after the final save is synced.
+//! Later connections are routed to the running listener.
 
-use crate::{config, host, memory, persist};
+use crate::{config, host, memory};
 use host::{js_error, method, property, then};
 use pumpkin::{data::VanillaData, server::Server, PumpkinServer};
 use std::{
@@ -56,7 +56,7 @@ struct Shared {
     failure: RefCell<Option<String>>,
     connections: Cell<u32>,
     startup_ms: Cell<Option<f64>>,
-    checkpointed_at: RefCell<Option<String>>,
+    saved_at: RefCell<Option<String>>,
     /// Signals the server root that the last connection has closed.
     idle: Arc<tokio::sync::Notify>,
     /// Resolves at the next phase change; connections arriving mid-transition
@@ -84,7 +84,7 @@ impl MinecraftWorld {
             eprintln!("RUST PANIC: {info}");
         }));
         let storage = property(&state, "storage")?;
-        persist::prepare(&storage)?;
+        host::mount_storage(&storage);
         Ok(MinecraftWorld {
             shared: Rc::new(Shared {
                 storage,
@@ -92,7 +92,7 @@ impl MinecraftWorld {
                 failure: RefCell::new(None),
                 connections: Cell::new(0),
                 startup_ms: Cell::new(None),
-                checkpointed_at: RefCell::new(None),
+                saved_at: RefCell::new(None),
                 idle: Arc::new(tokio::sync::Notify::new()),
                 transition: RefCell::new(None),
             }),
@@ -100,7 +100,7 @@ impl MinecraftWorld {
     }
 
     /// Serves one inbound connection; resolves when it closes. The first call
-    /// while idle also runs the server, resolving once the world is checkpointed.
+    /// while idle also runs the server, resolving once the final save is synced.
     #[wasm_bindgen(experimental_tokio)]
     pub async fn connect(&self, socket: JsValue) -> Result<JsValue, JsValue> {
         let shared = self.shared.clone();
@@ -119,8 +119,8 @@ impl MinecraftWorld {
         )?;
         set("startup_ms", shared.startup_ms.get().map_or(JsValue::NULL, JsValue::from))?;
         set(
-            "checkpointed_at",
-            shared.checkpointed_at.borrow().as_deref().map_or(JsValue::NULL, JsValue::from),
+            "saved_at",
+            shared.saved_at.borrow().as_deref().map_or(JsValue::NULL, JsValue::from),
         )?;
         let server = SERVER.with(|slot| slot.borrow().clone());
         set(
@@ -204,9 +204,9 @@ impl Shared {
     }
 
     async fn run(self: Rc<Self>, first: JsValue, started: f64) -> Result<JsValue, JsValue> {
-        let restored = persist::restore(&self.storage)?;
-        std::env::set_current_dir(persist::ROOT).map_err(js_error)?;
-        eprintln!("Restored {restored} world files");
+        let root = host::MOUNT_ROOT.with(|root| root.as_string()).unwrap_or_default();
+        std::fs::create_dir_all(&root).map_err(js_error)?;
+        std::env::set_current_dir(&root).map_err(js_error)?;
         pumpkin::reset_stop();
         let (basic, advanced) = config::configuration();
         if !LOGGER.replace(true) {
@@ -242,14 +242,13 @@ impl Shared {
         if let Some(panic) = PANIC.with(|slot| slot.borrow_mut().take()) {
             return Err(js_error(panic));
         }
-        let (written, removed) = persist::save(&self.storage)?;
-        eprintln!("Checkpoint: {written} files written, {removed} removed");
-        // Issued writes become durable before the connection is reported closed.
+        // Writes issued through the mount become durable before the connection
+        // is reported closed.
         let synced = method(&self.storage, "sync", &[])?;
         let shared = self.clone();
         let done = Closure::once_into_js(move |_: JsValue| {
             shared
-                .checkpointed_at
+                .saved_at
                 .replace(Some(String::from(js_sys::Date::new_0().to_iso_string())));
             shared.set_phase(Phase::Idle);
         });

@@ -1,7 +1,6 @@
 mod config;
 mod host;
 mod memory;
-mod persist;
 mod world;
 
 use host::{method, property, then};

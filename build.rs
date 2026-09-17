@@ -12,7 +12,7 @@ fn main() {
         "-sSTACK_SIZE=8MB",
         // Keep growth headroom bounded after generation's temporary allocations.
         "-sMEMORY_GROWTH_LINEAR_STEP=2097152",
-        "-sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE=[\"$workerdStdio\"]",
+        "-sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE=[\"$workerdFs\"]",
         "--js-library",
     ] {
         println!("cargo::rustc-link-arg-bins={arg}");

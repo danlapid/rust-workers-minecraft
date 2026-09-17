@@ -13,9 +13,9 @@ state. Its `connect` is a `#[wasm_bindgen(experimental_tokio)]` export: the futu
 the thread's Tokio `LocalEventLoop` (tokio-rs/tokio#8484), the current-thread
 scheduler and drivers with the host event loop as their wait, and the export
 returns the Promise of its outcome. Nothing blocks or suspends. The first
-`connect` after idle runs the server lifetime: it restores the world, starts
-Pumpkin, awaits the server's return after its final save, checkpoints, and
-settles the connection's promise. Later connections and `status` calls enter
+`connect` after idle runs the server lifetime: it starts Pumpkin on the mounted
+world, awaits the server's return after its final save, awaits `storage.sync()`,
+and settles the connection's promise. Later connections and `status` calls enter
 the same instance as ordinary calls while that future is parked. A connection
 arriving while the server is starting or stopping waits for the next phase
 change and then retries, so a client that connects as the previous server
@@ -49,19 +49,22 @@ neighborhood compact without changing its dependency rules. Emscripten grows
 memory in 2 MiB increments, configured by `build.rs`, while retaining the 8 MiB
 stack. See [memory measurements](memory-reduction.md).
 
-## Filesystem and checkpoints
+## Filesystem
 
-Pumpkin runs against workerd's own Node filesystem through Emscripten's
-`NODERAWFS`, with the world under `/tmp/world`. That tree lives for the Durable
-Object's lifetime. Between runs it lives in the object's SQLite storage, one row
-per file: the server root restores the tree before starting Pumpkin and, after
-the server's final save, writes every changed file back, deletes rows for removed
-files, and awaits `storage.sync()` before the last connection is reported closed.
-Status shows the checkpoint time. Terminating a server with active clients can
-lose changes since the previous checkpoint.
+The world is a SQLite-backed filesystem: the object constructor mounts
+`durable-object-fs`'s `LocalDOFilesystem(storage)` at `/data` through
+`worker-fs-mount`, whose `node:fs` implementation routes that prefix to the
+object's storage and every other path (stdio, `/tmp`) to workerd's own
+filesystem. `src/workerd.js` rebinds Emscripten's `NODERAWFS` to it, resolves
+relative paths against Emscripten's working directory (`/data`, distinct from
+the isolate's `process.cwd()`), and disables the VFS's own permission checks
+since the host enforces them. Every Pumpkin write is therefore durable as it
+happens, under the object's transaction semantics; after the final save the
+server awaits `storage.sync()` before the last connection is reported closed,
+and status shows that time.
 
-Logging goes to the host console: `src/workerd.js` keeps Emscripten's stdio
-descriptors on its console callbacks, since workerd exposes no process stdio.
+Logging goes to the process's stdout and stderr through `NODERAWFS`, which
+Wrangler relays as `stdout:` and `stderr:` lines.
 
 ## Development interfaces
 
@@ -69,7 +72,7 @@ The supplied configuration listens on loopback TCP port 25565 and HTTP port 8787
 The world name comes from `WORLD_NAME` in `wrangler.jsonc`.
 
 - `GET /health`: Worker readiness.
-- `GET /`: phase, connection count, runtime statistics, and last checkpoint time.
+- `GET /`: phase, connection count, runtime statistics, and last save time.
 
 Runtime statistics include Wasm capacity and allocator in-use/free/arena bytes.
 Allocator counters include allocation metadata and unused container capacity;

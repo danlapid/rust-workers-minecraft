@@ -26,7 +26,7 @@ stop only their own Wrangler process groups. Their databases and logs live in
 
 `npm test` must finish with `PUMPKIN-DO-SQLITE-RESTART-OK`. It checks two-player
 gameplay, a real block edit, and player/block restoration after a restart, which
-exercises the tree-to-SQLite checkpoint and restore.
+exercises the SQLite-mounted world across a restart.
 
 The memory probe waits for both clients to receive 81 chunks, observes 30 seconds
 of stationary play, then checkpoints. Each run creates a fresh isolated world

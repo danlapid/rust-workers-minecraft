@@ -5,8 +5,9 @@ Read [README.md](README.md), [architecture](docs/architecture.md), and
 
 ## Project layout
 
-- `src/`: the Worker: TCP ingress, the Durable Object, world persistence,
-  Pumpkin configuration, and the Emscripten JS library (`workerd.js`).
+- `src/`: the Worker: TCP ingress, the Durable Object, the SQLite filesystem
+  mount (`js/mount.js`), Pumpkin configuration, and the Emscripten JS library
+  (`workerd.js`).
 - `tests/`: protocol clients and the integration test.
 - `scripts/setup.sh`: provision pinned sources and build the toolchain.
 - `scripts/{build,serve,test}.sh`: build, run, and validate the Workers server.

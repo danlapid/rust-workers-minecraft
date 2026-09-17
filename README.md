@@ -40,10 +40,11 @@ The example uses offline mode, with encryption and compression disabled. Local
 listeners bind to loopback. `WORLD_NAME` in [wrangler.jsonc](wrangler.jsonc) selects
 the Durable Object; server settings are in [src/config.rs](src/config.rs).
 
-World data lives under `.data/workers/server/`. After the last connection closes,
-the server saves and stops. The next connection restores the same world. Wait for
-status to report `phase: "idle"` and a checkpoint timestamp before stopping
-Wrangler; changes held in memory can be lost if the process is terminated early.
+World data lives under `.data/workers/server/`, written through to the Durable
+Object's SQLite storage as Pumpkin saves. After the last connection closes, the
+server saves and stops; the next connection starts it on the same world. Wait for
+status to report `phase: "idle"` before stopping Wrangler so the final save
+completes.
 
 ## Build and contribute
 

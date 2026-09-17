@@ -96,9 +96,11 @@ bash scripts/setup.sh --sources-only
 
 ## JavaScript dependencies
 
-`package-lock.json` pins Wrangler 4.129.0. There is no application JavaScript;
-worker-build generates `build/index.js`, which wraps the exports into the
-entrypoint and derives the Durable Object class from `DurableObject` for RPC.
+`package-lock.json` pins Wrangler 4.129.0, `worker-fs-mount` 0.2.0 and
+`durable-object-fs` 1.0.0 (the SQLite filesystem mount, imported by
+`src/js/mount.js` and bundled by worker-build). worker-build generates
+`build/index.js`, which wraps the exports into the entrypoint and derives the
+Durable Object class from `DurableObject` for RPC.
 
 After moving a checkout with cached build output, run `cargo clean` before rebuilding.
 Generated data can contain absolute paths. This leaves databases under `.data/` intact.
