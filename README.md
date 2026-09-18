@@ -28,11 +28,6 @@ wasm-bindgen itself. `npm run dev` compiles Pumpkin with
 `worker-build --emscripten` and starts Wrangler. The first build takes several
 minutes; later builds use Cargo's cache.
 
-The runtime support this needs (`net.Server` routing into Durable Objects and
-the `node:fs` fixes listed in [dependency pins](docs/dependencies.md#host-tools))
-is in workerd main. Until Wrangler's bundled workerd catches up, point Miniflare
-at a build of main: `MINIFLARE_WORKERD_PATH=/path/to/workerd npm run dev`.
-
 Connect **Minecraft Java 26.2** to **`localhost:25565`**. Status is available at
 **http://localhost:8787/**.
 

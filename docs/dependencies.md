@@ -50,13 +50,15 @@ graph, including the branch commits.
   `build/`. `EMSCRIPTEN`/`EMSDK` select a local toolchain instead.
 - Node: 24+; 26 recommended and selected in CI. Used for build tools and tests.
 - Python: 3.11+ (Emscripten scripts, emsdk and TOML parsing).
-- workerd: Wrangler must run a workerd with `net.Server` inbound routing into
+- Emscripten backend: LLVM, Binaryen and Node through emsdk under `.work/emsdk`
+  (or an activated emsdk selected with `EMSDK`). `scripts/common.sh` hands the
+  frontend checkout and emsdk to worker-build through `EMSCRIPTEN` and `EMSDK`;
+  it uses the frontend unpatched.
+- workerd 1.20260918.1 (Wrangler's bundled version, also pinned directly in
+  `package.json`): the first release with `net.Server` inbound routing into
   Durable Objects (`handleAsNodeConnection`, cloudflare/workerd#7306, #7313) and
   the `node:fs` fixes for positional buffer I/O (#7368), `O_TRUNC` (#7369),
-  `O_CREAT` (#7393), and rename over an existing path (#7394). All are in
-  workerd main; until Wrangler's bundled version catches up, build main
-  (`bazel build //src/workerd/server:workerd`) and set `MINIFLARE_WORKERD_PATH`
-  to `bazel-bin/src/workerd/server/workerd`.
+  `O_CREAT` (#7393), and rename over an existing path (#7394).
 
 ## Updating a patch
 
@@ -96,7 +98,7 @@ bash scripts/setup.sh --sources-only
 
 ## JavaScript dependencies
 
-`package-lock.json` pins Wrangler 4.129.0, `worker-fs-mount` 0.2.0 and
+`package-lock.json` pins Wrangler 4.135.0, workerd 1.20260918.1, `worker-fs-mount` 0.2.0 and
 `durable-object-fs` 1.0.0 (the SQLite filesystem mount, imported by
 `src/js/mount.js` and bundled by worker-build). worker-build generates
 `build/index.js`, which wraps the exports into the entrypoint and derives the
