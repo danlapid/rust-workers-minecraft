@@ -1,0 +1,105 @@
+.cargo/config.toml
+  s_dccdbcee9eb73b::t_9ed500ab3c5b4e 7
+Cargo.lock
+  s_dccdbcee9eb73b::t_ec06f22a81eb45 1846-1847
+Cargo.toml
+  s_dccdbcee9eb73b::t_bced8e7fdc467b 28-29
+README.md
+  s_dccdbcee9eb73b::t_45be4c35eeacde 34,36-37,39-41
+docs/architecture.md
+  s_dccdbcee9eb73b::t_9c76f06e5fb023 5-7,27-31,62-66,78-80,101-103
+docs/configuration-results.json
+  s_dccdbcee9eb73b::t_73b99869fa5f25 1-174
+docs/configuration.md
+  s_dccdbcee9eb73b::t_0f083828e96689 1-134
+docs/dependencies.md
+  s_dccdbcee9eb73b::t_73cf5858c1e152 15,23-24,60-63,66-71,81-83
+docs/development.md
+  s_dccdbcee9eb73b::t_dd02dc451a98fc 15,18-19,27,52-54
+docs/emscripten-linking.md
+  s_dccdbcee9eb73b::t_1019ce60754d0f 1-89
+docs/memory-exploration-results.json
+  s_dccdbcee9eb73b::t_6256cf1a0e66eb 1-417
+docs/memory-reduction.md
+  s_dccdbcee9eb73b::t_f8e8b179c276b0 15-86,120
+package.json
+  s_dccdbcee9eb73b::t_ad189b532e00f2 30-31
+patches/README.md
+  s_b5100e8818a1d4::t_d91acfab1a9e4d 12-13,18-25,31-38,42-46
+patches/pumpkin-emscripten.patch
+  s_dccdbcee9eb73b::t_7ff91636fc6840 26-29,301,304-312,320,322,477,490,497-508,512,533-552,564,573,582,597,612,634,740,769,785,815,851-878,889-893,905-907,944,947-959,968-1002,1004,1007-1023,1032-1067,1961-2022
+patches/pumpkin-memory.patch
+  s_dccdbcee9eb73b::t_a0348980f52c8e 1,15-18,22-561,1362-1424
+scripts/serve.sh
+  s_dccdbcee9eb73b::t_686f23227d4b2d 9
+scripts/test.sh
+  s_dccdbcee9eb73b::t_c45b9cdbd39c6e 7,13
+src/config.rs
+  s_dccdbcee9eb73b::t_eb5712c803d120 2,5-27,32-33,42-45,57-59,67
+src/main.rs
+  s_dccdbcee9eb73b::t_8c5c29db4d6a9b 27-28,38,90-94,101-119
+tests/client.mjs
+  s_dccdbcee9eb73b::t_94a8d51d15256f 17-25,37,39-42,44-45,48-58,60,65,67-68,85,87,90-95,97,99,104-106,118,122,129,141,160,168,170,186
+tests/config.test.mjs
+  s_dccdbcee9eb73b::t_d1616c32a742d9 1-21
+tests/fixtures/startup-failure.mjs
+  s_dccdbcee9eb73b::t_03c7e95e14a835 15-39
+tests/fixtures/worker.mjs
+  s_dccdbcee9eb73b::t_30e5aaeb23d066 2,47-49
+tests/fixtures/wrangler.jsonc
+  s_dccdbcee9eb73b::t_4ece67a54e4226 6-21,23-34,36-38
+tests/integration.mjs
+  s_dccdbcee9eb73b::t_6018593d047f88 7,9,35,68-72,90-93,101-103,121-131,138,143
+tests/memory.mjs
+  s_dccdbcee9eb73b::t_e41ee5cfda9b57 9,38,45
+tests/protocol.mjs
+  s_dccdbcee9eb73b::t_0c39dd7deeef67 1-2,5-6,34-40,50,60,62-74
+tests/protocol.test.mjs
+  s_dccdbcee9eb73b::t_9e292926760f58 1-23
+tests/status.test.mjs
+  s_dccdbcee9eb73b::t_5aad79ec9a7c00 1-49
+worker/index.ts
+  s_dccdbcee9eb73b::t_f1b3a7a81d9ce3 3,8-30
+worker/minecraft-status.ts
+  s_dccdbcee9eb73b::t_102e2b5e1a0074 1-136
+worker/modules.d.ts
+  s_dccdbcee9eb73b::t_d792d58110afad 14,16-17
+worker/pumpkin.ts
+  s_dccdbcee9eb73b::t_bcccdd0d8d765a 4,7,17,20
+worker/socket.ts
+  s_dccdbcee9eb73b::t_40346d33505fa1 1,14
+worker/world.ts
+  s_dccdbcee9eb73b::t_cb51b95821dce7 3-4,11,20-22,25,29,41,49,59-64,67,74,78,80,82-86,88,90-101,105-116,119,123-125,131,133-134
+tests/experience.mjs
+  s_dccdbcee9eb73b::t_d1b5a6630fc2e2 1-119
+tests/server.mjs
+  s_dccdbcee9eb73b::t_02b0c92f7e6318 5,8,12-17,22,32,34-41,44-45,85,96,102,113-114
+worker/config.ts
+  s_dccdbcee9eb73b::t_8e6abd33c91824 1-49
+wrangler.jsonc
+  s_dccdbcee9eb73b::t_25694142675e00 6-41
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "cd83251d667e2b7573de8789a34c1d0d8135ae1c",
+  "prompts": {},
+  "sessions": {
+    "s_b5100e8818a1d4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "269c6dc8-6085-4412-b5b8-92f18d990985",
+        "model": "claude-watermelon-eap"
+      },
+      "human_author": "Dan Lapid <dlapid@cloudflare.com>"
+    },
+    "s_dccdbcee9eb73b": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a07663-3837-7741-892f-3e0fae2953db",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Dan Lapid <dlapid@cloudflare.com>"
+    }
+  }
+}
