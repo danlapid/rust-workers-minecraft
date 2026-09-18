@@ -1,4 +1,4 @@
-export async function forwardSocket(socket: Socket, target: Socket): Promise<void> {
+export async function forwardSocket(socket: Socket, target: Socket, readable = socket.readable): Promise<void> {
   // Read/write failures are observed by the pumps below. Also consume the
   // lifetime promises so a normal peer disconnect is not an unhandled rejection.
   void socket.closed.catch(() => undefined);
@@ -11,7 +11,7 @@ export async function forwardSocket(socket: Socket, target: Socket): Promise<voi
     });
   try {
     const results = await Promise.allSettled([
-      pipe(socket.readable, target.writable),
+      pipe(readable, target.writable),
       pipe(target.readable, socket.writable),
     ]);
     for (const result of results) {

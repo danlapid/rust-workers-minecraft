@@ -1843,6 +1843,8 @@ dependencies = [
  "pumpkin",
  "pumpkin-config",
  "rayon",
+ "serde",
+ "serde_json",
  "tokio",
  "wasm-bindgen",
  "worker",

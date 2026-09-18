@@ -2,18 +2,24 @@ import assert from 'node:assert/strict';
 import net from 'node:net';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { mkdir, mkdtemp, appendFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, appendFile, readFile, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { waitFor } from './client.mjs';
+import { PORT, HTTP_PORT } from './protocol.mjs';
 
 const repo = fileURLToPath(new URL('../', import.meta.url));
 
-export async function testServer({ seed = '1789195700909824175' } = {}) {
+export async function testServer({ seed = '1789195700909824175', vars = {} } = {}) {
+  const inspectorPort = process.env.TEST_INSPECTOR_PORT;
+  if (inspectorPort !== undefined) {
+    assert.ok(/^\d+$/.test(inspectorPort) && Number(inspectorPort) >= 1 && Number(inspectorPort) <= 65535,
+      'TEST_INSPECTOR_PORT must be a port between 1 and 65535');
+  }
   await mkdir(path.join(repo, '.data/probes'), { recursive: true });
   const probe = await mkdtemp(path.join(repo, '.data/probes/workers.'));
   const persistence = path.join(probe, 'state');
   console.log(`Workers probe state: ${probe}`);
-  for (const port of [25565, 8787]) {
+  for (const port of [PORT, HTTP_PORT, ...(inspectorPort ? [Number(inspectorPort)] : [])]) {
     const listener = net.createServer();
     await new Promise((resolve, reject) => {
       listener.once('error', reject);
@@ -23,11 +29,20 @@ export async function testServer({ seed = '1789195700909824175' } = {}) {
   }
 
   let phase = 0;
-  async function startWorker(fixture = false) {
+  async function startWorker(fixture = false, overrides = {}) {
     const log = path.join(probe, `${++phase}-${fixture ? "filesystem" : "minecraft"}.log`);
+    const sourceConfig = path.join(repo, fixture ? 'tests/fixtures/wrangler.jsonc' : 'wrangler.jsonc');
+    const config = JSON.parse(await readFile(sourceConfig, 'utf8'));
+    config.main = path.resolve(path.dirname(sourceConfig), config.main);
+    config.dev.port = HTTP_PORT;
+    config.connect[0].port = PORT;
+    config.vars = { ...config.vars, ...vars, ...overrides };
+    const configPath = path.join(probe, 'wrangler.json');
+    await writeFile(configPath, JSON.stringify(config));
     const child = spawn(process.execPath, [
       path.join(repo, 'node_modules/wrangler/bin/wrangler.js'), 'dev', '--local',
-      '--config', path.join(repo, fixture ? 'tests/fixtures/wrangler.jsonc' : 'wrangler.jsonc'),
+      '--config', configPath,
+      ...(inspectorPort ? ['--inspector-port', inspectorPort] : []),
       '--persist-to', persistence, '--var', 'WORLD_NAME:integration',
       // Known terrain with a stable editable spawn block; random water spawns
       // cannot exercise the integration test's shared block-edit assertions.
@@ -67,7 +82,7 @@ export async function testServer({ seed = '1789195700909824175' } = {}) {
       await waitFor(async () => {
         if (failure) throw failure;
         if (exited) throw new Error(`Wrangler exited; see ${log}`);
-        try { return (await fetch('http://127.0.0.1:8787/health', { signal: AbortSignal.timeout(2000) })).ok; }
+        try { return (await fetch(`http://127.0.0.1:${HTTP_PORT}/health`, { signal: AbortSignal.timeout(2000) })).ok; }
         catch { return false; }
       }, `Wrangler (${log})`);
     } catch (error) { await stop(); throw error; }
@@ -78,13 +93,13 @@ export async function testServer({ seed = '1789195700909824175' } = {}) {
   }
 
   async function request(route = '/', options) {
-    const response = await fetch(`http://127.0.0.1:8787${route}`, { ...options, signal: AbortSignal.timeout(60_000) });
+    const response = await fetch(`http://127.0.0.1:${HTTP_PORT}${route}`, { ...options, signal: AbortSignal.timeout(60_000) });
     const text = await response.text();
     assert.ok(response.ok, `HTTP ${response.status}: ${text.slice(0,2000)}`);
     return JSON.parse(text);
   }
 
-  async function checkpoint(worker) {
+  async function checkpoint(worker, { stopped = true, after } = {}) {
     return waitFor(async () => {
       worker.healthy();
       let state;
@@ -95,7 +110,8 @@ export async function testServer({ seed = '1789195700909824175' } = {}) {
         throw error;
       }
       if (state.failure) throw new Error(state.failure);
-      return state.phase === 'idle' && state.checkpointed_at && state.connections === 0 && state;
+      return (stopped ? state.phase === 'idle' : state.phase === 'running' && state.idle_deadline)
+        && state.checkpointed_at && state.checkpointed_at !== after && state.connections === 0 && state;
     }, 'world checkpoint');
   }
 

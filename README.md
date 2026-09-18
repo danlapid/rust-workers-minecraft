@@ -31,12 +31,14 @@ The first build takes several minutes; later builds use Cargo's cache.
 Connect **Minecraft Java 26.2** to **`localhost:25565`**. Status is available at
 **http://localhost:8787/**.
 
-The example uses offline mode, with encryption and compression disabled. Local
+The example uses offline mode, with fast packet compression enabled. Local
 listeners bind to loopback. `WORLD_NAME` in [wrangler.jsonc](wrangler.jsonc) selects
-the Durable Object; server settings are in [src/config.rs](src/config.rs).
+the Durable Object. [Gameplay settings](docs/configuration.md), including view
+distance and the player limit, can be changed through Worker variables.
 
-World data lives under `.data/workers/server/`. After the last connection closes,
-the server saves and stops. The next connection restores the same world. Wait for
+World data lives under `.data/workers/server/`. After the last gameplay connection
+closes, the server saves and keeps a short reconnect window before stopping.
+Server-list pings do not start the game runtime. Wait for
 status to report `phase: "idle"` and a checkpoint timestamp before stopping
 Wrangler; changes held in memory can be lost if the process is terminated early.
 

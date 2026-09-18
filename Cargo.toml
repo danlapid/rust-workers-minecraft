@@ -25,6 +25,8 @@ name = "pumpkin-do"
 path = "src/main.rs"
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 wasm-bindgen = { path = ".work/wasm-bindgen" }
 js-sys = { path = ".work/wasm-bindgen/crates/js-sys" }
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "sync", "time", "net", "io-util"] }

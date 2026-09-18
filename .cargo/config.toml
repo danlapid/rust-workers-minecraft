@@ -4,7 +4,7 @@ target-dir = "target/workers"
 
 [target.wasm32-unknown-emscripten]
 rustflags = [
-    # Static linking and unwind semantics are required by the hosted runtime.
+    # Current compatibility setting; see docs/emscripten-linking.md.
     "-Crelocation-model=static",
     "--cfg=tokio_unstable",
     "-Clink-arg=-sWASM_BINDGEN=auto",

@@ -27,6 +27,7 @@
     "test:memory": "npm run build && node tests/memory.mjs",
     "types": "wrangler types worker/env.d.ts --strict-vars=false",
     "typecheck": "npm run types && tsc --noEmit",
-    "test:scheduler": "bash scripts/test-scheduler.sh"
+    "test:scheduler": "bash scripts/test-scheduler.sh",
+    "test:experience": "npm run build && node tests/experience.mjs"
   }
 }

@@ -11,9 +11,10 @@ declare module '*pumpkin-do.js' {
     printErr(message: string): void;
   }
   interface Pumpkin {
-    pumpkin_start(): Promise<void>;
+    pumpkin_start(settings: string): Promise<void>;
     pumpkin_connect(socket: Socket): Promise<void>;
-    pumpkin_status(): { players: number; ticks: number; wasm_memory_bytes: number };
+    pumpkin_status(): { players: number; ticks: number; mean_tick_ms: number; wasm_memory_bytes: number; heap_allocated_bytes: number; heap_free_bytes: number; heap_arena_bytes: number };
+    pumpkin_save(): Promise<void>;
     pumpkin_shutdown(): Promise<void>;
   }
   export default function create(options: Options): Promise<Pumpkin>;

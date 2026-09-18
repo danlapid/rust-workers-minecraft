@@ -2,8 +2,9 @@
 
 ## Runtime and connections
 
-The Worker forwards TCP streams to a named Durable Object using the platform's
-stream-piping API. The object lazily creates an Emscripten module and passes a
+The Worker reads a bounded Minecraft handshake and answers server-list requests
+from Durable Object metadata. Gameplay streams are forwarded unchanged to the
+named Durable Object using the platform's stream-piping API. The object lazily creates an Emscripten module and passes a
 workers-rs `Socket` to Pumpkin's injected connection entry point.
 
 Each object owns separate wasm memory, Rust statics, filesystem descriptors, and
@@ -22,6 +23,11 @@ active noise pass uses a temporary dense block buffer. This keeps the generation
 neighborhood compact without changing its dependency rules. Emscripten grows
 memory in 2 MiB increments, configured by `build.rs`, while retaining the 8 MiB
 stack. See [memory measurements](memory-reduction.md).
+
+Chunk palettes pack small indices into 1, 2, 4, or 8 bits without changing their
+wire format. Uniform initialized light arrays are shared; writes detach the
+affected array. Carving masks allocate only through their highest used word,
+and idle pathfinders reserve nodes when a search begins.
 
 Emscripten factory mode (`MODULARIZE=1`) isolates module instances. Wrangler
 provides the compiled wasm through `instantiateWasm`; the generated host glue uses
@@ -53,9 +59,11 @@ The upstream `entries` table stores metadata, and `file_pages` stores contents i
 sparse files, and file writes and native rename use SQLite transactions. Whole-file
 reads still require a buffer large enough for the result.
 
-After the final connection leaves, Pumpkin saves and shuts down, and the object
-awaits `storage.sync()`. New connections wait for this checkpoint, then create a
-fresh runtime from the stored files. Checkpoint failures remain visible in status.
+After the final gameplay connection leaves, Pumpkin saves and the object awaits
+`storage.sync()`. A configurable reconnect window keeps that runtime available;
+new connections wait for the save and cancel its pending shutdown. When the
+window expires, Pumpkin performs the final save and shutdown. Checkpoint failures
+remain visible in status.
 This preserves issued writes; terminating a server with active clients can still
 lose changes in Pumpkin's in-memory caches.
 
@@ -67,7 +75,9 @@ The world name comes from `WORLD_NAME` in `wrangler.jsonc`.
 - `GET /health`: Worker readiness.
 - `GET /`: phase, connection count, runtime statistics, and last checkpoint time.
 
-Runtime statistics include Wasm capacity and allocator in-use/free/arena bytes.
+Runtime statistics include Wasm capacity, allocator in-use/free/arena bytes, and
+mean tick execution time. Lifecycle status includes the runtime start count,
+checkpoint time, reconnect deadline, and effective configuration.
 Allocator counters include allocation metadata and unused container capacity;
 Wasm capacity additionally includes static data, stack, and growth headroom.
 
@@ -88,7 +98,9 @@ test.
 ## Build constraints
 
 - Use the pinned Rust nightly and matching wasm-bindgen CLI from setup.
-- Keep static relocation, unwind semantics, the 8 MiB stack, and memory growth.
+- Keep unwind semantics, the 8 MiB stack, and memory growth. The current
+  static-relocation override conflicts with shared-library output; see the
+  [Emscripten linking investigation](emscripten-linking.md).
 - Pass Emscripten link settings through rustc so they do not affect C compilation.
 - Keep the compatibility initializer linked even when Rust does not call `fd_sync`;
   `build.rs` configures this and tracks the library as a build input.

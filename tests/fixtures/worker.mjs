@@ -1,5 +1,5 @@
 import { DurableObject, exports } from 'cloudflare:workers';
-export { StartupFailure } from './startup-failure.mjs';
+export { StartupFailure, CheckpointFailure } from './startup-failure.mjs';
 import createModule from '../../target/workers/wasm32-unknown-emscripten/release/filesystem-probe.js';
 import wasm from '../../target/workers/wasm32-unknown-emscripten/release/filesystem_probe.wasm';
 import { createWorldRuntime } from '../../worker/filesystem';
@@ -44,6 +44,9 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname === '/health') return Response.json({ ready: true });
+    if (url.pathname === '/checkpoint-failure') {
+      return Response.json(await exports.CheckpointFailure.getByName('checkpoint-failure').verify());
+    }
     if (url.pathname === '/startup-failure') {
       return Response.json(await exports.StartupFailure.getByName('failure').verify());
     }

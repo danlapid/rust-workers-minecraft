@@ -23,6 +23,10 @@ paths do not invalidate Cargo's cache on every build. The application
 Cargo.lock supplies the embedded dependency resolution; Pumpkin's lockfile
 is excluded from this patch.
 
+Expose an acknowledged checkpoint for quiescent embedded worlds. Wait for
+generation results and serialized chunk/entity writes before reporting success,
+and surface writer failures to the host without stopping the scheduler.
+
 Base-commit: b5b9b9d7010e793806a83c495af223c67e1d35ee
 
 ---
@@ -294,9 +298,18 @@ index f670ad37b..b9d9a8671 100644
  )>;
  
 diff --git a/crates/pumpkin-world/src/chunk_system/schedule.rs b/crates/pumpkin-world/src/chunk_system/schedule.rs
-index 145e15de8..2942a1d31 100644
+index 145e15de8..fede9db43 100644
 --- a/crates/pumpkin-world/src/chunk_system/schedule.rs
 +++ b/crates/pumpkin-world/src/chunk_system/schedule.rs
+@@ -3,7 +3,7 @@ use super::chunk_holder::ChunkHolder;
+ use super::chunk_state::{Chunk, StagedChunkEnum};
+ use super::dag::{DAG, EdgeKey, Node, NodeKey};
+ use super::generation_cache::{Cache, SurfaceBiomeNeighborhood};
+-use super::worker_logic::{RecvChunk, io_read_work, io_write_work};
++use super::worker_logic::{ChunkWriteRequest, RecvChunk, io_read_work, io_write_work};
+ use super::{
+     ChunkLevel, ChunkListener, ChunkLoading, ChunkPos, HashMapType, HashSetType, IOLock,
+     LevelChannel,
 @@ -69,13 +69,14 @@ pub struct GenerationSchedule {
      running_task_count: u16,
      max_in_flight: u16,
@@ -304,8 +317,9 @@ index 145e15de8..2942a1d31 100644
 -    recv_chunk: crossbeam::channel::Receiver<(ChunkPos, RecvChunk)>,
 +    recv_chunk: tokio::sync::mpsc::UnboundedReceiver<(ChunkPos, RecvChunk)>,
      io_read: tokio::sync::mpsc::Sender<Vec<ChunkPos>>,
-     io_write: tokio::sync::mpsc::Sender<Vec<(ChunkPos, Chunk)>>,
+-    io_write: tokio::sync::mpsc::Sender<Vec<(ChunkPos, Chunk)>>,
 -    send_chunk: crossbeam::channel::Sender<(ChunkPos, RecvChunk)>,
++    io_write: tokio::sync::mpsc::Sender<ChunkWriteRequest>,
 +    send_chunk: tokio::sync::mpsc::UnboundedSender<(ChunkPos, RecvChunk)>,
      listener: Arc<ChunkListener>,
      lighting_config: LightingEngineConfig,
@@ -460,7 +474,7 @@ index 145e15de8..2942a1d31 100644
 -                e
 -            );
 -        }
-+        permit.send(chunks);
++        permit.send(ChunkWriteRequest::Chunks(chunks));
      }
  
 -    fn save_all_chunk(&mut self, save_proto_chunk: bool) {
@@ -473,18 +487,29 @@ index 145e15de8..2942a1d31 100644
          let mut chunks = Vec::with_capacity(self.chunk_map.len());
  
          for (pos, holder) in &mut self.chunk_map {
-@@ -969,9 +987,7 @@ impl GenerationSchedule {
+@@ -969,9 +987,18 @@ impl GenerationSchedule {
          }
          drop(data);
  
 -        if let Err(e) = self.io_write.blocking_send(chunks) {
 -            error!("Failed to send chunks to io write thread: {:?}", e);
 -        }
-+        permit.send(chunks);
++        permit.send(ChunkWriteRequest::Chunks(chunks));
++    }
++
++    async fn flush_saves(&mut self) -> Result<(), String> {
++        let (reply, completed) = tokio::sync::oneshot::channel();
++        self.io_write
++            .send(ChunkWriteRequest::Barrier(reply))
++            .await
++            .map_err(|_| "Chunk writer stopped before checkpoint".to_owned())?;
++        completed
++            .await
++            .map_err(|_| "Chunk writer dropped checkpoint".to_owned())?
      }
  
      fn drop_node(&mut self, node: NodeKey) {
-@@ -1254,25 +1270,22 @@ impl GenerationSchedule {
+@@ -1254,25 +1281,41 @@ impl GenerationSchedule {
      }
  
      #[expect(clippy::too_many_lines)]
@@ -505,7 +530,26 @@ index 145e15de8..2942a1d31 100644
              }
              if level.should_save.swap(false, Relaxed) {
 -                self.save_all_chunk(false);
-+                self.save_all_chunk(false).await;
++                let mut checkpoints = Vec::new();
++                while let Some(reply) = level.checkpoints.pop() {
++                    checkpoints.push(reply);
++                }
++                if checkpoints.is_empty() {
++                    self.save_all_chunk(false).await;
++                } else {
++                    // Return chunks held by generation tasks before taking the
++                    // checkpoint snapshot. Do not dispatch more work meanwhile.
++                    self.drain_results().await;
++                    let result = if self.running_task_count == 0 {
++                        self.save_all_chunk(false).await;
++                        self.flush_saves().await
++                    } else {
++                        Err("Generation did not finish before checkpoint".to_owned())
++                    };
++                    for reply in checkpoints {
++                        let _ = reply.send(result.clone());
++                    }
++                }
              }
              if level.shut_down_chunk_system.load(Relaxed) {
                  info!("Saving chunks before shutdown...");
@@ -517,7 +561,7 @@ index 145e15de8..2942a1d31 100644
                  break;
              }
  
-@@ -1287,7 +1300,7 @@ impl GenerationSchedule {
+@@ -1287,7 +1330,7 @@ impl GenerationSchedule {
              // is what puts stale dependency holders into the queue in the first place.
              if self.last_unload.elapsed() >= std::time::Duration::from_secs(1) {
                  self.garbage_collect_dependencies();
@@ -526,7 +570,7 @@ index 145e15de8..2942a1d31 100644
                  self.last_unload = std::time::Instant::now();
              }
  
-@@ -1308,7 +1321,7 @@ impl GenerationSchedule {
+@@ -1308,7 +1351,7 @@ impl GenerationSchedule {
                  if level.shut_down_chunk_system.load(Relaxed) {
                      self.queue.push(task);
                      info!("Shutdown detected during task processing, saving chunks...");
@@ -535,7 +579,7 @@ index 145e15de8..2942a1d31 100644
                      break 'out2;
                  }
  
-@@ -1400,11 +1413,12 @@ impl GenerationSchedule {
+@@ -1400,11 +1443,12 @@ impl GenerationSchedule {
                          if io_batch.len() >= 16
                              && self
                                  .io_read
@@ -550,7 +594,7 @@ index 145e15de8..2942a1d31 100644
                              break 'out2;
                          }
                      } else {
-@@ -1412,11 +1426,12 @@ impl GenerationSchedule {
+@@ -1412,11 +1456,12 @@ impl GenerationSchedule {
                          if !io_batch.is_empty()
                              && self
                                  .io_read
@@ -565,7 +609,7 @@ index 145e15de8..2942a1d31 100644
                              break 'out2;
                          }
  
-@@ -1552,12 +1567,19 @@ impl GenerationSchedule {
+@@ -1552,12 +1597,19 @@ impl GenerationSchedule {
                          let send_chunk = self.send_chunk.clone();
                          let level = level.clone();
  
@@ -587,7 +631,7 @@ index 145e15de8..2942a1d31 100644
                      }
                  }
              }
-@@ -1566,82 +1588,39 @@ impl GenerationSchedule {
+@@ -1566,82 +1618,39 @@ impl GenerationSchedule {
              if !io_batch.is_empty()
                  && self
                      .io_read
@@ -693,7 +737,7 @@ index 145e15de8..2942a1d31 100644
                  }
              }
          }
-@@ -1649,24 +1628,10 @@ impl GenerationSchedule {
+@@ -1649,24 +1658,10 @@ impl GenerationSchedule {
              "schedule: waiting for {} generation tasks to finish",
              self.running_task_count
          );
@@ -722,7 +766,7 @@ index 145e15de8..2942a1d31 100644
  
          if self.running_task_count > 0 {
              warn!(
-@@ -1716,6 +1681,15 @@ impl GenerationSchedule {
+@@ -1716,6 +1711,15 @@ impl GenerationSchedule {
          self.graph.edges.clear();
      }
  
@@ -738,7 +782,7 @@ index 145e15de8..2942a1d31 100644
      fn debug_check(&self) -> bool {
          if !self.graph.nodes.is_empty() {
              for (key, value) in &self.graph.nodes {
-@@ -1746,3 +1720,123 @@ impl GenerationSchedule {
+@@ -1746,3 +1750,157 @@ impl GenerationSchedule {
          true
      }
  }
@@ -768,7 +812,7 @@ index 145e15de8..2942a1d31 100644
 +
 +    fn scheduler() -> (
 +        GenerationSchedule,
-+        tokio::sync::mpsc::Receiver<Vec<(ChunkPos, Chunk)>>,
++        tokio::sync::mpsc::Receiver<ChunkWriteRequest>,
 +    ) {
 +        let (send_chunk, recv_chunk) = tokio::sync::mpsc::unbounded_channel();
 +        let (io_write, receiver) = tokio::sync::mpsc::channel(1);
@@ -804,6 +848,34 @@ index 145e15de8..2942a1d31 100644
 +    }
 +
 +    #[tokio::test]
++    async fn checkpoint_waits_for_the_writer_result() {
++        for expected in [Ok(()), Err("disk full".to_owned())] {
++            let (mut scheduler, mut receiver) = scheduler();
++            let checkpoint = tokio::spawn(async move { scheduler.flush_saves().await });
++            let ChunkWriteRequest::Barrier(reply) = receiver.recv().await.unwrap() else {
++                panic!("expected checkpoint barrier");
++            };
++            tokio::task::yield_now().await;
++            assert!(!checkpoint.is_finished());
++            reply.send(expected.clone()).unwrap();
++            assert_eq!(checkpoint.await.unwrap(), expected);
++        }
++    }
++
++    #[tokio::test]
++    async fn checkpoint_fails_when_the_writer_has_stopped() {
++        let (mut scheduler, receiver) = scheduler();
++        drop(receiver);
++        assert!(
++            scheduler
++                .flush_saves()
++                .await
++                .unwrap_err()
++                .contains("stopped")
++        );
++    }
++
++    #[tokio::test]
 +    async fn full_save_queue_retains_the_batch_until_capacity_is_available() {
 +        let (mut scheduler, mut receiver) = scheduler();
 +        let pos = ChunkPos::new(0, 0);
@@ -814,7 +886,11 @@ index 145e15de8..2942a1d31 100644
 +                ..Default::default()
 +            },
 +        );
-+        scheduler.io_write.send(Vec::new()).await.unwrap();
++        scheduler
++            .io_write
++            .send(ChunkWriteRequest::Chunks(Vec::new()))
++            .await
++            .unwrap();
 +        let lock = scheduler.io_lock.clone();
 +        let save = scheduler.save_all_chunk(true);
 +        tokio::pin!(save);
@@ -826,7 +902,9 @@ index 145e15de8..2942a1d31 100644
 +        assert!(lock.0.lock().unwrap().is_empty());
 +        receiver.recv().await.unwrap();
 +        save.await;
-+        let batch = receiver.recv().await.unwrap();
++        let ChunkWriteRequest::Chunks(batch) = receiver.recv().await.unwrap() else {
++            panic!("expected chunk batch");
++        };
 +        assert_eq!(batch.len(), 1);
 +        assert_eq!(batch[0].0, pos);
 +        assert_eq!(lock.0.lock().unwrap().get(&pos), Some(&1));
@@ -863,10 +941,22 @@ index 145e15de8..2942a1d31 100644
 +    }
 +}
 diff --git a/crates/pumpkin-world/src/chunk_system/worker_logic.rs b/crates/pumpkin-world/src/chunk_system/worker_logic.rs
-index b50ac05c9..281fa41f0 100644
+index b50ac05c9..b518adec5 100644
 --- a/crates/pumpkin-world/src/chunk_system/worker_logic.rs
 +++ b/crates/pumpkin-world/src/chunk_system/worker_logic.rs
-@@ -90,7 +90,7 @@ fn process_loaded_chunk(chunk: Arc<crate::chunk::ChunkData>, level: &Level) -> C
+@@ -13,6 +13,11 @@ use std::sync::Arc;
+ use std::sync::atomic::Ordering::Relaxed;
+ use tracing::{debug, error, warn};
+
++pub enum ChunkWriteRequest {
++    Chunks(Vec<(ChunkPos, Chunk)>),
++    Barrier(tokio::sync::oneshot::Sender<Result<(), String>>),
++}
++
+ pub enum RecvChunk {
+     IO(Chunk),
+     Generation(Cache),
+@@ -90,7 +95,7 @@ fn process_loaded_chunk(chunk: Arc<crate::chunk::ChunkData>, level: &Level) -> C
  
  pub async fn io_read_work(
      recv: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Vec<ChunkPos>>>>,
@@ -875,11 +965,62 @@ index b50ac05c9..281fa41f0 100644
      level: Arc<Level>,
      lock: IOLock,
  ) {
+@@ -178,13 +183,23 @@ pub async fn io_read_work(
+ }
+
+ pub async fn io_write_work(
+-    mut recv: tokio::sync::mpsc::Receiver<Vec<(ChunkPos, Chunk)>>,
++    mut recv: tokio::sync::mpsc::Receiver<ChunkWriteRequest>,
+     level: Arc<Level>,
+     lock: IOLock,
+ ) {
++    let mut failure: Option<String> = None;
+     loop {
+-        // Don't check cancel_token here (keep saving chunks)
+-        let Some(data) = recv.recv().await else { break };
++        // Don't check cancel_token here (keep saving chunks).
++        let Some(request) = recv.recv().await else {
++            break;
++        };
++        let data = match request {
++            ChunkWriteRequest::Chunks(data) => data,
++            ChunkWriteRequest::Barrier(reply) => {
++                let _ = reply.send(failure.clone().map_or(Ok(()), Err));
++                continue;
++            }
++        };
+         // debug!("io write thread receive chunks size {}", data.len());
+         let positions = data.iter().map(|(pos, _)| *pos).collect::<Vec<_>>();
+         let level_for_upgrade = level.clone();
+@@ -215,6 +230,7 @@ pub async fn io_write_work(
+                     .await
+                 {
+                     error!("Failed to save chunks: {:?}", e);
++                    failure.get_or_insert_with(|| format!("Failed to save chunks: {e:?}"));
+                 }
+                 false
+             }
 diff --git a/crates/pumpkin-world/src/level.rs b/crates/pumpkin-world/src/level.rs
-index fbc69749a..533b09d21 100644
+index fbc69749a..f4652e6f8 100644
 --- a/crates/pumpkin-world/src/level.rs
 +++ b/crates/pumpkin-world/src/level.rs
-@@ -316,7 +316,7 @@ impl Level {
+@@ -110,6 +110,7 @@ pub struct Level {
+
+     pub shut_down_chunk_system: AtomicBool,
+     pub should_save: AtomicBool,
++    pub(crate) checkpoints: SegQueue<oneshot::Sender<Result<(), String>>>,
+     pub should_unload: AtomicBool,
+     /// Whether periodic autosaving is enabled. Toggled by `/save-off` and `/save-on`;
+     /// a manual `/save-all` still saves while this is `false`.
+@@ -281,6 +282,7 @@ impl Level {
+             cancel_token: CancellationToken::new(),
+             shut_down_chunk_system: AtomicBool::new(false),
+             should_save: AtomicBool::new(false),
++            checkpoints: SegQueue::new(),
+             should_unload: AtomicBool::new(false),
+             save_enabled: AtomicBool::new(true),
+             autosave_ticks: level_config.autosave_ticks,
+@@ -316,7 +318,7 @@ impl Level {
  
      pub fn spawn_entity_generation(self: &Arc<Self>, pos: Vector2<i32>) {
          let level = self.clone();
@@ -888,7 +1029,42 @@ index fbc69749a..533b09d21 100644
              let arc_chunk = Arc::new(ChunkEntityData {
                  x: pos.x,
                  z: pos.y,
-@@ -354,43 +354,46 @@ impl Level {
+@@ -344,6 +346,34 @@ impl Level {
+         self.tasks.spawn(task)
+     }
+
++    /// Save a quiescent world without stopping its scheduler. The caller must
++    /// finish gameplay mutations before requesting this persistence barrier.
++    pub async fn checkpoint(&self) -> Result<(), String> {
++        if self.shut_down_chunk_system.load(Ordering::Relaxed) {
++            return Err("Cannot checkpoint a stopped world".to_owned());
++        }
++        let (reply, completed) = oneshot::channel();
++        self.checkpoints.push(reply);
++        self.should_save.store(true, Ordering::Relaxed);
++        self.level_channel.notify();
++        timeout(Duration::from_secs(30), completed)
++            .await
++            .map_err(|_| "Timed out waiting for chunk checkpoint".to_owned())?
++            .map_err(|_| "Chunk scheduler dropped checkpoint".to_owned())??;
++        let entities = self
++            .loaded_entity_chunks
++            .iter()
++            .map(|chunk| (*chunk.key(), chunk.value().clone()))
++            .collect();
++        self.entity_saver
++            .save_chunks(&self.level_folder, entities)
++            .await
++            .map_err(|error| format!("Failed to checkpoint entities: {error:?}"))?;
++        self.chunk_saver.block_and_await_ongoing_tasks().await;
++        self.entity_saver.block_and_await_ongoing_tasks().await;
++        Ok(())
++    }
++
+     pub async fn shutdown(&self) {
+         let world_id = self.level_folder.root_folder.display();
+         info!("Saving level ({})...", world_id);
+@@ -354,43 +384,46 @@ impl Level {
          self.tasks.close();
          self.chunk_system_tasks.close();
  
@@ -1782,6 +1958,68 @@ index 5ea3e41ac..fd913a72b 100644
  pub mod nethernet;
  pub mod play;
  pub mod status;
+diff --git a/crates/pumpkin/src/net/bedrock/nethernet_stub.rs b/crates/pumpkin/src/net/bedrock/nethernet_stub.rs
+new file mode 100644
+index 000000000..90f0989c4
+--- /dev/null
++++ b/crates/pumpkin/src/net/bedrock/nethernet_stub.rs
+@@ -0,0 +1,56 @@
++//! WebRTC-free stub of the NetherNet transport, compiled when the `nethernet`
++//! feature is off (e.g. the emscripten/embedded Java-only build). The types
++//! exist so the always-compiled Bedrock client code type-checks, but no Bedrock
++//! connection is ever created (the listener is never bound), so the method
++//! bodies are unreachable.
++use std::net::SocketAddr;
++use std::sync::Arc;
++
++use bytes::Bytes;
++use pumpkin_util::p384::PublicKey;
++
++pub type IncomingSession = (Arc<NetherNetSession>, SocketAddr);
++
++/// Stub listener: never bound when `nethernet` is off, so `accept` never yields.
++pub struct NetherNetListener {
++    _private: (),
++}
++
++impl NetherNetListener {
++    pub async fn accept(&self) -> Option<IncomingSession> {
++        None
++    }
++
++    pub const fn local_addr(&self) -> SocketAddr {
++        SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
++    }
++}
++
++/// Stub session. Never constructed when `nethernet` is off.
++pub struct NetherNetSession {
++    _private: (),
++}
++
++impl NetherNetSession {
++    pub async fn recv(&self) -> Option<Bytes> {
++        None
++    }
++
++    pub async fn send(&self, _data: Bytes) -> Result<(), String> {
++        Err("NetherNet transport is disabled in this build".to_string())
++    }
++
++    pub async fn send_unreliable(&self, _data: Bytes) -> Result<(), String> {
++        Err("NetherNet transport is disabled in this build".to_string())
++    }
++
++    pub const fn is_closed(&self) -> bool {
++        true
++    }
++
++    pub async fn close(&self) {}
++
++    pub const fn client_public_key(&self) -> Option<&PublicKey> {
++        None
++    }
++}
 diff --git a/crates/pumpkin/src/net/java/config/known_packs.rs b/crates/pumpkin/src/net/java/config/known_packs.rs
 index 7e45c3db9..8a4d5af4d 100644
 --- a/crates/pumpkin/src/net/java/config/known_packs.rs
@@ -2405,65 +2643,3 @@ index aeadba752..85bf10aff 100644
                      if let Ok(handle) = tokio::runtime::Handle::try_current() {
                          tokio::task::block_in_place(|| {
                              handle.block_on(async {
-diff --git a/crates/pumpkin/src/net/bedrock/nethernet_stub.rs b/crates/pumpkin/src/net/bedrock/nethernet_stub.rs
-new file mode 100644
-index 000000000..90f0989c4
---- /dev/null
-+++ b/crates/pumpkin/src/net/bedrock/nethernet_stub.rs
-@@ -0,0 +1,56 @@
-+//! WebRTC-free stub of the NetherNet transport, compiled when the `nethernet`
-+//! feature is off (e.g. the emscripten/embedded Java-only build). The types
-+//! exist so the always-compiled Bedrock client code type-checks, but no Bedrock
-+//! connection is ever created (the listener is never bound), so the method
-+//! bodies are unreachable.
-+use std::net::SocketAddr;
-+use std::sync::Arc;
-+
-+use bytes::Bytes;
-+use pumpkin_util::p384::PublicKey;
-+
-+pub type IncomingSession = (Arc<NetherNetSession>, SocketAddr);
-+
-+/// Stub listener: never bound when `nethernet` is off, so `accept` never yields.
-+pub struct NetherNetListener {
-+    _private: (),
-+}
-+
-+impl NetherNetListener {
-+    pub async fn accept(&self) -> Option<IncomingSession> {
-+        None
-+    }
-+
-+    pub const fn local_addr(&self) -> SocketAddr {
-+        SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
-+    }
-+}
-+
-+/// Stub session. Never constructed when `nethernet` is off.
-+pub struct NetherNetSession {
-+    _private: (),
-+}
-+
-+impl NetherNetSession {
-+    pub async fn recv(&self) -> Option<Bytes> {
-+        None
-+    }
-+
-+    pub async fn send(&self, _data: Bytes) -> Result<(), String> {
-+        Err("NetherNet transport is disabled in this build".to_string())
-+    }
-+
-+    pub async fn send_unreliable(&self, _data: Bytes) -> Result<(), String> {
-+        Err("NetherNet transport is disabled in this build".to_string())
-+    }
-+
-+    pub const fn is_closed(&self) -> bool {
-+        true
-+    }
-+
-+    pub async fn close(&self) {}
-+
-+    pub const fn client_public_key(&self) -> Option<&PublicKey> {
-+        None
-+    }
-+}

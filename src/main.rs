@@ -24,8 +24,8 @@ fn server() -> Result<Arc<PumpkinServer>, JsValue> {
 }
 
 #[wasm_bindgen]
-pub fn pumpkin_start() -> js_sys::Promise {
-    future_to_promise(async {
+pub fn pumpkin_start(settings: String) -> js_sys::Promise {
+    future_to_promise(async move {
         if SERVER.with(|server| server.borrow().is_some()) {
             return Ok(JsValue::UNDEFINED);
         }
@@ -35,12 +35,12 @@ pub fn pumpkin_start() -> js_sys::Promise {
             });
             eprintln!("RUST PANIC: {info}");
         }));
+        let (basic, advanced) = config::configuration(&settings).map_err(js_error)?;
         rayon::ThreadPoolBuilder::new()
             .num_threads(1)
             .use_current_thread()
             .build_global()
             .map_err(js_error)?;
-        let (basic, advanced) = config::configuration();
         pumpkin::init_logger(&advanced);
         let server = Arc::new(PumpkinServer::new(basic, advanced, VanillaData::load()).await);
         server.init_plugins().await;
@@ -87,10 +87,34 @@ pub fn pumpkin_status() -> Result<JsValue, JsValue> {
         &"wasm_memory_bytes".into(),
         &((core::arch::wasm32::memory_size::<0>() * 65536) as f64).into(),
     )?;
+    js_sys::Reflect::set(
+        &result,
+        &"mean_tick_ms".into(),
+        &server.server.get_mspt().into(),
+    )?;
     for (name, bytes) in memory::heap_usage() {
         js_sys::Reflect::set(&result, &name.into(), &(bytes as f64).into())?;
     }
     Ok(result.into())
+}
+
+#[wasm_bindgen]
+pub fn pumpkin_save() -> js_sys::Promise {
+    future_to_promise(async {
+        let server = server()?;
+        if !server.server.get_all_players().is_empty() {
+            return Err(js_error(
+                "Disconnect clients before checkpointing the world",
+            ));
+        }
+        server.server.save_all().await.map_err(js_error)?;
+        for world in server.server.worlds.load_full().iter() {
+            world.level.checkpoint().await.map_err(js_error)?;
+        }
+        // Background generation may catch a panic while the writer is draining.
+        crate::server()?;
+        Ok(JsValue::UNDEFINED)
+    })
 }
 
 #[wasm_bindgen]

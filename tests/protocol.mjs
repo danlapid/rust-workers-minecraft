@@ -1,7 +1,9 @@
-// Minimal, uncompressed Java 26.2 framing for this demo's smoke probe.
+// Java 26.2 framing, including negotiated packet compression.
+import { deflateSync, inflateSync } from 'node:zlib';
 export const PROTOCOL = 776;
 export const HOST = '127.0.0.1';
-export const PORT = 25565;
+export const PORT = Number(process.env.TEST_TCP_PORT ?? 25565);
+export const HTTP_PORT = Number(process.env.TEST_HTTP_PORT ?? 8787);
 
 export function varint(value) {
   const bytes = [];
@@ -29,8 +31,13 @@ export function mcString(value) {
   return Buffer.concat([varint(bytes.length), bytes]);
 }
 
-export function frame(id, payload = Buffer.alloc(0)) {
-  const body = Buffer.concat([varint(id), payload]);
+export function frame(id, payload = Buffer.alloc(0), threshold = null) {
+  let body = Buffer.concat([varint(id), payload]);
+  if (threshold !== null) {
+    body = body.length >= threshold
+      ? Buffer.concat([varint(body.length), deflateSync(body, { level: 1 })])
+      : Buffer.concat([varint(0), body]);
+  }
   return Buffer.concat([varint(body.length), body]);
 }
 
@@ -40,7 +47,7 @@ export function handshake(state) {
   return frame(0, Buffer.concat([varint(PROTOCOL), mcString(HOST), port, varint(state)]));
 }
 
-export async function* packets(socket) {
+export async function* packets(socket, compression = { threshold: null }) {
   let buffer = Buffer.alloc(0);
   for await (const data of socket) {
     buffer = Buffer.concat([buffer, data]);
@@ -50,8 +57,21 @@ export async function* packets(socket) {
       const [size, start] = length;
       if (size === 0 || size > 8 * 1024 * 1024) throw new Error('Invalid packet size');
       if (buffer.length < start + size) break;
-      const body = buffer.subarray(start, start + size);
+      let body = buffer.subarray(start, start + size);
       buffer = buffer.subarray(start + size);
+      if (compression.threshold !== null) {
+        const length = readVarint(body);
+        if (!length) throw new Error('Missing uncompressed packet length');
+        const [expected, offset] = length;
+        if (expected > 8 * 1024 * 1024) throw new Error('Uncompressed packet exceeds limit');
+        body = body.subarray(offset);
+        if (expected !== 0) {
+          if (expected < compression.threshold) throw new Error('Compressed packet below threshold');
+          body = inflateSync(body, { maxOutputLength: 8 * 1024 * 1024 });
+          if (body.length !== expected) throw new Error('Wrong uncompressed packet length');
+        }
+      }
+      compression.decodedBytes = (compression.decodedBytes ?? 0) + body.length;
       const id = readVarint(body);
       if (!id) throw new Error('Missing packet ID');
       yield { id: id[0], payload: body.subarray(id[1]) };

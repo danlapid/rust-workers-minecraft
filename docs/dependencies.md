@@ -12,7 +12,7 @@ are ignored under `.work/`. Both Cargo and npm dependency graphs are locked.
 | tokio | [emscripten-layering](https://github.com/guybedford/tokio) | `7c1d4977c510866775ed6164b58b2218a6a2955b` | HostedRuntime and normal Tokio TCP/UDP APIs; unmodified |
 | libc | [libc-0.2-emscripten](https://github.com/guybedford/libc) | `4091fe0b0dc5f9c1a27bed75be1ff02bb27e756d` | Emscripten epoll and socket support; unmodified |
 | ring | [emscripten](https://github.com/guybedford/ring) | `6671f7cfbb13f249b571ffa6326275a8596e0ca2` | Portable Emscripten crypto backend; unmodified |
-| pumpkin | [master](https://github.com/Pumpkin-MC/Pumpkin) | `b5b9b9d7010e793806a83c495af223c67e1d35ee` | Headless embedding, shared async scheduler, compact templates/generation chunks, and build-script fixes |
+| pumpkin | [master](https://github.com/Pumpkin-MC/Pumpkin) | `b5b9b9d7010e793806a83c495af223c67e1d35ee` | Headless embedding, shared async scheduler and checkpoint barriers, compact templates/generation chunks, and build-script fixes |
 | workers-rs | [connect-bindings](https://github.com/ThomasRubini/workers-rs) | `7db011ec97658a5d907f3e3102028ce86c044f19` | TCP ingress PR #1041; pinned ABI, Emscripten Tokio promise adapter, host-owned initialization, and socket shutdown flushing |
 | wasm-streams | [v0.6.0](https://github.com/MattiasBuelens/wasm-streams) | `35665f7b1da830b5ac51b4c6c3ff13f5c1a09ccb` | Build only the Rust library; its standalone `cdylib` is incompatible with static Emscripten linking |
 
@@ -20,7 +20,8 @@ Patches are relative to the pinned commits above. Setup checks reverse applicati
 before applying a patch and refuses to repin a modified checkout.
 
 Pumpkin has two patches: `pumpkin-emscripten.patch` for embedding/runtime support,
-followed by `pumpkin-memory.patch` for compact templates and generation chunks.
+followed by `pumpkin-memory.patch` for compact templates, generation chunks,
+palettes, lighting, carving masks, and idle pathfinders.
 They currently modify separate files and are both based on the pinned upstream
 commit.
 
@@ -56,9 +57,18 @@ commit description at the top of the maintained patch:
 ```sh
 git -C .work/pumpkin diff b5b9b9d7010e793806a83c495af223c67e1d35ee -- \
   . ':(exclude)Cargo.lock' ':(exclude)crates/pumpkin-world/src/generation' \
+  ':(exclude)crates/pumpkin-world/src/chunk/format/mod.rs' \
+  ':(exclude)crates/pumpkin-world/src/chunk/palette.rs' \
+  ':(exclude)crates/pumpkin-world/src/lighting/engine.rs' \
+  ':(exclude)crates/pumpkin/src/entity/ai/pathfinder/binary_heap.rs' \
   > .work/pumpkin-emscripten.diff
 git -C .work/pumpkin diff b5b9b9d7010e793806a83c495af223c67e1d35ee -- \
-  crates/pumpkin-world/src/generation > .work/pumpkin-memory.diff
+  crates/pumpkin-world/src/generation \
+  crates/pumpkin-world/src/chunk/format/mod.rs \
+  crates/pumpkin-world/src/chunk/palette.rs \
+  crates/pumpkin-world/src/lighting/engine.rs \
+  crates/pumpkin/src/entity/ai/pathfinder/binary_heap.rs \
+  > .work/pumpkin-memory.diff
 git -C .work/wasm-bindgen diff 4b69f3b3ba4212c857be6854f77fa5aec8b62871 -- crates/cli-support/src/js/mod.rs > .work/wasm-bindgen-emscripten-closures.diff
 git -C .work/workers-rs diff 7db011ec97658a5d907f3e3102028ce86c044f19 > .work/workers-rs-emscripten-toolchain.diff
 git -C .work/wasm-streams diff 35665f7b1da830b5ac51b4c6c3ff13f5c1a09ccb > .work/wasm-streams-rlib.diff
@@ -68,9 +78,9 @@ Replace the corresponding patch's contents from its first `diff --git` line onwa
 with the new diff. Update the subject, description, and `Base-commit` when the scope
 or pinned revision changes.
 
-The Pumpkin path filters reflect the current separation: all memory-patch files
-are under `crates/pumpkin-world/src/generation/`. Adjust the filters if that scope
-changes, keeping platform support and memory optimizations in their own patches.
+The Pumpkin path filters keep platform support and memory optimizations in
+separate patches. When extending the memory patch, add the same paths to the
+embedding patch's exclusions so they remain independently applicable.
 
 `git diff` omits untracked files, including files created by existing patches.
 Preserve those added-file diffs when regenerating (for example,

@@ -12,9 +12,11 @@ npm run typecheck      # Regenerate Worker types and check TypeScript
 npm test               # Full Wrangler integration suite
 npm run test:scheduler # Native queue/backpressure and shutdown regressions
 npm run test:memory    # Two-player memory probe on a fresh, fixed-seed world
+npm run test:experience # Configuration and movement/traffic probe
 ```
 
-Tests fail if their loopback ports (25565 and 8787) are occupied. They start and
+Tests fail if their loopback ports (25565 and 8787 by default) are occupied.
+Set `TEST_TCP_PORT` and `TEST_HTTP_PORT` to use separate ports. They start and
 stop only their own Wrangler process groups. Their databases and logs live in
 `.data/probes/`; playable worlds are separate under `.data/workers/server/`.
 
@@ -22,7 +24,7 @@ stop only their own Wrangler process groups. Their databases and logs live in
 isolation, synchronous descriptors, large files, failed-startup status, two-player
 gameplay, a real block edit, and player/block restoration after a restart.
 
-The memory probe waits for both clients to receive 81 chunks, observes 30 seconds
+The memory probe waits for both clients to receive their configured view, observes 30 seconds
 of stationary play, then checkpoints. Each run creates a fresh isolated world
 with a fixed seed; use the same seed when comparing builds:
 
@@ -47,3 +49,6 @@ selects an older Node version, use a version manager or set
 Read [dependency pins](dependencies.md) before changing a checkout. Every change
 to a patched dependency must be reflected in `patches/`. The embedded build uses
 the root Cargo.lock. Native Pumpkin tests use the dependency's own workspace.
+
+See [configuration](configuration.md) for gameplay controls, reconnect behavior,
+and the exploration probe.
