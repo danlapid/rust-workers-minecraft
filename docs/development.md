@@ -6,6 +6,22 @@ The initial Pumpkin compilation takes several minutes. Later builds use Cargo's
 cache. `build.rs` owns the Emscripten library arguments and tracks changes to the
 compatibility library.
 
+Wrangler's custom build runs `scripts/build.sh` before `dev` and `deploy`, so
+direct Wrangler commands also compile the Rust runtime. During development it
+watches the application sources and build inputs, rebuilding Rust before
+reloading the Worker. Changes in dependency checkouts under `.work/` require
+restarting Wrangler or running `npm run build` followed by a restart.
+
+Compiler diagnostics are printed normally. The pinned Emscripten frontend still
+labels JSPI as experimental; this runtime requires JSPI, so that notice remains
+visible. Dependency warning fixes and the matching LLVM/Binaryen backend are
+recorded in [dependency pins](dependencies.md).
+
+The Worker checks its required runtime exports before starting Pumpkin. A
+missing export such as `pumpkin_save` means the generated JavaScript does not
+match the Worker code. Run `npm run build` and restart or redeploy with both the
+generated JavaScript and Wasm; editing `worker/modules.d.ts` cannot add exports.
+
 ```sh
 npm run build          # Compile the production server
 npm run typecheck      # Regenerate Worker types and check TypeScript
@@ -19,6 +35,8 @@ Tests fail if their loopback ports (25565 and 8787 by default) are occupied.
 Set `TEST_TCP_PORT` and `TEST_HTTP_PORT` to use separate ports. They start and
 stop only their own Wrangler process groups. Their databases and logs live in
 `.data/probes/`; playable worlds are separate under `.data/workers/server/`.
+Each probe also uses its own Worker name. The experience probe accepts up to 20
+clients; `--max-players` sets the login limit independently of the client count.
 
 `npm test` must finish with `PUMPKIN-DO-SQLITE-RESTART-OK`. It checks filesystem
 isolation, synchronous descriptors, large files, failed-startup status, two-player

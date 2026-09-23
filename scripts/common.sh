@@ -17,6 +17,11 @@ require_node() {
 require_toolchain() {
   if [ ! -f "$WORK/emscripten/.emscripten_cf" ] ||
      [ ! -x "$WORK/bin/wasm-bindgen" ] ||
+     [ ! -x "$WORK/emsdk/upstream/bin/clang" ] ||
+     [ ! -x "$WORK/emsdk/upstream/bin/wasm-opt" ] ||
+     [ ! -f "$WORK/tokio-compat/tokio/Cargo.toml" ] ||
+     [ ! -f "$WORK/ring-compat/Cargo.toml" ] ||
+     [ ! -f "$WORK/proc-macro-error2/Cargo.toml" ] ||
      [ ! -f "$WORK/pumpkin/crates/pumpkin/Cargo.toml" ] ||
      [ ! -f "$WORK/workers-rs/worker/Cargo.toml" ]; then
     echo "error: run bash scripts/setup.sh first." >&2

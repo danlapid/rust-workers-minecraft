@@ -29,6 +29,16 @@ wire format. Uniform initialized light arrays are shared; writes detach the
 affected array. Carving masks allocate only through their highest used word,
 and idle pathfinders reserve nodes when a search begins.
 
+Generation-graph storage is released after all tasks finish, with stale keys
+cleared before reuse. Density-buffer pools retain at most 4 MiB of payload per
+thread. Structure-start caches periodically drop idle entries while preserving
+collectors still referenced by generation.
+
+Java chunk delivery reserves queue slots and byte credit for complete batches.
+When the 2 MiB per-client chunk budget is full, unsent chunks remain pending for
+a later tick. A single larger chunk can use the whole budget. Raw packet buffers
+are released after frame writes; completion notifications still wait for flush.
+
 Emscripten factory mode (`MODULARIZE=1`) isolates module instances. Wrangler
 provides the compiled wasm through `instantiateWasm`; the generated host glue uses
 Workers' Node compatibility APIs. The SDK's standalone-loader initialization and

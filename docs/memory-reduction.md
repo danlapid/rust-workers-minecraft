@@ -2,9 +2,10 @@
 
 The optimized server runs on standard SQLite-backed Durable Objects.
 
-The memory optimizations are maintained in
-[`pumpkin-memory.patch`](../patches/pumpkin-memory.patch), separately from the
-Emscripten embedding patch. Setup applies both to the pinned Pumpkin revision.
+Storage and cache optimizations are maintained in
+[`pumpkin-memory.patch`](../patches/pumpkin-memory.patch). Scheduler and network
+queue changes live in the embedding patch alongside their runtime integration.
+Setup applies both to the pinned Pumpkin revision.
 
 Structure templates share indexed block arrays and store block-state descriptions
 once per palette. Block-entity NBT is shared until placement needs a mutable copy.
@@ -64,7 +65,9 @@ Additional optimized runs checked the larger view and longer movement:
 | 4 / 3 | 4 | 32 | Same | 125.81 MiB | Passed |
 | 3 / 3 | 4 | 128 | Same | 159.81 MiB | Passed on retry |
 
-The default is now view 4/simulation 3 with two players. The long four-player
+The configuration initially chosen after these measurements used view 4/simulation
+3 with a two-player limit. The current limit is 20; that capacity has not been
+load-tested. The long four-player
 result is still too large for the standard isolate budget, and even the
 two-player results do not establish a general capacity bound. Movement counts
 describe commands sent by synthetic clients, not verified terrain traversal.
@@ -82,6 +85,68 @@ The final source passed 186 native world tests, 101 protocol tests, and the
 pathfinder heap growth/ordering test. The full integration suite passed at the
 new 4/3 defaults, including a shared block edit and restoration of the player
 position and edited chunk after restarting Wrangler.
+
+## Cache lifetime and outgoing data (September 22, 2026)
+
+This pass kept view distance 4, simulation distance 3, and the configured player
+limit of 20. Four clients each commanded 128 four-block movement steps in
+different directions. The baseline includes the earlier memory optimizations
+and the matching LLVM 24/Binaryen 131 backend.
+
+| Measurement | Baseline | Baseline repeat | Optimized |
+| --- | ---: | ---: | ---: |
+| Peak sampled Wasm capacity | 173.81 MiB | 175.88 MiB | 155.94 MiB |
+| Peak sampled allocated heap | 129.86 MiB | 130.98 MiB | 113.19 MiB |
+| Initial views | 8.63 s | 8.82 s | 7.49 s |
+| Observed exploration ticks/second | 14.31 | 14.17 | 14.92 |
+
+That is approximately **10–11% less Wasm capacity** and **13–14% less allocated
+heap** at the same settings. The optimized run received 1,876 distinct chunks
+across the clients, compared with 1,277 in the baseline repeat. The lower memory
+use did not come from delivering less terrain. Timing results remain individual
+observations, not a statistical CPU benchmark.
+
+With **20 nearby clients** and no movement, the optimized build peaked at
+**83.94 MiB** of Wasm capacity versus **91.69 MiB** in both baseline runs. All
+clients received their initial 117 chunks. Initial view delivery took 9.24 s
+optimized and 8.64–8.73 s baseline. A second seed's optimized four-client long
+run completed at 161.94 MiB; its baseline attempts failed, so it is not a paired
+comparison. These results do not establish a 20-player exploration capacity.
+
+The changes address retained memory and large bursts of outgoing data:
+
+- Release large generation-graph arrays once no queued or running task can hold
+  a key. Clear stale holder keys before reusing the graph.
+- After the structure-start cache passes 2,048 entries, periodically remove
+  entries that active generation no longer references. Keep shared collector
+  identity intact, including concurrent cache misses.
+- Limit pooled density-buffer payloads to 4 MiB per thread while retaining
+  reusable buffers that fit.
+- Give each Java client's queued chunk payloads a 2 MiB byte budget. Reserve
+  capacity for a whole chunk batch before marking chunks sent. When capacity is
+  unavailable, chunks stay pending for retry. A single larger chunk can occupy
+  the whole budget so valid packets still make progress.
+- Trim serialized packet capacity and release raw packet data after writing its
+  frame. Keep completion acknowledgements until the writer flushes. Asynchronous
+  resends serialize small groups and share the same batch-ordering guard.
+
+The [complete report](memory-retention-results.json) includes unsuccessful
+attempts and intermediate builds. Some heap captures caused client timeouts;
+stopped-world dumps were excluded. Several baseline and candidate runs ended
+with Wrangler proxy errors. Their cause was not established. An additional
+dependency-pruning experiment was left out because it showed no clear benefit
+over the selected implementation.
+
+Native validation covered 191 world tests and six packet/chunk tests, including
+atomic batch reservation, retrying unsent chunks, collector identity, and pool
+accounting. The integration suite verifies player and edited-chunk restoration.
+
+To repeat the workloads with the current build:
+
+```sh
+TEST_TCP_PORT=25566 TEST_HTTP_PORT=8788 TEST_INSPECTOR_PORT=9241 npm run test:experience -- --players 4 --max-players 20 --view 4 --simulation 3 --steps 128
+TEST_TCP_PORT=25566 TEST_HTTP_PORT=8788 TEST_INSPECTOR_PORT=9241 npm run test:experience -- --players 20 --max-players 20 --view 4 --simulation 3 --steps 0
+```
 
 ## Earlier stationary comparison (September 5, 2026)
 

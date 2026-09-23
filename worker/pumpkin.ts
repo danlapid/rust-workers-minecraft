@@ -14,6 +14,11 @@ export async function startPumpkin(storage: DurableObjectStorage, settings: Serv
     },
     printErr: console.error,
   }));
+  for (const name of ['pumpkin_start', 'pumpkin_connect', 'pumpkin_save', 'pumpkin_shutdown', 'pumpkin_status'] as const) {
+    if (typeof instance[name] !== 'function') {
+      throw new Error(`Pumpkin runtime is missing ${name}. Run npm run build, then restart or redeploy the Worker.`);
+    }
+  }
   await run(() => instance.pumpkin_start(JSON.stringify(settings)));
   return {
     connect: (socket: Socket) => run(() => instance.pumpkin_connect(socket)),

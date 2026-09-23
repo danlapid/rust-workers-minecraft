@@ -10,7 +10,7 @@ Rust. Invalid settings appear in the HTTP status response's `failure` field.
 | `WORLD_SEED` | Unset | Seed for a new world; an existing world keeps its saved seed. |
 | `VIEW_DISTANCE` | `4` | Maximum client view distance, from 2 to 32 chunks. |
 | `SIMULATION_DISTANCE` | `3` | Simulation radius, from 2 to the configured view distance. |
-| `MAX_PLAYERS` | `2` | Login limit, from 1 to 1,000; higher values need load testing. |
+| `MAX_PLAYERS` | `20` | Login limit, from 1 to 1,000; capacity depends on the world and workload. |
 | `COMPRESSION_THRESHOLD` | `512` | Compress packets at or above this byte count; `-1` disables compression. |
 | `COMPRESSION_LEVEL` | `1` | Compression level, from 0 to 9; 1 favors speed. |
 | `IDLE_TIMEOUT_SECONDS` | `10` | Reconnect window after a checkpoint, from 0 to 30 seconds; 0 stops immediately. |

@@ -2,6 +2,19 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "rust-workers-minecraft",
   "main": "worker/index.ts",
+  "build": {
+    "command": "bash scripts/build.sh",
+    "watch_dir": [
+      "src",
+      "worker",
+      "scripts",
+      ".cargo",
+      "Cargo.toml",
+      "Cargo.lock",
+      "build.rs",
+      "rust-toolchain.toml"
+    ]
+  },
   "compatibility_date": "2026-09-05",
   "compatibility_flags": [
     "nodejs_compat",
@@ -25,11 +38,14 @@
       "storage": "sqlite"
     }
   },
+  "limits": {
+    "cpu_ms": 300000
+  },
   "vars": {
     "WORLD_NAME": "world",
     "VIEW_DISTANCE": "4",
     "SIMULATION_DISTANCE": "3",
-    "MAX_PLAYERS": "2",
+    "MAX_PLAYERS": "20",
     "COMPRESSION_THRESHOLD": "512",
     "COMPRESSION_LEVEL": "1",
     "IDLE_TIMEOUT_SECONDS": "10",

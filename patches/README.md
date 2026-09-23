@@ -14,6 +14,9 @@ diff below it. Preserve the description when regenerating the diff.
 | `wasm-bindgen-emscripten-closures.patch` | `.work/wasm-bindgen` | Escape generated closure-finalizer postsets as JavaScript strings |
 | `workers-rs-emscripten-toolchain.patch` | `.work/workers-rs` | Match the pinned wasm-bindgen ABI, provide the Emscripten Tokio promise adapter, leave initialization/recovery to the host, and flush pending writes before socket shutdown |
 | `wasm-streams-rlib.patch` | `.work/wasm-streams` | Omit the standalone cdylib when embedding the stream adapter in Emscripten |
+| `tokio-atomic-update.patch` | `.work/tokio-compat` | Use the renamed atomic update API, retaining Loom's existing API |
+| `ring-portable-build.patch` | `.work/ring-compat` | Gate hardware-only helpers and replace the deprecated internal export macro while preserving its C symbol |
+| `proc-macro-error2-visibility.patch` | `.work/proc-macro-error2` | Make the re-exported `proc_macro` crate public before the compiler makes private re-exports an error |
 
 The wasm-streams patch is a downstream workaround for this application's static
 Emscripten build. Removing its `cdylib` output upstream could break consumers of
@@ -39,6 +42,11 @@ from the embedding patch.
 Both Pumpkin patches exclude its Cargo.lock; the application's root Cargo.lock
 locks the embedded build. Setup checks reverse application before reapplying each
 patch.
+
+The embedding patch also releases idle generation-graph storage and applies byte
+backpressure to outgoing chunk batches. The memory patch bounds density-buffer
+reuse and evicts idle structure-start cache entries. See the
+[measurements and validation](../docs/memory-reduction.md#cache-lifetime-and-outgoing-data-september-22-2026).
 
 The [wasm-bindgen side-module review branch](https://github.com/wasm-bindgen/wasm-bindgen/compare/main...danlapid:fix/emscripten-function-got)
 and [merged Walrus fix](https://github.com/wasm-bindgen/walrus/pull/320) track the

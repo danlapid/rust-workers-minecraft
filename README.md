@@ -13,19 +13,18 @@ Minecraft → Workers TCP ingress → MinecraftWorld → Pumpkin + SQLite
 
 ## Try it
 
-The supported build host is macOS with Homebrew. Install Git,
+The supported build host is macOS. Install Git,
 [rustup](https://rustup.rs/), Python 3.11+, and Node 24+ (26 recommended).
 From a checkout of this repository:
 
 ```sh
-brew install emscripten
 npm ci
 bash scripts/setup.sh
 npm run dev
 ```
 
-Setup installs the pinned Rust toolchain, fetches dependency sources, and builds
-the matching wasm-bindgen CLI. `npm run dev` compiles Pumpkin and starts Wrangler.
+Setup installs the pinned Rust toolchain and Emscripten backend, fetches dependency
+sources, and builds the matching wasm-bindgen CLI. `npm run dev` compiles Pumpkin and starts Wrangler.
 The first build takes several minutes; later builds use Cargo's cache.
 
 Connect **Minecraft Java 26.2** to **`localhost:25565`**. Status is available at
@@ -59,10 +58,9 @@ See [development](docs/development.md), [architecture](docs/architecture.md), an
 
 ## Deploy
 
-After setup, build the runtime and deploy the Worker:
+After setup, deploy the Worker. Wrangler builds the Rust runtime before bundling:
 
 ```sh
-npm run build
 npx wrangler deploy
 ```
 

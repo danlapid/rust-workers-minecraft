@@ -33,6 +33,15 @@ export async function testServer({ seed = '1789195700909824175', vars = {} } = {
     const log = path.join(probe, `${++phase}-${fixture ? "filesystem" : "minecraft"}.log`);
     const sourceConfig = path.join(repo, fixture ? 'tests/fixtures/wrangler.jsonc' : 'wrangler.jsonc');
     const config = JSON.parse(await readFile(sourceConfig, 'utf8'));
+    config.name += '-' + path.basename(probe).split('.').at(-1).toLowerCase();
+    // The probe config lives outside the repository root. Keep the real build
+    // hook and resolve its paths so tests exercise the same startup as dev.
+    if (config.build) {
+      config.build.cwd = repo;
+      const watch = config.build.watch_dir ?? 'src';
+      config.build.watch_dir = (Array.isArray(watch) ? watch : [watch])
+        .map(directory => path.relative(probe, path.resolve(repo, directory)));
+    }
     config.main = path.resolve(path.dirname(sourceConfig), config.main);
     config.dev.port = HTTP_PORT;
     config.connect[0].port = PORT;

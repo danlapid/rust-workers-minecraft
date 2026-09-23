@@ -16,6 +16,10 @@ Use packed in-memory palette indices, share light arrays with copy-on-write,
 allocate carving-mask words on demand, and grow pathfinding heaps only when
 needed. Preserve block values, lighting initialization, and search behavior.
 
+Limit pooled density buffers by bytes and prune structure-start entries that
+no active generation task references. Concurrent cache misses share a canonical
+collector so pointer-based structure deduplication remains valid.
+
 Base-commit: b5b9b9d7010e793806a83c495af223c67e1d35ee
 
 ---
@@ -483,7 +487,7 @@ index 39ed39a7e..911e320d9 100644
      fn bulk_palette_matches_individual_mutations() {
          let states = [
 diff --git a/crates/pumpkin-world/src/generation/carver/mask.rs b/crates/pumpkin-world/src/generation/carver/mask.rs
-index f9ccd2773..34c161458 100644
+index f9ccd2773..8e47504f1 100644
 --- a/crates/pumpkin-world/src/generation/carver/mask.rs
 +++ b/crates/pumpkin-world/src/generation/carver/mask.rs
 @@ -1,6 +1,7 @@
@@ -556,7 +560,7 @@ index f9ccd2773..34c161458 100644
 +    #[test]
 +    #[should_panic(expected = "outside the chunk")]
 +    fn reads_outside_the_dimension_still_fail() {
-+        CarvingMask::new(384, -64).get(0, -65, 0);
++        let _ = CarvingMask::new(384, -64).get(0, -65, 0);
      }
  }
 diff --git a/crates/pumpkin-world/src/generation/feature/features/fossil.rs b/crates/pumpkin-world/src/generation/feature/features/fossil.rs
@@ -572,6 +576,112 @@ index 226ee1833..0e774e8bc 100644
          let local_pos = rotation.transform_pos(block.pos, template.size);
          let world_pos = origin + local_pos;
 
+diff --git a/crates/pumpkin-world/src/generation/noise/router/density_volume.rs b/crates/pumpkin-world/src/generation/noise/router/density_volume.rs
+index 106a65d51..10f24c744 100644
+--- a/crates/pumpkin-world/src/generation/noise/router/density_volume.rs
++++ b/crates/pumpkin-world/src/generation/noise/router/density_volume.rs
+@@ -6,9 +6,10 @@ pub use pumpkin_util::noise::volume::DensityVolume;
+ const BUFFER_SIZE_INCREMENT: usize = 16;
+ const MAX_REUSE_SIZE_FACTOR: usize = 2;
+ const MAX_POOLED_BUFFERS: usize = 1024;
++const MAX_POOLED_BYTES: usize = 4 * 1024 * 1024;
+
+ thread_local! {
+-    static DENSITY_BUFFER_POOL: RefCell<Vec<Box<[f32]>>> = const { RefCell::new(Vec::new()) };
++    static DENSITY_BUFFER_POOL: RefCell<BufferPool> = const { RefCell::new(BufferPool { buffers: Vec::new(), bytes: 0 }) };
+ }
+
+ fn take_best(
+@@ -31,6 +32,27 @@ fn take_best(
+     best_index.map(|i| pool.remove(i))
+ }
+
++struct BufferPool {
++    buffers: Vec<Box<[f32]>>,
++    bytes: usize,
++}
++
++impl BufferPool {
++    fn take(&mut self, min: usize, max: usize) -> Option<Box<[f32]>> {
++        let buffer = take_best(&mut self.buffers, min, max)?;
++        self.bytes -= std::mem::size_of_val(&*buffer);
++        Some(buffer)
++    }
++
++    fn put(&mut self, buffer: Box<[f32]>) {
++        let bytes = std::mem::size_of_val(&*buffer);
++        if self.buffers.len() < MAX_POOLED_BUFFERS && bytes <= MAX_POOLED_BYTES - self.bytes {
++            self.bytes += bytes;
++            self.buffers.push(buffer);
++        }
++    }
++}
++
+ pub struct DensityBuffer {
+     values: Box<[f32]>,
+     len: usize,
+@@ -47,11 +69,8 @@ impl DensityBuffer {
+         let min_capacity = len.next_multiple_of(BUFFER_SIZE_INCREMENT);
+         let values = DENSITY_BUFFER_POOL
+             .with(|pool| {
+-                take_best(
+-                    &mut pool.borrow_mut(),
+-                    min_capacity,
+-                    min_capacity * MAX_REUSE_SIZE_FACTOR,
+-                )
++                pool.borrow_mut()
++                    .take(min_capacity, min_capacity * MAX_REUSE_SIZE_FACTOR)
+             })
+             .unwrap_or_else(|| vec![0.0; min_capacity].into_boxed_slice());
+         Self { values, len }
+@@ -83,10 +102,43 @@ impl Drop for DensityBuffer {
+     fn drop(&mut self) {
+         let values = std::mem::take(&mut self.values);
+         DENSITY_BUFFER_POOL.with(|pool| {
+-            let mut pool = pool.borrow_mut();
+-            if pool.len() < MAX_POOLED_BUFFERS {
+-                pool.push(values);
+-            }
++            pool.borrow_mut().put(values);
+         });
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn retained_buffers_obey_byte_budget_and_return_credit_on_reuse() {
++        let mut pool = BufferPool {
++            buffers: Vec::new(),
++            bytes: 0,
++        };
++        let len = MAX_POOLED_BYTES / std::mem::size_of::<f32>();
++        pool.put(vec![7.0; len].into_boxed_slice());
++        pool.put(vec![0.0; 16].into_boxed_slice());
++        assert_eq!(pool.buffers.len(), 1);
++        assert_eq!(pool.bytes, MAX_POOLED_BYTES);
++        assert!(pool.take(16, 32).is_none());
++        assert_eq!(pool.bytes, MAX_POOLED_BYTES);
++        let buffer = pool.take(len, len).unwrap();
++        assert_eq!(pool.bytes, 0);
++        assert!(buffer.iter().all(|&value| value == 7.0));
++        pool.put(buffer);
++        assert_eq!(pool.bytes, MAX_POOLED_BYTES);
++    }
++
++    #[test]
++    fn oversized_buffers_are_not_retained() {
++        let mut pool = BufferPool {
++            buffers: Vec::new(),
++            bytes: 0,
++        };
++        pool.put(vec![0.0; MAX_POOLED_BYTES / 4 + 16].into_boxed_slice());
++        assert!(pool.buffers.is_empty());
++        assert_eq!(pool.bytes, 0);
++    }
++}
 diff --git a/crates/pumpkin-world/src/generation/proto_chunk.rs b/crates/pumpkin-world/src/generation/proto_chunk.rs
 index 727a58a31..cc4c8e77e 100644
 --- a/crates/pumpkin-world/src/generation/proto_chunk.rs
@@ -687,6 +797,146 @@ index 727a58a31..cc4c8e77e 100644
      }
 
      pub fn spawn_mobs<T: GenerationCache>(cache: &mut T, block_registry: &dyn WorldPortalExt) {
+diff --git a/crates/pumpkin-world/src/generation/structure/placement.rs b/crates/pumpkin-world/src/generation/structure/placement.rs
+index 250263ff7..c96f1ad33 100644
+--- a/crates/pumpkin-world/src/generation/structure/placement.rs
++++ b/crates/pumpkin-world/src/generation/structure/placement.rs
+@@ -10,7 +10,8 @@ use pumpkin_util::{
+     },
+ };
+ use std::f64::consts::PI;
+-use std::sync::OnceLock;
++use std::sync::atomic::{AtomicUsize, Ordering};
++use std::sync::{Arc, OnceLock};
+
+ use crate::ProtoChunk;
+ use dashmap::DashMap;
+@@ -31,6 +32,7 @@ pub struct GlobalStructureCache {
+     /// world seed, so it is computed once here instead of being recomputed for every
+     /// surrounding chunk whose structure references overlap it.
+     structure_starts: OnceLock<DashMap<(StructureKeys, i32, i32), Option<StructurePosition>>>,
++    inserted_starts: AtomicUsize,
+ }
+ impl GlobalStructureCache {
+     /// Creates a new, empty global structure cache.
+@@ -39,6 +41,7 @@ impl GlobalStructureCache {
+         Self {
+             stronghold_chunks: OnceLock::new(),
+             structure_starts: OnceLock::new(),
++            inserted_starts: AtomicUsize::new(0),
+         }
+     }
+
+@@ -66,8 +69,29 @@ impl GlobalStructureCache {
+             return cached.value().clone();
+         }
+         let computed = compute();
+-        cache.insert((key, chunk_x, chunk_z), computed.clone());
+-        computed
++        // Concurrent requests must share the same collector: generation deduplicates
++        // structure references by Arc identity.
++        let result = cache
++            .entry((key, chunk_x, chunk_z))
++            .or_insert(computed)
++            .clone();
++        if self.inserted_starts.fetch_add(1, Ordering::Relaxed) % 256 == 255 && cache.len() > 2048 {
++            self.evict_unused_starts();
++        }
++        result
++    }
++
++    fn evict_unused_starts(&self) {
++        if let Some(cache) = self.structure_starts.get() {
++            // Active generation keeps its own Arc. Never replace a collector that
++            // another chunk can still use; idle placements can be recomputed from
++            // their world seed and start coordinates.
++            cache.retain(|_, position| {
++                position
++                    .as_ref()
++                    .is_some_and(|position| Arc::strong_count(&position.collector) > 1)
++            });
++        }
+     }
+
+     /// Retrieves the list of chunk coordinates for Concentric Ring structures.
+@@ -450,3 +474,77 @@ mod tests {
+         ));
+     }
+ }
++
++#[cfg(test)]
++mod cache_tests {
++    use super::*;
++    use crate::generation::structure::structures::StructurePiecesCollector;
++    use pumpkin_util::math::position::BlockPos;
++    use std::sync::Mutex;
++
++    fn position() -> StructurePosition {
++        StructurePosition {
++            start_pos: BlockPos::new(1, 2, 3),
++            collector: Arc::new(Mutex::new(StructurePiecesCollector::new())),
++        }
++    }
++
++    #[test]
++    fn exploration_releases_idle_entries_but_preserves_active_collectors() {
++        let cache = GlobalStructureCache::new();
++        let active = cache
++            .get_or_compute_structure_start(StructureKeys::Monument, -1, -1, || Some(position()))
++            .unwrap();
++        for x in 0..10_000 {
++            assert!(
++                cache
++                    .get_or_compute_structure_start(StructureKeys::Monument, x, 0, || None)
++                    .is_none()
++            );
++        }
++        assert!(cache.structure_starts.get().unwrap().len() <= 2304);
++        cache.evict_unused_starts();
++        let reused = cache
++            .get_or_compute_structure_start(StructureKeys::Monument, -1, -1, || {
++                panic!("active collector was evicted")
++            })
++            .unwrap();
++        assert!(Arc::ptr_eq(&active.collector, &reused.collector));
++        drop(reused);
++        drop(active);
++        cache.evict_unused_starts();
++        assert!(cache.structure_starts.get().unwrap().is_empty());
++        let rebuilt = cache
++            .get_or_compute_structure_start(StructureKeys::Monument, -1, -1, || Some(position()))
++            .unwrap();
++        assert_eq!(rebuilt.start_pos, BlockPos::new(1, 2, 3));
++    }
++
++    #[test]
++    fn concurrent_misses_return_one_canonical_collector() {
++        let cache = GlobalStructureCache::new();
++        let barrier = std::sync::Barrier::new(2);
++        std::thread::scope(|scope| {
++            let a = scope.spawn(|| {
++                cache
++                    .get_or_compute_structure_start(StructureKeys::Monument, 0, 0, || {
++                        barrier.wait();
++                        Some(position())
++                    })
++                    .unwrap()
++            });
++            let b = scope.spawn(|| {
++                cache
++                    .get_or_compute_structure_start(StructureKeys::Monument, 0, 0, || {
++                        barrier.wait();
++                        Some(position())
++                    })
++                    .unwrap()
++            });
++            assert!(Arc::ptr_eq(
++                &a.join().unwrap().collector,
++                &b.join().unwrap().collector
++            ));
++        });
++    }
++}
 diff --git a/crates/pumpkin-world/src/generation/structure/structures/end_city/layout.rs b/crates/pumpkin-world/src/generation/structure/structures/end_city/layout.rs
 index a7f29d8dc..ca0dc47dd 100644
 --- a/crates/pumpkin-world/src/generation/structure/structures/end_city/layout.rs

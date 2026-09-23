@@ -1,0 +1,21 @@
+Subject: [PATCH] Make the re-exported proc_macro crate public
+
+The hidden macro support module publicly re-exports proc_macro. Declare the
+extern crate public so this remains valid when private re-exports become errors.
+
+Base-commit: b02d79c49898a8f4340aaa81ebd7cae3668ac6a9
+
+---
+diff --git a/src/lib.rs b/src/lib.rs
+index a00c924..d496790 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -274,7 +274,7 @@
+ #![cfg_attr(feature = "nightly", feature(proc_macro_diagnostic))]
+ #![forbid(unsafe_code)]
+
+-extern crate proc_macro;
++pub extern crate proc_macro;
+
+ pub use crate::{
+     diagnostic::{Diagnostic, DiagnosticExt, Level},

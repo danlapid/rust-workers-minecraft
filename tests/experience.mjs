@@ -14,6 +14,7 @@ const { values } = parseArgs({ options: {
   view: { type: 'string', default: '4' },
   simulation: { type: 'string', default: '3' },
   players: { type: 'string', default: '2' },
+  'max-players': { type: 'string' },
   compression: { type: 'string', default: '512' },
   level: { type: 'string', default: '1' },
   label: { type: 'string', default: 'experience' },
@@ -21,11 +22,11 @@ const { values } = parseArgs({ options: {
 } });
 const playerCount = Number(values.players);
 const steps = Number(values.steps);
-assert.ok(Number.isInteger(playerCount) && playerCount >= 1 && playerCount <= 4);
+assert.ok(Number.isInteger(playerCount) && playerCount >= 1 && playerCount <= 20);
 assert.ok(Number.isInteger(steps) && steps >= 0 && steps <= 128);
 const vars = {
   VIEW_DISTANCE: values.view, SIMULATION_DISTANCE: values.simulation,
-  MAX_PLAYERS: values.players, COMPRESSION_THRESHOLD: values.compression,
+  MAX_PLAYERS: values['max-players'] ?? values.players, COMPRESSION_THRESHOLD: values.compression,
   COMPRESSION_LEVEL: values.level, IDLE_TIMEOUT_SECONDS: '0',
 };
 const { probe, startWorker, request, checkpoint, seed } = await testServer({ seed: values.seed, vars });
@@ -64,7 +65,8 @@ try {
   await delay(5000);
   healthy();
   const origins = clients.map(c => ({ ...c.position }));
-  const directions = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+  const directions = playerCount <= 4 ? [[1, 0], [-1, 0], [0, 1], [0, -1]]
+    : Array.from({ length: playerCount }, (_, i) => [Math.cos(i * 2 * Math.PI / playerCount), Math.sin(i * 2 * Math.PI / playerCount)]);
   phase = 'exploration';
   for (let step = 1; step <= steps; step++) {
     for (let i = 0; i < clients.length; i++) {

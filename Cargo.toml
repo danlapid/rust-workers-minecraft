@@ -45,10 +45,11 @@ web-sys = { path = ".work/wasm-bindgen/crates/web-sys" }
 wasm-streams = { path = ".work/wasm-streams" }
 libc = { path = ".work/libc" }
 mio = { git = "https://github.com/guybedford/mio", rev = "a62c9e46833fc255c9217ab9aa362c6221ed4401" }
-ring = { path = ".work/ring" }
+ring = { path = ".work/ring-compat" }
+proc-macro-error2 = { path = ".work/proc-macro-error2" }
 socket2 = { git = "https://github.com/rust-lang/socket2", rev = "239dd83a4ced08e514d2c38942aab99791119f0d" }
-tokio = { path = ".work/tokio/tokio" }
-tokio-macros = { path = ".work/tokio/tokio-macros" }
+tokio = { path = ".work/tokio-compat/tokio" }
+tokio-macros = { path = ".work/tokio-compat/tokio-macros" }
 
 [patch."https://github.com/guybedford/libc"]
 libc = { path = ".work/libc" }

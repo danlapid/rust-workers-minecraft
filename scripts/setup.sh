@@ -25,7 +25,7 @@ checkout() { # name url branch commit
       exit 1
     fi
     if ! git -C "$dir" cat-file -e "$commit^{commit}" 2>/dev/null; then
-      git -C "$dir" fetch --filter=blob:none origin "$branch"
+      git -C "$dir" fetch --filter=blob:none origin "$commit"
     fi
     git -C "$dir" switch --detach "$commit"
   fi
@@ -45,9 +45,10 @@ apply_patch() {
 echo "==> Pinned dependencies"
 checkout emscripten https://github.com/guybedford/emscripten cf 21166256c4c4d73d39b3685c8973d7cbe427ce8c
 checkout wasm-bindgen https://github.com/guybedford/wasm-bindgen emscripten-non-identifier-names 4b69f3b3ba4212c857be6854f77fa5aec8b62871
-checkout tokio https://github.com/guybedford/tokio emscripten-layering 7c1d4977c510866775ed6164b58b2218a6a2955b
+checkout tokio-compat https://github.com/guybedford/tokio emscripten-layering 7c1d4977c510866775ed6164b58b2218a6a2955b
 checkout libc https://github.com/guybedford/libc libc-0.2-emscripten 4091fe0b0dc5f9c1a27bed75be1ff02bb27e756d
-checkout ring https://github.com/guybedford/ring emscripten 6671f7cfbb13f249b571ffa6326275a8596e0ca2
+checkout ring-compat https://github.com/guybedford/ring emscripten 6671f7cfbb13f249b571ffa6326275a8596e0ca2
+checkout proc-macro-error2 https://github.com/GnomedDev/proc-macro-error-2 master b02d79c49898a8f4340aaa81ebd7cae3668ac6a9
 checkout pumpkin https://github.com/Pumpkin-MC/Pumpkin master b5b9b9d7010e793806a83c495af223c67e1d35ee
 checkout workers-rs https://github.com/ThomasRubini/workers-rs connect-bindings 7db011ec97658a5d907f3e3102028ce86c044f19
 checkout wasm-streams https://github.com/MattiasBuelens/wasm-streams main 35665f7b1da830b5ac51b4c6c3ff13f5c1a09ccb
@@ -56,6 +57,9 @@ apply_patch pumpkin pumpkin-emscripten.patch
 apply_patch pumpkin pumpkin-memory.patch
 apply_patch workers-rs workers-rs-emscripten-toolchain.patch
 apply_patch wasm-streams wasm-streams-rlib.patch
+apply_patch tokio-compat tokio-atomic-update.patch
+apply_patch ring-compat ring-portable-build.patch
+apply_patch proc-macro-error2 proc-macro-error2-visibility.patch
 
 if [ "${1:-}" = --sources-only ]; then exit 0; fi
 
@@ -63,22 +67,26 @@ echo "==> Pinned Rust toolchain"
 RUST_CHANNEL="$(python3 -c 'import tomllib,sys; print(tomllib.load(open(sys.argv[1],"rb"))["toolchain"]["channel"])' "$REPO/rust-toolchain.toml")"
 rustup toolchain install "$RUST_CHANNEL" --profile minimal --target wasm32-unknown-emscripten --no-self-update
 
-echo "==> Emscripten frontend and Homebrew compiler backend"
-EM_PREFIX="$(brew --prefix emscripten)" || {
-  echo "error: install the backend with 'brew install emscripten'." >&2
-  exit 1
-}
+echo "==> Emscripten frontend and matching compiler backend"
+checkout emsdk https://github.com/emscripten-core/emsdk main c59d6e841da55c2c21af32004c4c173cbd1c0f10
+case "$(uname -s)" in
+  Darwin) sdk_os=macos ;;
+  Linux) sdk_os=linux ;;
+  *) echo "error: this setup script requires macOS or Linux." >&2; exit 1 ;;
+esac
+# This release supplies LLVM 24 and Binaryen 131, as required by the fork.
+EMSDK_OS="$sdk_os" "$WORK/emsdk/emsdk" install 6.0.6
 # Resolve NODE before entering the checkout (it may be a relative path).
 NODE_PATH="$("$NODE" -p 'process.execPath')"
 export PATH="$(dirname "$NODE_PATH"):$PATH"
 (cd "$WORK/emscripten" && npm ci --no-audit --no-fund && python3 bootstrap.py)
-python3 - "$WORK/emscripten/.emscripten_cf" "$EM_PREFIX" "$NODE_PATH" <<'PY'
+python3 - "$WORK/emscripten/.emscripten_cf" "$WORK/emsdk/upstream" "$NODE_PATH" <<'PY'
 from pathlib import Path
 import sys
 config, prefix, node = sys.argv[1:]
 Path(config).write_text(
-    f"LLVM_ROOT={prefix + '/libexec/llvm/bin'!r}\n"
-    f"BINARYEN_ROOT={prefix + '/libexec/binaryen'!r}\n"
+    f"LLVM_ROOT={prefix + '/bin'!r}\n"
+    f"BINARYEN_ROOT={prefix!r}\n"
     f"NODE_JS={node!r}\n"
 )
 PY

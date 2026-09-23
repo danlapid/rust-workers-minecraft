@@ -39,7 +39,7 @@ export function readSettings(env: Partial<Env>): ServerSettings {
   return {
     viewDistance,
     simulationDistance,
-    maxPlayers: integer('MAX_PLAYERS', 2, 1, 1000),
+    maxPlayers: integer('MAX_PLAYERS', 20, 1, 1000),
     compressionThreshold: integer('COMPRESSION_THRESHOLD', 512, -1, 2 * 1024 * 1024),
     compressionLevel: integer('COMPRESSION_LEVEL', 1, 0, 9),
     idleTimeoutSeconds: integer('IDLE_TIMEOUT_SECONDS', 10, 0, 30),

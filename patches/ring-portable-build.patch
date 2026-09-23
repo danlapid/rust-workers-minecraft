@@ -1,0 +1,346 @@
+Subject: [PATCH] Compile hardware feature helpers only on supported architectures
+
+Gate hardware-only feature detection and AES/GCM helpers on their consumers'
+architectures. Keep the portable arithmetic path and its C ABI export,
+spelling the export directly instead of calling the deprecated internal macro.
+
+Base-commit: 6671f7cfbb13f249b571ffa6326275a8596e0ca2
+
+---
+diff --git a/src/aead/aes/mod.rs b/src/aead/aes/mod.rs
+index 2f73b9f7a..c5e0fd47f 100644
+--- a/src/aead/aes/mod.rs
++++ b/src/aead/aes/mod.rs
+@@ -13,7 +13,14 @@
+ // CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+ use super::{NONCE_LEN, Overlapping, nonce::Nonce, overlapping, quic::Sample};
+-use crate::cpu::{self, GetFeature as _};
++use crate::cpu;
++#[cfg(any(
++    all(target_arch = "aarch64", target_endian = "little"),
++    all(target_arch = "arm", target_endian = "little"),
++    target_arch = "x86",
++    target_arch = "x86_64"
++))]
++use crate::cpu::GetFeature as _;
+ use core::num::NonZero;
+
+ #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+diff --git a/src/aead/aes_gcm/mod.rs b/src/aead/aes_gcm/mod.rs
+index 4517b82e3..a79446ebf 100644
+--- a/src/aead/aes_gcm/mod.rs
++++ b/src/aead/aes_gcm/mod.rs
+@@ -103,6 +103,12 @@ enum DynKey {
+
+ impl DynKey {
+     fn new(key: aes::KeyBytes, cpu: cpu::Features) -> Self {
++        #[cfg(any(
++            all(target_arch = "aarch64", target_endian = "little"),
++            all(target_arch = "arm", target_endian = "little"),
++            target_arch = "x86",
++            target_arch = "x86_64"
++        ))]
+         let cpu = cpu.values();
+
+         #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+@@ -402,6 +408,10 @@ fn open_whole_partial<A: aes::EncryptBlock, G: gcm::UpdateBlock>(
+     ))
+ }
+
++#[cfg(any(
++    all(target_arch = "aarch64", target_endian = "little"),
++    target_arch = "x86_64"
++))]
+ #[inline]
+ fn open_whole_partial_tail<A: aes::EncryptBlock, G: gcm::UpdateBlock>(
+     aes_key: &A,
+diff --git a/src/aead/gcm/ffi.rs b/src/aead/gcm/ffi.rs
+index acf0182cb..cc5abc858 100644
+--- a/src/aead/gcm/ffi.rs
++++ b/src/aead/gcm/ffi.rs
+@@ -15,7 +15,20 @@
+ #[allow(unused_imports)]
+ use crate::polyfill::prelude::*;
+
+-use crate::{bb, c, polyfill::ArraySplitMap};
++#[cfg(any(
++    all(target_arch = "aarch64", target_endian = "little"),
++    all(target_arch = "arm", target_endian = "little"),
++    target_arch = "x86",
++    target_arch = "x86_64"
++))]
++use crate::c;
++use crate::{bb, polyfill::ArraySplitMap};
++#[cfg(any(
++    all(target_arch = "aarch64", target_endian = "little"),
++    all(target_arch = "arm", target_endian = "little"),
++    target_arch = "x86",
++    target_arch = "x86_64"
++))]
+ use core::num::NonZero;
+
+ pub(in super::super) const BLOCK_LEN: usize = 16;
+@@ -35,6 +48,12 @@ impl KeyValue {
+     }
+ }
+
++#[cfg(any(
++    all(target_arch = "aarch64", target_endian = "little"),
++    all(target_arch = "arm", target_endian = "little"),
++    target_arch = "x86",
++    target_arch = "x86_64"
++))]
+ pub(super) fn with_non_dangling_ptr(
+     input: &[[u8; BLOCK_LEN]],
+     f: impl FnOnce(*const u8, NonZero<c::size_t>),
+diff --git a/src/arithmetic/ffi.rs b/src/arithmetic/ffi.rs
+index efbaa5e3c..64d7979c3 100644
+--- a/src/arithmetic/ffi.rs
++++ b/src/arithmetic/ffi.rs
+@@ -44,6 +44,12 @@ const _MAX_LIMBS_ADDRESSES_MEMORY_SAFETY_ISSUES: () = {
+     assert!(MAX_LIMBS <= usize_from_u32(u32::MAX));
+ };
+
++#[cfg(any(
++    all(target_arch = "aarch64", target_endian = "little"),
++    all(target_arch = "arm", target_endian = "little"),
++    target_arch = "x86",
++    target_arch = "x86_64"
++))]
+ macro_rules! bn_mul_mont_ffi {
+     ( $in_out:expr, $n:expr, $n0:expr, $cpu:expr,
+       unsafe { ($MIN_LEN:expr, $MOD_LEN:expr, $Cpu:ty) => $f:ident }) => {{
+diff --git a/src/arithmetic/limbs/fallback/mont.rs b/src/arithmetic/limbs/fallback/mont.rs
+index e45e6735f..ec5e6b98d 100644
+--- a/src/arithmetic/limbs/fallback/mont.rs
++++ b/src/arithmetic/limbs/fallback/mont.rs
+@@ -51,19 +51,18 @@ cfg_if! {
+             all(target_arch = "x86", target_feature = "sse2"),
+             target_arch = "x86_64")))] {
+         // TODO: Stop calling this from C and un-export it.
+-        prefixed_export! {
+-            #[cfg_attr(target_arch = "x86", cold)]
+-            #[cfg_attr(target_arch = "x86", inline(never))]
+-            unsafe extern "C" fn bn_mul_mont_fallback(
+-                r: *mut Limb,
+-                a: *const Limb,
+-                b: *const Limb,
+-                n: *const Limb,
+-                n0: N0<'_>,
+-                num_limbs: NonZero<c::size_t>,
+-            ) {
+-                unsafe { bn_mul_mont_fallback_impl(r, a, b, n, n0, num_limbs) }
+-            }
++        #[unsafe(export_name = concat!(prefix!(), "bn_mul_mont_fallback"))]
++        #[cfg_attr(target_arch = "x86", cold)]
++        #[cfg_attr(target_arch = "x86", inline(never))]
++        unsafe extern "C" fn bn_mul_mont_fallback(
++            r: *mut Limb,
++            a: *const Limb,
++            b: *const Limb,
++            n: *const Limb,
++            n0: N0<'_>,
++            num_limbs: NonZero<c::size_t>,
++        ) {
++            unsafe { bn_mul_mont_fallback_impl(r, a, b, n, n0, num_limbs) }
+         }
+     } else {
+         use bn_mul_mont_fallback_impl as bn_mul_mont_fallback;
+diff --git a/src/arithmetic/montgomery.rs b/src/arithmetic/montgomery.rs
+index a578e9dd8..27b873797 100644
+--- a/src/arithmetic/montgomery.rs
++++ b/src/arithmetic/montgomery.rs
+@@ -178,6 +178,7 @@ pub(super) fn limbs_mul_mont<'o>(
+                 (MIN_LIMBS, MOD_FALLBACK, ()) => bn_mul_mont_sse2
+             })
+         } else {
++            let _ = cpu;
+             super::limbs::fallback::mont::limbs_mul_mont(in_out, n, n0)
+         }
+     }
+diff --git a/src/cpu/mod.rs b/src/cpu/mod.rs
+index ae10864d5..3f9cba059 100644
+--- a/src/cpu/mod.rs
++++ b/src/cpu/mod.rs
+@@ -15,6 +15,12 @@
+ pub(crate) use self::features::Features;
+ use core::mem::size_of;
+
++#[cfg(any(
++    all(target_arch = "aarch64", target_endian = "little"),
++    all(target_arch = "arm", target_endian = "little"),
++    target_arch = "x86",
++    target_arch = "x86_64"
++))]
+ macro_rules! impl_get_feature {
+     {
+           $( $( #[$meta:meta] )* $Name:ident , )+
+@@ -73,10 +79,22 @@ macro_rules! impl_get_feature {
+     }
+ }
+
++#[cfg(any(
++    all(target_arch = "aarch64", target_endian = "little"),
++    all(target_arch = "arm", target_endian = "little"),
++    target_arch = "x86",
++    target_arch = "x86_64"
++))]
+ pub(crate) trait GetFeature<T> {
+     fn get_feature(&self) -> Option<T>;
+ }
+
++#[cfg(any(
++    all(target_arch = "aarch64", target_endian = "little"),
++    all(target_arch = "arm", target_endian = "little"),
++    target_arch = "x86",
++    target_arch = "x86_64"
++))]
+ impl GetFeature<()> for features::Values {
+     #[inline(always)]
+     fn get_feature(&self) -> Option<()> {
+@@ -84,6 +102,12 @@ impl GetFeature<()> for features::Values {
+     }
+ }
+
++#[cfg(any(
++    all(target_arch = "aarch64", target_endian = "little"),
++    all(target_arch = "arm", target_endian = "little"),
++    target_arch = "x86",
++    target_arch = "x86_64"
++))]
+ impl<A, B> GetFeature<(A, B)> for features::Values
+ where
+     features::Values: GetFeature<A>,
+@@ -98,6 +122,12 @@ where
+     }
+ }
+
++#[cfg(any(
++    all(target_arch = "aarch64", target_endian = "little"),
++    all(target_arch = "arm", target_endian = "little"),
++    target_arch = "x86",
++    target_arch = "x86_64"
++))]
+ impl<A, B, C> GetFeature<(A, B, C)> for features::Values
+ where
+     features::Values: GetFeature<A>,
+@@ -113,6 +143,12 @@ where
+     }
+ }
+
++#[cfg(any(
++    all(target_arch = "aarch64", target_endian = "little"),
++    all(target_arch = "arm", target_endian = "little"),
++    target_arch = "x86",
++    target_arch = "x86_64"
++))]
+ impl<F> GetFeature<F> for Features
+ where
+     features::Values: GetFeature<F>,
+@@ -137,6 +173,12 @@ mod features {
+     #[derive(Copy, Clone)]
+     pub(crate) struct Features(NotSend);
+
++    #[cfg(any(
++        all(target_arch = "aarch64", target_endian = "little"),
++        all(target_arch = "arm", target_endian = "little"),
++        target_arch = "x86",
++        target_arch = "x86_64"
++    ))]
+     impl Features {
+         pub fn values(self) -> Values {
+             Values {
+@@ -165,11 +207,23 @@ mod features {
+         }
+     }
+
++    #[cfg(any(
++        all(target_arch = "aarch64", target_endian = "little"),
++        all(target_arch = "arm", target_endian = "little"),
++        target_arch = "x86",
++        target_arch = "x86_64"
++    ))]
+     pub struct Values {
+         values: u32,
+         cpu: Features,
+     }
+
++    #[cfg(any(
++        all(target_arch = "aarch64", target_endian = "little"),
++        all(target_arch = "arm", target_endian = "little"),
++        target_arch = "x86",
++        target_arch = "x86_64"
++    ))]
+     impl Values {
+         #[inline(always)]
+         pub(super) fn values(&self) -> u32 {
+@@ -212,19 +266,40 @@ cfg_if::cfg_if! {
+                 Features::new_no_features_to_detect()
+             }
+
++            #[cfg(test)]
+             #[inline(always)]
+             pub(super) fn get(_cpu_features: Features) -> u32 {
+                 STATIC_DETECTED
+             }
+
++            #[cfg(test)]
+             pub(super) const STATIC_DETECTED: u32 = 0;
++            #[cfg(test)]
+             pub(super) const FORCE_DYNAMIC_DETECTION: u32 = 0;
+         }
+     }
+ }
+
++#[cfg(any(
++    test,
++    any(
++        all(target_arch = "aarch64", target_endian = "little"),
++        all(target_arch = "arm", target_endian = "little"),
++        target_arch = "x86",
++        target_arch = "x86_64"
++    )
++))]
+ const CAPS_STATIC: u32 = featureflags::STATIC_DETECTED & !featureflags::FORCE_DYNAMIC_DETECTION;
+
++#[cfg(any(
++    test,
++    any(
++        all(target_arch = "aarch64", target_endian = "little"),
++        all(target_arch = "arm", target_endian = "little"),
++        target_arch = "x86",
++        target_arch = "x86_64"
++    )
++))]
+ #[allow(clippy::assertions_on_constants, clippy::bad_bit_mask)]
+ const _FORCE_DYNAMIC_DETECTION_HONORED: () =
+     assert!((CAPS_STATIC & featureflags::FORCE_DYNAMIC_DETECTION) == 0);
+diff --git a/src/prefixed.rs b/src/prefixed.rs
+index 14e3785c6..d42dd3c21 100644
+--- a/src/prefixed.rs
++++ b/src/prefixed.rs
+@@ -52,23 +52,3 @@ macro_rules! prefixed_extern {
+         }
+     };
+ }
+-
+-#[deprecated = "`#[export_name]` creates problems and we will stop doing it."]
+-#[cfg(not(any(
+-    all(target_arch = "aarch64", target_endian = "little"),
+-    all(target_arch = "arm", target_endian = "little"),
+-    target_arch = "x86",
+-    target_arch = "x86_64"
+-)))]
+-macro_rules! prefixed_export {
+-    // A function.
+-    {
+-        $( #[$meta:meta] )*
+-        $vis:vis unsafe extern "C" fn
+-        $name:ident ( $( $arg_pat:ident : $arg_ty:ty ),* $(,)? ) $body:block
+-    } => {
+-        $( #[$meta] )*
+-        #[unsafe(export_name = concat!(prefix!(), stringify!($name)))]
+-        $vis unsafe extern "C" fn $name ( $( $arg_pat : $arg_ty ),* ) $body
+-    };
+-}

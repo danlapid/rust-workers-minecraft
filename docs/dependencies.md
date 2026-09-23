@@ -8,10 +8,12 @@ are ignored under `.work/`. Both Cargo and npm dependency graphs are locked.
 | Component | Source / branch | Commit | Local changes or purpose |
 | --- | --- | --- | --- |
 | emscripten | [cf](https://github.com/guybedford/emscripten) | `21166256c4c4d73d39b3685c8973d7cbe427ce8c` | Fork frontend: epoll, JSPI, wasm-bindgen post-link |
+| emsdk | [main](https://github.com/emscripten-core/emsdk) | `c59d6e841da55c2c21af32004c4c173cbd1c0f10` | Installs the 6.0.6 backend: LLVM 24 and Binaryen 131 |
 | wasm-bindgen | [emscripten-non-identifier-names](https://github.com/guybedford/wasm-bindgen) | `4b69f3b3ba4212c857be6854f77fa5aec8b62871` | Closure-finalizer string escaping |
-| tokio | [emscripten-layering](https://github.com/guybedford/tokio) | `7c1d4977c510866775ed6164b58b2218a6a2955b` | HostedRuntime and normal Tokio TCP/UDP APIs; unmodified |
+| tokio | [emscripten-layering](https://github.com/guybedford/tokio) | `7c1d4977c510866775ed6164b58b2218a6a2955b` | HostedRuntime and normal Tokio TCP/UDP APIs; atomic API compatibility in `.work/tokio-compat` |
 | libc | [libc-0.2-emscripten](https://github.com/guybedford/libc) | `4091fe0b0dc5f9c1a27bed75be1ff02bb27e756d` | Emscripten epoll and socket support; unmodified |
-| ring | [emscripten](https://github.com/guybedford/ring) | `6671f7cfbb13f249b571ffa6326275a8596e0ca2` | Portable Emscripten crypto backend; unmodified |
+| ring | [emscripten](https://github.com/guybedford/ring) | `6671f7cfbb13f249b571ffa6326275a8596e0ca2` | Portable Emscripten crypto backend; architecture-specific helper gates in `.work/ring-compat` |
+| proc-macro-error2 | [master](https://github.com/GnomedDev/proc-macro-error-2) | `b02d79c49898a8f4340aaa81ebd7cae3668ac6a9` | Correct visibility of the publicly re-exported `proc_macro` crate |
 | pumpkin | [master](https://github.com/Pumpkin-MC/Pumpkin) | `b5b9b9d7010e793806a83c495af223c67e1d35ee` | Headless embedding, shared async scheduler and checkpoint barriers, compact templates/generation chunks, and build-script fixes |
 | workers-rs | [connect-bindings](https://github.com/ThomasRubini/workers-rs) | `7db011ec97658a5d907f3e3102028ce86c044f19` | TCP ingress PR #1041; pinned ABI, Emscripten Tokio promise adapter, host-owned initialization, and socket shutdown flushing |
 | wasm-streams | [v0.6.0](https://github.com/MattiasBuelens/wasm-streams) | `35665f7b1da830b5ac51b4c6c3ff13f5c1a09ccb` | Build only the Rust library; its standalone `cdylib` is incompatible with static Emscripten linking |
@@ -41,12 +43,19 @@ the host CLI graph, since that upstream workspace does not commit a lockfile.
 - Rust: `nightly-2026-07-20`, target `wasm32-unknown-emscripten`; setup installs both through rustup.
 - Node: 24+; 26 recommended and selected in CI. Used for build tools and tests.
 - Python: 3.11+ (Emscripten scripts and TOML parsing).
-- Backend: Homebrew `emscripten`, detected with `brew --prefix emscripten`.
-  Homebrew backend versions are external prerequisites, not pinned source files.
+- Backend: emsdk 6.0.6, release `833aa203ba2283fc2b6adb504a79a3a0d692df81`,
+  installed under `.work/emsdk/upstream`. Its LLVM 24 and Binaryen 131 match the
+  frontend's required versions.
 
-Setup deliberately uses the fork frontend with Homebrew's LLVM/binaryen backend;
-emsdk is not needed. It writes a machine-local `.emscripten_cf`, builds wasm-bindgen
-explicitly for the host target, and places the CLI in `.work/bin/`.
+Setup uses the fork frontend with the pinned emsdk backend. It writes a
+machine-local `.emscripten_cf`, builds wasm-bindgen explicitly for the host target,
+and places the CLI in `.work/bin/`. It does not activate emsdk globally or change
+the shell's Node selection. Run setup again when upgrading an older checkout
+that used the Homebrew backend.
+
+Tokio and Ring use separate `-compat` checkouts for the maintained compiler
+compatibility patches. Existing unpatched `.work/tokio` and `.work/ring` sources
+are left intact.
 
 ## Updating a patch
 
@@ -72,6 +81,9 @@ git -C .work/pumpkin diff b5b9b9d7010e793806a83c495af223c67e1d35ee -- \
 git -C .work/wasm-bindgen diff 4b69f3b3ba4212c857be6854f77fa5aec8b62871 -- crates/cli-support/src/js/mod.rs > .work/wasm-bindgen-emscripten-closures.diff
 git -C .work/workers-rs diff 7db011ec97658a5d907f3e3102028ce86c044f19 > .work/workers-rs-emscripten-toolchain.diff
 git -C .work/wasm-streams diff 35665f7b1da830b5ac51b4c6c3ff13f5c1a09ccb > .work/wasm-streams-rlib.diff
+git -C .work/tokio-compat diff 7c1d4977c510866775ed6164b58b2218a6a2955b -- . ':(exclude)Cargo.lock' > .work/tokio-atomic-update.diff
+git -C .work/ring-compat diff 6671f7cfbb13f249b571ffa6326275a8596e0ca2 -- . ':(exclude)Cargo.lock' > .work/ring-portable-build.diff
+git -C .work/proc-macro-error2 diff b02d79c49898a8f4340aaa81ebd7cae3668ac6a9 -- . ':(exclude)Cargo.lock' > .work/proc-macro-error2-visibility.diff
 ```
 
 Replace the corresponding patch's contents from its first `diff --git` line onward

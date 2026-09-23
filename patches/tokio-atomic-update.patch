@@ -1,0 +1,34 @@
+Subject: [PATCH] Use the current atomic update API with the pinned Rust toolchain
+
+Use AtomicUsize::try_update, retaining fetch_update for Loom's simulated
+atomic type. The update closure and memory orderings are unchanged.
+
+Base-commit: 7c1d4977c510866775ed6164b58b2218a6a2955b
+
+---
+diff --git a/tokio/src/runtime/io/scheduled_io.rs b/tokio/src/runtime/io/scheduled_io.rs
+index 47e5e24a..c72c67c9 100644
+--- a/tokio/src/runtime/io/scheduled_io.rs
++++ b/tokio/src/runtime/io/scheduled_io.rs
+@@ -205,7 +205,7 @@ impl ScheduledIo {
+     /// - `f`: a closure returning a new readiness value given the previous
+     ///   readiness.
+     pub(super) fn set_readiness(&self, tick_op: Tick, f: impl Fn(Ready) -> Ready) -> Ready {
+-        let prev = self.readiness.fetch_update(AcqRel, Acquire, |curr| {
++        let update = |curr| {
+             // If the io driver is shut down, then you are only allowed to clear readiness.
+             debug_assert!(SHUTDOWN.unpack(curr) == 0 || matches!(tick_op, Tick::Clear(_)));
+
+@@ -220,7 +220,11 @@ impl ScheduledIo {
+             };
+             let ready = Ready::from_usize(READINESS.unpack(curr));
+             Some(TICK.pack(new_tick, f(ready).as_usize()))
+-        });
++        };
++        #[cfg(loom)]
++        let prev = self.readiness.fetch_update(AcqRel, Acquire, update);
++        #[cfg(not(loom))]
++        let prev = self.readiness.try_update(AcqRel, Acquire, update);
+         let prev = match prev {
+             Ok(prev) | Err(prev) => prev,
+         };
