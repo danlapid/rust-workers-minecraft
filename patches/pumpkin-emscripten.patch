@@ -27,6 +27,12 @@ paths do not invalidate Cargo's cache on every build. The application
 Cargo.lock supplies the embedded dependency resolution; Pumpkin's lockfile
 is excluded from this patch.
 
+Reserve outgoing chunk batches by bytes and queue slots before marking them
+sent. Keep backpressured chunks pending, release framed packet data promptly,
+and preserve batch ordering for asynchronous resends. Release idle generation
+graph allocations once no task holds a key. Keep imports and helpers behind
+the same feature gates as their consumers so headless builds compile cleanly.
+
 Base-commit: b5b9b9d7010e793806a83c495af223c67e1d35ee
 
 ---
@@ -295,7 +301,7 @@ index f670ad37..b9d9a867 100644
  )>;
  
 diff --git a/crates/pumpkin-world/src/chunk_system/schedule.rs b/crates/pumpkin-world/src/chunk_system/schedule.rs
-index 145e15de..0d388726 100644
+index 145e15de..eca8ecde 100644
 --- a/crates/pumpkin-world/src/chunk_system/schedule.rs
 +++ b/crates/pumpkin-world/src/chunk_system/schedule.rs
 @@ -69,13 +69,14 @@ pub struct GenerationSchedule {
@@ -474,18 +480,36 @@ index 145e15de..0d388726 100644
          let mut chunks = Vec::with_capacity(self.chunk_map.len());
  
          for (pos, holder) in &mut self.chunk_map {
-@@ -969,9 +987,7 @@ impl GenerationSchedule {
+@@ -969,9 +987,26 @@ impl GenerationSchedule {
          }
          drop(data);
  
 -        if let Err(e) = self.io_write.blocking_send(chunks) {
 -            error!("Failed to send chunks to io write thread: {:?}", e);
--        }
 +        permit.send(chunks);
++    }
++
++    /// SlotMap retains its largest backing arrays after tasks finish. When no
++    /// task can hold a key, release those arrays and remove all stale holder keys.
++    fn release_idle_graph(&mut self) {
++        if self.running_task_count != 0
++            || !self.graph.nodes.is_empty()
++            || !self.queue.is_empty()
++            || !self.waiting_for_chunks.is_empty()
++            || (self.graph.nodes.capacity() < 4096 && self.graph.edges.capacity() < 8192)
++        {
++            return;
++        }
++        for holder in self.chunk_map.values_mut() {
++            holder.tasks.fill(NodeKey::null());
++            holder.occupied = NodeKey::null();
++            holder.occupied_by = EdgeKey::null();
+         }
++        self.graph = DAG::default();
      }
  
      fn drop_node(&mut self, node: NodeKey) {
-@@ -1254,25 +1270,22 @@ impl GenerationSchedule {
+@@ -1254,25 +1289,22 @@ impl GenerationSchedule {
      }
  
      #[expect(clippy::too_many_lines)]
@@ -518,7 +542,7 @@ index 145e15de..0d388726 100644
                  break;
              }
  
-@@ -1287,7 +1300,7 @@ impl GenerationSchedule {
+@@ -1287,7 +1319,7 @@ impl GenerationSchedule {
              // is what puts stale dependency holders into the queue in the first place.
              if self.last_unload.elapsed() >= std::time::Duration::from_secs(1) {
                  self.garbage_collect_dependencies();
@@ -527,7 +551,7 @@ index 145e15de..0d388726 100644
                  self.last_unload = std::time::Instant::now();
              }
  
-@@ -1308,7 +1321,7 @@ impl GenerationSchedule {
+@@ -1308,7 +1340,7 @@ impl GenerationSchedule {
                  if level.shut_down_chunk_system.load(Relaxed) {
                      self.queue.push(task);
                      info!("Shutdown detected during task processing, saving chunks...");
@@ -536,7 +560,7 @@ index 145e15de..0d388726 100644
                      break 'out2;
                  }
  
-@@ -1400,11 +1413,12 @@ impl GenerationSchedule {
+@@ -1400,11 +1432,12 @@ impl GenerationSchedule {
                          if io_batch.len() >= 16
                              && self
                                  .io_read
@@ -551,7 +575,7 @@ index 145e15de..0d388726 100644
                              break 'out2;
                          }
                      } else {
-@@ -1412,11 +1426,12 @@ impl GenerationSchedule {
+@@ -1412,11 +1445,12 @@ impl GenerationSchedule {
                          if !io_batch.is_empty()
                              && self
                                  .io_read
@@ -566,7 +590,7 @@ index 145e15de..0d388726 100644
                              break 'out2;
                          }
  
-@@ -1552,12 +1567,16 @@ impl GenerationSchedule {
+@@ -1552,12 +1586,16 @@ impl GenerationSchedule {
                          let send_chunk = self.send_chunk.clone();
                          let level = level.clone();
  
@@ -585,7 +609,7 @@ index 145e15de..0d388726 100644
                      }
                  }
              }
-@@ -1566,82 +1585,39 @@ impl GenerationSchedule {
+@@ -1566,82 +1604,40 @@ impl GenerationSchedule {
              if !io_batch.is_empty()
                  && self
                      .io_read
@@ -658,6 +682,7 @@ index 145e15de..0d388726 100644
 -                if self.queue_dirty {
 -                    self.sort_queue();
 -                    self.queue_dirty = false;
++                    self.release_idle_graph();
                  }
 -            } else if self.running_task_count >= self.max_in_flight {
 -                // Queue has tasks, but we are at maximum in-flight capacity.
@@ -691,7 +716,7 @@ index 145e15de..0d388726 100644
                  }
              }
          }
-@@ -1649,24 +1625,10 @@ impl GenerationSchedule {
+@@ -1649,24 +1645,10 @@ impl GenerationSchedule {
              "schedule: waiting for {} generation tasks to finish",
              self.running_task_count
          );
@@ -720,7 +745,7 @@ index 145e15de..0d388726 100644
  
          if self.running_task_count > 0 {
              warn!(
-@@ -1716,6 +1678,15 @@ impl GenerationSchedule {
+@@ -1716,6 +1698,15 @@ impl GenerationSchedule {
          self.graph.edges.clear();
      }
  
@@ -736,7 +761,7 @@ index 145e15de..0d388726 100644
      fn debug_check(&self) -> bool {
          if !self.graph.nodes.is_empty() {
              for (key, value) in &self.graph.nodes {
-@@ -1746,3 +1717,123 @@ impl GenerationSchedule {
+@@ -1746,3 +1737,160 @@ impl GenerationSchedule {
          true
      }
  }
@@ -799,6 +824,43 @@ index 145e15de..0d388726 100644
 +            },
 +            receiver,
 +        )
++    }
++
++    #[test]
++    fn idle_graph_release_clears_stale_keys_and_never_drops_live_tasks() {
++        let (mut scheduler, _receiver) = scheduler();
++        let pos = ChunkPos::new(0, 0);
++        let node = scheduler
++            .graph
++            .nodes
++            .insert(Node::new(pos, StagedChunkEnum::Noise));
++        scheduler.graph.nodes.reserve(8192);
++        scheduler.graph.edges.reserve(16384);
++        let edge = scheduler
++            .graph
++            .edges
++            .insert(super::super::dag::Edge::new(node, EdgeKey::null()));
++        let mut holder = ChunkHolder {
++            chunk: Some(chunk(StagedChunkEnum::Biomes)),
++            occupied_by: edge,
++            ..ChunkHolder::default()
++        };
++        holder.tasks[StagedChunkEnum::Noise as usize] = node;
++        scheduler.chunk_map.insert(pos, holder);
++        scheduler.release_idle_graph();
++        assert!(scheduler.graph.nodes.contains_key(node));
++        scheduler.graph.nodes.remove(node);
++        scheduler.running_task_count = 1;
++        scheduler.release_idle_graph();
++        assert!(scheduler.graph.edges.contains_key(edge));
++        scheduler.running_task_count = 0;
++        scheduler.release_idle_graph();
++        assert!(scheduler.graph.nodes.capacity() < 4096);
++        assert!(scheduler.graph.edges.is_empty());
++        let holder = &scheduler.chunk_map[&pos];
++        assert!(holder.tasks.iter().all(Key::is_null));
++        assert!(holder.occupied_by.is_null());
++        assert!(holder.chunk.is_some());
 +    }
 +
 +    #[tokio::test]
@@ -874,10 +936,31 @@ index b50ac05c..281fa41f 100644
      lock: IOLock,
  ) {
 diff --git a/crates/pumpkin-world/src/level.rs b/crates/pumpkin-world/src/level.rs
-index fbc69749..533b09d2 100644
+index fbc69749..52fe29fb 100644
 --- a/crates/pumpkin-world/src/level.rs
 +++ b/crates/pumpkin-world/src/level.rs
-@@ -316,7 +316,7 @@ impl Level {
+@@ -28,15 +28,19 @@ use pumpkin_util::math::{position::BlockPos, vector2::Vector2};
+ use pumpkin_util::world_seed::Seed;
+ use rustc_hash::FxHashSet;
+ use std::sync::{Arc, Mutex, Weak};
++#[cfg(not(feature = "single-threaded"))]
+ use std::time::Duration;
+ use std::{
+     path::PathBuf,
+     sync::atomic::{AtomicBool, AtomicU64, Ordering},
+     thread,
+ };
++#[cfg(not(feature = "single-threaded"))]
+ use tokio::time::timeout;
+ use tokio_util::sync::CancellationToken;
+-use tracing::{debug, error, info, trace, warn};
++#[cfg(not(feature = "single-threaded"))]
++use tracing::warn;
++use tracing::{debug, error, info, trace};
+ // use tokio::runtime::Handle;
+ use tokio::{
+     select,
+@@ -316,7 +320,7 @@ impl Level {
  
      pub fn spawn_entity_generation(self: &Arc<Self>, pos: Vector2<i32>) {
          let level = self.clone();
@@ -886,7 +969,7 @@ index fbc69749..533b09d2 100644
              let arc_chunk = Arc::new(ChunkEntityData {
                  x: pos.x,
                  z: pos.y,
-@@ -354,43 +354,46 @@ impl Level {
+@@ -354,43 +358,46 @@ impl Level {
          self.tasks.close();
          self.chunk_system_tasks.close();
  
@@ -1135,7 +1218,7 @@ index 5314180a..a6accb81 100644
      println!("cargo::rustc-env=GIT_HASH_FULL={git_hash_full}");
  }
 diff --git a/crates/pumpkin/src/command/commands/pumpkin.rs b/crates/pumpkin/src/command/commands/pumpkin.rs
-index 0045511a..9586e5dc 100644
+index 0045511a..326c0c64 100644
 --- a/crates/pumpkin/src/command/commands/pumpkin.rs
 +++ b/crates/pumpkin/src/command/commands/pumpkin.rs
 @@ -56,6 +56,7 @@ fn fetch_all_contributors_cached() -> Vec<Contributor> {
@@ -1156,7 +1239,63 @@ index 0045511a..9586e5dc 100644
  
      if !contributors.is_empty() {
          if let Ok(mut guard) = CONTRIBUTORS_CACHE.lock() {
-@@ -251,6 +255,7 @@ fn fetch_donators_hover_cached() -> TextComponent {
+@@ -80,6 +84,7 @@ fn fetch_all_contributors_cached() -> Vec<Contributor> {
+     contributors
+ }
+ 
++#[cfg(not(feature = "single-threaded"))]
+ async fn fetch_all_contributors() -> Vec<Contributor> {
+     let client = pumpkin_util::client_builder()
+         .user_agent("Pumpkin-MC")
+@@ -121,6 +126,7 @@ async fn fetch_all_contributors() -> Vec<Contributor> {
+     all_contributors
+ }
+ 
++#[cfg(not(feature = "single-threaded"))]
+ fn extract_next_url(header: &str) -> Option<String> {
+     header
+         .split(',')
+@@ -132,6 +138,7 @@ fn extract_next_url(header: &str) -> Option<String> {
+         })
+ }
+ 
++#[cfg(not(feature = "single-threaded"))]
+ #[derive(Deserialize)]
+ struct Donator {
+     name: String,
+@@ -139,6 +146,7 @@ struct Donator {
+     tier_slug: String,
+ }
+ 
++#[cfg(not(feature = "single-threaded"))]
+ #[derive(Deserialize)]
+ struct DonatorResponse {
+     current: Vec<Donator>,
+@@ -146,6 +154,7 @@ struct DonatorResponse {
+     past: Vec<Donator>,
+ }
+ 
++#[cfg(not(feature = "single-threaded"))]
+ fn tier_priority(tier_slug: &str, tier_name: &str) -> u32 {
+     let s = format!("{tier_slug} {tier_name}").to_lowercase();
+ 
+@@ -174,6 +183,7 @@ fn tier_priority(tier_slug: &str, tier_name: &str) -> u32 {
+     }
+ }
+ 
++#[cfg(not(feature = "single-threaded"))]
+ fn tier_color(tier_slug: &str, tier_name: &str) -> NamedColor {
+     let s = format!("{tier_slug} {tier_name}").to_lowercase();
+ 
+@@ -194,6 +204,7 @@ fn tier_color(tier_slug: &str, tier_name: &str) -> NamedColor {
+     }
+ }
+ 
++#[cfg(not(feature = "single-threaded"))]
+ async fn fetch_donators_hover() -> TextComponent {
+     let url = "https://market.pumpkinmc.org/api/v1/rest/donators";
+     let client = pumpkin_util::client_builder()
+@@ -251,6 +262,7 @@ fn fetch_donators_hover_cached() -> TextComponent {
          return cache.data.clone();
      }
  
@@ -1164,7 +1303,7 @@ index 0045511a..9586e5dc 100644
      let donators = tokio::runtime::Handle::try_current().map_or_else(
          |_| {
              tokio::runtime::Runtime::new().map_or_else(
-@@ -260,6 +265,8 @@ fn fetch_donators_hover_cached() -> TextComponent {
+@@ -260,6 +272,8 @@ fn fetch_donators_hover_cached() -> TextComponent {
          },
          |handle| tokio::task::block_in_place(|| handle.block_on(fetch_donators_hover())),
      );
@@ -1174,18 +1313,20 @@ index 0045511a..9586e5dc 100644
      if let Ok(mut guard) = DONATORS_CACHE.lock() {
          *guard = Some(DonatorCache {
 diff --git a/crates/pumpkin/src/crash.rs b/crates/pumpkin/src/crash.rs
-index 6f88670e..9969598c 100644
+index 6f88670e..0fc4b3a1 100644
 --- a/crates/pumpkin/src/crash.rs
 +++ b/crates/pumpkin/src/crash.rs
-@@ -13,6 +13,7 @@ use pumpkin_util::text::{
+@@ -12,7 +12,9 @@ use pumpkin_util::text::{
+     color::{Color, NamedColor},
  };
  use pumpkin_world::CURRENT_MC_VERSION;
++#[cfg(feature = "crash-report")]
  use rustc_hash::FxHashMap;
 +#[cfg(feature = "crash-report")]
  use sysinfo::{Cpu, System};
  use time::OffsetDateTime;
  use tracing::error;
-@@ -206,6 +207,7 @@ impl CrashReport {
+@@ -206,6 +208,7 @@ impl CrashReport {
              rustc_version_runtime::version()
          );
  
@@ -1193,7 +1334,7 @@ index 6f88670e..9969598c 100644
          if sysinfo::IS_SUPPORTED_SYSTEM {
              writeln_output!(&mut output, "\n--- System Details ---");
  
-@@ -243,6 +245,7 @@ impl CrashReport {
+@@ -243,6 +246,7 @@ impl CrashReport {
          output
      }
  
@@ -1241,44 +1382,88 @@ index 7d64f9b1..ca28e83b 100644
                      let Some(entity_arc) = world_clone.get_entity_by_id(entity_id) else {
                          return;
 diff --git a/crates/pumpkin/src/entity/player.rs b/crates/pumpkin/src/entity/player.rs
-index a19825bc..45d6783e 100644
+index a19825bc..ec620557 100644
 --- a/crates/pumpkin/src/entity/player.rs
 +++ b/crates/pumpkin/src/entity/player.rs
-@@ -572,6 +572,7 @@ impl Player {
-             .and_then(|m| m.model.as_deref())
-             .is_some_and(|model| model == "slim");
+@@ -523,26 +523,33 @@ pub struct Player {
+     pub inbound_packets: SegQueue<RawPacket>,
+ }
  
-+        #[cfg(not(feature = "single-threaded"))]
-         let bytes = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-             tokio::task::block_in_place(|| {
-                 handle.block_on(async {
-@@ -585,6 +586,13 @@ impl Player {
-                 client.get(&url).send().await.ok()?.bytes().await.ok()
-             })?
-         };
-+        // Emscripten: no sync-blocking HTTP from the single-thread runtime; skip the
-+        // skin fetch (players still join, just without a fetched skin texture).
-+        #[cfg(feature = "single-threaded")]
-+        let bytes: Vec<u8> = {
-+            let _ = &url;
-+            return None;
-+        };
-         let img = image::load_from_memory(&bytes).ok()?;
++#[cfg(not(feature = "single-threaded"))]
+ use base64::prelude::*;
+ use pumpkin_protocol::Property;
++#[cfg(not(feature = "single-threaded"))]
+ use serde::Deserialize;
  
-         let width = img.width();
-@@ -2583,6 +2591,7 @@ impl Player {
-             sender.prepare_batch(&world.level, player_chunk, epoch, version)
-         });
+ // Bit masks for the Java skin pixels that Bedrock requires to be opaque.
+ // Adapted from Geyser's SkinProvider under the MIT License.
++#[cfg(not(feature = "single-threaded"))]
+ const SKIN_OPAQUE_MASK: &str = "AP//AAAAAAAA//8AAAAAAAD//wAAAAAAAP//AAAAAAAA//8AAAAAAAD//wAAAAAAAP//AAAAAAAA//8AAAAAAP////8AAAAA/////wAAAAD/////AAAAAP////8AAAAA/////wAAAAD/////AAAAAP////8AAAAA/////wAAAADwD/D/D/8AAPAP8P8P/wAA8A/w/w//AADwD/D/D/8AAP///////w8A////////DwD///////8PAP///////w8A////////DwD///////8PAP///////w8A////////DwD///////8PAP///////w8A////////DwD///////8PAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADwD/APAAAAAPAP8A8AAAAA8A/wDwAAAADwD/APAAAAAP////8AAAAA/////wAAAAD/////AAAAAP////8AAAAA/////wAAAAD/////AAAAAP////8AAAAA/////wAAAAD/////AAAAAP////8AAAAA/////wAAAAD/////AAA=";
++#[cfg(not(feature = "single-threaded"))]
+ const LEGACY_SKIN_OPAQUE_MASK: &str = "AP//AAAAAAAA//8AAAAAAAD//wAAAAAAAP//AAAAAAAA//8AAAAAAAD//wAAAAAAAP//AAAAAAAA//8AAAAAAP////8AAAAA/////wAAAAD/////AAAAAP////8AAAAA/////wAAAAD/////AAAAAP////8AAAAA/////wAAAADwD/D/D/APAPAP8P8P8A8A8A/w/w/wDwDwD/D/D/APAP////////8A/////////wD/////////AP////////8A/////////wD/////////AP////////8A/////////wD/////////AP////////8A/////////wD/////////AA==";
  
++#[cfg(not(feature = "single-threaded"))]
+ #[derive(Deserialize)]
+ struct TexturesProperty {
+     textures: Textures,
+ }
+ 
++#[cfg(not(feature = "single-threaded"))]
+ #[derive(Deserialize)]
+ struct Textures {
+     #[serde(rename = "SKIN")]
+     skin: Option<SkinTexture>,
+ }
+ 
++#[cfg(not(feature = "single-threaded"))]
+ #[derive(Deserialize)]
+ struct SkinTexture {
+     url: String,
+@@ -550,6 +557,7 @@ struct SkinTexture {
+     metadata: Option<SkinMetadata>,
+ }
+ 
++#[cfg(not(feature = "single-threaded"))]
+ #[derive(Deserialize)]
+ struct SkinMetadata {
+     #[serde(default)]
+@@ -557,6 +565,14 @@ struct SkinMetadata {
+ }
+ 
+ impl Player {
++    #[cfg(feature = "single-threaded")]
++    #[must_use]
++    pub fn fetch_skin(_properties: &[Property]) -> Option<pumpkin_protocol::bedrock::client::Skin> {
++        // A synchronous skin fetch cannot block the hosted runtime.
++        None
++    }
 +
-         let total_sent_chunks = prepared_batch.map_or_else(
-             || {
-                 self.chunk_sender
++    #[cfg(not(feature = "single-threaded"))]
+     #[must_use]
+     pub fn fetch_skin(properties: &[Property]) -> Option<pumpkin_protocol::bedrock::client::Skin> {
+         let textures_prop = properties.iter().find(|p| &*p.name == "textures")?;
+@@ -2590,10 +2606,13 @@ impl Player {
+                     .map_or(0, |s| s.sent_chunks_count())
+             },
+             |batch| match self.client.as_ref() {
+-                ClientPlatform::Java(_) => {
++                ClientPlatform::Java(java) => {
+                     let mut per_player_cache = rustc_hash::FxHashMap::default();
+-                    let encoded =
+-                        crate::net::ChunkSender::encode_batch(&batch, &mut per_player_cache);
++                    let encoded = crate::net::ChunkSender::encode_batch_limited(
++                        &batch,
++                        &mut per_player_cache,
++                        java.available_chunk_bytes(),
++                    );
+                     let current_epoch = self.chunk_send_epoch.load(Ordering::Relaxed);
+                     self.chunk_sender.try_lock().map_or(0, |mut sender| {
+                         sender.commit_batch(&batch, &encoded, &self.client, current_epoch);
 diff --git a/crates/pumpkin/src/lib.rs b/crates/pumpkin/src/lib.rs
-index 7110bc9e..f45cadbe 100644
+index 7110bc9e..e7e9ecb4 100644
 --- a/crates/pumpkin/src/lib.rs
 +++ b/crates/pumpkin/src/lib.rs
-@@ -8,12 +8,14 @@ extern crate pumpkin_macros;
+@@ -8,29 +8,37 @@ extern crate pumpkin_macros;
  
  use crate::crash::CrashReport;
  use crate::data::VanillaData;
@@ -1297,7 +1482,13 @@ index 7110bc9e..f45cadbe 100644
      status::{IceSocket, StatusResponder},
  };
  use crate::net::java::JavaClient;
-@@ -26,8 +28,11 @@ use plugin::server::server_load::{LoadType, ServerLoadEvent};
+ use crate::net::java::pending::PendingConnection;
+ use crate::net::{ClientPlatform, DisconnectReason, PacketHandlerResult, PacketRateLimiter};
+ use crate::net::{lan_broadcast::LANBroadcast, query, rcon::RCONServer};
++#[cfg(feature = "console")]
+ use crate::plugin::server::server_command::ServerCommandEvent;
+ use crate::server::{Server, ticker::Ticker};
+ use plugin::server::server_load::{LoadType, ServerLoadEvent};
  use pumpkin_config::{AdvancedConfiguration, BasicConfiguration};
  use pumpkin_util::text::TextComponent;
  use pumpkin_util::text::color::{Color, NamedColor};
@@ -1308,8 +1499,14 @@ index 7110bc9e..f45cadbe 100644
 +#[cfg(feature = "console")]
  use rustyline::{Config, error::ReadlineError};
  use std::collections::HashMap;
- use std::io::{ErrorKind, IsTerminal, stdin};
-@@ -112,6 +117,7 @@ pub fn init_logger(advanced_config: &AdvancedConfiguration) {
+-use std::io::{ErrorKind, IsTerminal, stdin};
++use std::io::ErrorKind;
++#[cfg(feature = "console")]
++use std::io::{IsTerminal, stdin};
+ use std::process::exit;
+ use std::str::FromStr;
+ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+@@ -112,6 +120,7 @@ pub fn init_logger(advanced_config: &AdvancedConfiguration) {
              }
          };
  
@@ -1317,7 +1514,7 @@ index 7110bc9e..f45cadbe 100644
          let (logger, rl): (
              ConsoleWriter,
              Option<Editor<PumpkinCommandCompleter, FileHistory>>,
-@@ -142,6 +148,8 @@ pub fn init_logger(advanced_config: &AdvancedConfiguration) {
+@@ -142,6 +151,8 @@ pub fn init_logger(advanced_config: &AdvancedConfiguration) {
          } else {
              (ConsoleWriter::new(None), None)
          };
@@ -1326,7 +1523,7 @@ index 7110bc9e..f45cadbe 100644
  
          let fmt_layer = fmt::layer()
              .with_writer(std::sync::Mutex::new(logger))
-@@ -194,7 +202,11 @@ pub fn init_logger(advanced_config: &AdvancedConfiguration) {
+@@ -194,7 +205,11 @@ pub fn init_logger(advanced_config: &AdvancedConfiguration) {
              timestamp: advanced_config.logging.timestamp,
          };
  
@@ -1339,7 +1536,7 @@ index 7110bc9e..f45cadbe 100644
      });
  
      assert!(
-@@ -204,16 +216,57 @@ pub fn init_logger(advanced_config: &AdvancedConfiguration) {
+@@ -204,16 +219,57 @@ pub fn init_logger(advanced_config: &AdvancedConfiguration) {
  }
  
  pub static SHOULD_STOP: AtomicBool = AtomicBool::new(false);
@@ -1398,7 +1595,7 @@ index 7110bc9e..f45cadbe 100644
  pub fn stop_or_exit_server() {
      if SERVER_IS_STOPPING.load(Ordering::Acquire) {
          // Server is already stopping, so we forcefully exit.
-@@ -251,7 +304,7 @@ impl PumpkinServer {
+@@ -251,7 +307,7 @@ impl PumpkinServer {
      ) -> Self {
          let server = Server::new(basic_config, advanced_config, vanilla_data).await;
  
@@ -1407,7 +1604,7 @@ index 7110bc9e..f45cadbe 100644
          adjust_file_descriptor_limit();
  
          let rcon = server.advanced_config.networking.rcon.clone();
-@@ -320,19 +373,30 @@ impl PumpkinServer {
+@@ -320,19 +376,30 @@ impl PumpkinServer {
              None
          };
  
@@ -1440,7 +1637,7 @@ index 7110bc9e..f45cadbe 100644
  
          let (bedrock_status, ice_socket) = Self::bind_bedrock_status(&server).await;
          let nethernet_listener = Self::bind_nethernet(&server, ice_socket).await;
-@@ -345,6 +409,15 @@ impl PumpkinServer {
+@@ -345,6 +412,15 @@ impl PumpkinServer {
          }
      }
  
@@ -1456,7 +1653,7 @@ index 7110bc9e..f45cadbe 100644
      async fn bind_nethernet(
          server: &Arc<Server>,
          ice_socket: Option<IceSocket>,
-@@ -441,6 +514,7 @@ impl PumpkinServer {
+@@ -441,6 +517,7 @@ impl PumpkinServer {
      }
  
      pub async fn start(&self) {
@@ -1464,7 +1661,7 @@ index 7110bc9e..f45cadbe 100644
          if self.server.advanced_config.commands.use_console
              && let Some((wrapper, _, _)) = LOGGER_IMPL.wait()
          {
-@@ -527,6 +601,7 @@ impl PumpkinServer {
+@@ -527,6 +604,7 @@ impl PumpkinServer {
  
          info!("Completed save!");
  
@@ -1472,7 +1669,7 @@ index 7110bc9e..f45cadbe 100644
          if let Some((wrapper, _, _)) = LOGGER_IMPL.wait()
              && let Some(rl) = wrapper.take_readline()
          {
-@@ -618,7 +693,7 @@ impl PumpkinServer {
+@@ -618,7 +696,7 @@ impl PumpkinServer {
                          });
                      }
                      Err(e) => {
@@ -1481,7 +1678,7 @@ index 7110bc9e..f45cadbe 100644
                          if e.raw_os_error() == Some(libc::EMFILE) {
                              error!(
                                  "Too many open files! Server reached file descriptor limit. \
-@@ -719,6 +794,7 @@ impl PumpkinServer {
+@@ -719,6 +797,7 @@ impl PumpkinServer {
      }
  }
  
@@ -1489,7 +1686,7 @@ index 7110bc9e..f45cadbe 100644
  fn setup_stdin_console(server: &Arc<Server>) {
      let (tx, mut rx) = tokio::sync::mpsc::channel(1);
      let rt = tokio::runtime::Handle::current();
-@@ -759,6 +835,7 @@ fn setup_stdin_console(server: &Arc<Server>) {
+@@ -759,6 +838,7 @@ fn setup_stdin_console(server: &Arc<Server>) {
      });
  }
  
@@ -1497,7 +1694,7 @@ index 7110bc9e..f45cadbe 100644
  fn setup_console(mut rl: Editor<PumpkinCommandCompleter, FileHistory>, server: Arc<Server>) {
      let (tx, mut rx) = tokio::sync::mpsc::channel(1);
      let (tx_reply, mut rx_reply) = tokio::sync::mpsc::channel(1);
-@@ -839,7 +916,7 @@ fn scrub_address(ip: &str) -> String {
+@@ -839,7 +919,7 @@ fn scrub_address(ip: &str) -> String {
          .collect()
  }
  
@@ -1507,10 +1704,10 @@ index 7110bc9e..f45cadbe 100644
      let mut rlim = libc::rlimit {
          rlim_cur: 0,
 diff --git a/crates/pumpkin/src/logging.rs b/crates/pumpkin/src/logging.rs
-index 85b51a45..4006f6ec 100644
+index 85b51a45..033870ff 100644
 --- a/crates/pumpkin/src/logging.rs
 +++ b/crates/pumpkin/src/logging.rs
-@@ -2,11 +2,17 @@
+@@ -2,24 +2,35 @@
  #![allow(clippy::print_stdout)]
  
  use flate2::write::GzEncoder;
@@ -1526,9 +1723,27 @@ index 85b51a45..4006f6ec 100644
  use rustyline::validate::Validator;
 +#[cfg(feature = "console")]
  use rustyline::{Editor, Helper};
++#[cfg(feature = "console")]
  use std::borrow::Cow;
  use std::fs::File;
-@@ -85,15 +91,18 @@ const MAX_ATTEMPTS: u32 = 1000;
+ use std::io::{self, BufWriter, Write};
+ use std::path::PathBuf;
++#[cfg(feature = "console")]
+ use std::sync::Arc;
+ use time::{Duration, OffsetDateTime};
+ use tracing::Subscriber;
+ use tracing_subscriber::Layer;
+ use tracing_subscriber::filter::LevelFilter;
+ 
++#[cfg(feature = "console")]
+ use crate::command::CommandSender;
++#[cfg(feature = "console")]
+ use crate::command::string_reader::StringReader;
++#[cfg(feature = "console")]
+ use crate::server::Server;
+ 
+ #[macro_export]
+@@ -85,15 +96,19 @@ const MAX_ATTEMPTS: u32 = 1000;
  /// A wrapper for our logger to hold the terminal input while no input is expected in order to
  /// properly flush logs to the output while they happen instead of batched
  pub struct ReadlineLogWrapper {
@@ -1539,6 +1754,7 @@ index 85b51a45..4006f6ec 100644
  pub struct ConsoleWriter {
 +    #[cfg(feature = "console")]
      printer: Option<Box<dyn rustyline::ExternalPrinter + Send>>,
++    #[cfg(feature = "console")]
      buffer: Vec<u8>,
  }
  
@@ -1547,7 +1763,7 @@ index 85b51a45..4006f6ec 100644
      #[must_use]
      pub fn new(printer: Option<Box<dyn rustyline::ExternalPrinter + Send>>) -> Self {
          Self {
-@@ -101,9 +110,16 @@ impl ConsoleWriter {
+@@ -101,9 +116,16 @@ impl ConsoleWriter {
              buffer: Vec::new(),
          }
      }
@@ -1555,7 +1771,7 @@ index 85b51a45..4006f6ec 100644
 +    #[cfg(not(feature = "console"))]
 +    #[must_use]
 +    pub fn new() -> Self {
-+        Self { buffer: Vec::new() }
++        Self {}
 +    }
  }
  
@@ -1564,7 +1780,7 @@ index 85b51a45..4006f6ec 100644
      fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
          if let Some(ref mut printer) = self.printer {
              self.buffer.extend_from_slice(buf);
-@@ -122,6 +138,12 @@ impl Write for ConsoleWriter {
+@@ -122,6 +144,12 @@ impl Write for ConsoleWriter {
          }
      }
  
@@ -1577,7 +1793,7 @@ index 85b51a45..4006f6ec 100644
      fn flush(&mut self) -> io::Result<()> {
          if let Some(ref mut printer) = self.printer {
              if !self.buffer.is_empty() {
-@@ -138,6 +160,11 @@ impl Write for ConsoleWriter {
+@@ -138,6 +166,11 @@ impl Write for ConsoleWriter {
              io::stdout().flush()
          }
      }
@@ -1589,7 +1805,7 @@ index 85b51a45..4006f6ec 100644
  }
  
  struct GzipRollingLoggerData {
-@@ -362,6 +389,7 @@ impl tracing::field::Visit for StringVisitor {
+@@ -362,6 +395,7 @@ impl tracing::field::Visit for StringVisitor {
  }
  
  impl ReadlineLogWrapper {
@@ -1597,7 +1813,7 @@ index 85b51a45..4006f6ec 100644
      #[must_use]
      pub const fn new(rl: Option<Editor<PumpkinCommandCompleter, FileHistory>>) -> Self {
          Self {
-@@ -369,6 +397,13 @@ impl ReadlineLogWrapper {
+@@ -369,6 +403,13 @@ impl ReadlineLogWrapper {
          }
      }
  
@@ -1611,7 +1827,7 @@ index 85b51a45..4006f6ec 100644
      pub fn take_readline(&self) -> Option<Editor<PumpkinCommandCompleter, FileHistory>> {
          self.readline
              .lock()
-@@ -377,6 +412,7 @@ impl ReadlineLogWrapper {
+@@ -377,6 +418,7 @@ impl ReadlineLogWrapper {
  
      // This isn't really dead code. It is just only used by the lib and not the bin for this
      // crate, and as such creates a compiler warning.
@@ -1619,7 +1835,7 @@ index 85b51a45..4006f6ec 100644
      #[allow(dead_code)]
      pub fn return_readline(&self, rl: Editor<PumpkinCommandCompleter, FileHistory>) {
          if let Ok(mut result) = self.readline.lock() {
-@@ -385,12 +421,14 @@ impl ReadlineLogWrapper {
+@@ -385,12 +427,14 @@ impl ReadlineLogWrapper {
      }
  }
  
@@ -1634,7 +1850,7 @@ index 85b51a45..4006f6ec 100644
  impl PumpkinCommandCompleter {
      #[must_use]
      pub fn new() -> Self {
-@@ -401,7 +439,9 @@ impl PumpkinCommandCompleter {
+@@ -401,7 +445,9 @@ impl PumpkinCommandCompleter {
      }
  }
  
@@ -1644,7 +1860,7 @@ index 85b51a45..4006f6ec 100644
  impl Highlighter for PumpkinCommandCompleter {
      fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
          line.find(' ').map_or_else(
-@@ -417,6 +457,7 @@ impl Highlighter for PumpkinCommandCompleter {
+@@ -417,6 +463,7 @@ impl Highlighter for PumpkinCommandCompleter {
          Cow::Owned(format!("\x1b[90m{hint}\x1b[0m"))
      }
  }
@@ -1652,7 +1868,7 @@ index 85b51a45..4006f6ec 100644
  impl Hinter for PumpkinCommandCompleter {
      type Hint = String;
      fn hint(&self, line: &str, pos: usize, ctx: &rustyline::Context<'_>) -> Option<Self::Hint> {
-@@ -440,8 +481,10 @@ impl Hinter for PumpkinCommandCompleter {
+@@ -440,8 +487,10 @@ impl Hinter for PumpkinCommandCompleter {
      }
  }
  
@@ -1767,6 +1983,354 @@ index 00000000..90f0989c
 +        None
 +    }
 +}
+diff --git a/crates/pumpkin/src/net/chunk_sender.rs b/crates/pumpkin/src/net/chunk_sender.rs
+index efaa2a65..c2e4832b 100644
+--- a/crates/pumpkin/src/net/chunk_sender.rs
++++ b/crates/pumpkin/src/net/chunk_sender.rs
+@@ -1,4 +1,5 @@
+ use bytes::Bytes;
++#[cfg(not(feature = "single-threaded"))]
+ use rayon::prelude::*;
+ use rustc_hash::{FxHashMap, FxHashSet};
+ use std::sync::{Arc, Weak};
+@@ -15,6 +16,7 @@ use pumpkin_world::chunk::ChunkData;
+ use pumpkin_world::level::{Level, SyncChunk};
+ 
+ use crate::net::ClientPlatform;
++use crate::net::java::MAX_CHUNK_QUEUE_BYTES;
+ 
+ const MIN_CHUNKS_PER_TICK: f32 = 0.1;
+ const MAX_CHUNKS_PER_TICK: f32 = 500.0;
+@@ -188,65 +190,91 @@ impl ChunkSender {
+         batch: &PreparedBatch,
+         cache: &mut FxHashMap<Vector2<i32>, EncodedChunk>,
+     ) -> Vec<EncodedChunk> {
++        Self::encode_batch_limited(batch, cache, usize::MAX)
++    }
++
++    pub fn encode_batch_limited(
++        batch: &PreparedBatch,
++        cache: &mut FxHashMap<Vector2<i32>, EncodedChunk>,
++        byte_limit: usize,
++    ) -> Vec<EncodedChunk> {
++        if byte_limit <= 16 {
++            return Vec::new();
++        }
+         let version = batch.target_version;
+         let cached_map = &*cache;
+ 
+-        let encoded_results: Vec<Option<EncodedChunk>> = batch
+-            .chunks
+-            .par_iter()
+-            .map(|candidate| {
+-                let pos = candidate.position;
+-                if let Some(cached) = cached_map.get(&pos)
+-                    && cached.is_fresh_for(candidate)
+-                {
+-                    return Some(cached.clone());
+-                }
++        let encode = |candidate: &PreparedChunk| {
++            let pos = candidate.position;
++            if let Some(cached) = cached_map.get(&pos)
++                && cached.is_fresh_for(candidate)
++            {
++                return Some(cached.clone());
++            }
+ 
+-                let chunk = &candidate.chunk;
+-                let mut chunk_buf = Vec::with_capacity(32 * 1024);
+-                if chunk_buf
+-                    .write_var_int(&VarInt(CChunkData::to_id(version)))
+-                    .is_err()
+-                {
+-                    return None;
+-                }
+-                if CChunkData(chunk)
+-                    .write_packet_data(&mut chunk_buf, &version)
+-                    .is_err()
+-                {
+-                    return None;
+-                }
++            let chunk = &candidate.chunk;
++            let mut chunk_buf = Vec::with_capacity(32 * 1024);
++            if chunk_buf
++                .write_var_int(&VarInt(CChunkData::to_id(version)))
++                .is_err()
++            {
++                return None;
++            }
++            if CChunkData(chunk)
++                .write_packet_data(&mut chunk_buf, &version)
++                .is_err()
++            {
++                return None;
++            }
+ 
+-                let light_payload = if version >= JavaMinecraftVersion::V_1_14
+-                    && version < JavaMinecraftVersion::V_1_18
+-                {
+-                    CLightUpdate::from_chunk(chunk, version)
+-                        .ok()
+-                        .and_then(|light_packet| {
+-                            let mut light_buf = Vec::new();
+-                            (light_buf
+-                                .write_var_int(&VarInt(CLightUpdate::to_id(version)))
+-                                .is_ok()
+-                                && light_packet
+-                                    .write_packet_data(&mut light_buf, &version)
+-                                    .is_ok())
+-                            .then(|| Bytes::from(light_buf))
+-                        })
+-                } else {
+-                    None
+-                };
+-
+-                Some(EncodedChunk {
+-                    position: pos,
+-                    payload: Bytes::from(chunk_buf),
+-                    light_payload,
+-                    chunk_ref: Arc::downgrade(chunk),
+-                })
++            let light_payload = if version >= JavaMinecraftVersion::V_1_14
++                && version < JavaMinecraftVersion::V_1_18
++            {
++                CLightUpdate::from_chunk(chunk, version)
++                    .ok()
++                    .and_then(|light_packet| {
++                        let mut light_buf = Vec::new();
++                        (light_buf
++                            .write_var_int(&VarInt(CLightUpdate::to_id(version)))
++                            .is_ok()
++                            && light_packet
++                                .write_packet_data(&mut light_buf, &version)
++                                .is_ok())
++                        .then(|| Bytes::from(light_buf.into_boxed_slice()))
++                    })
++            } else {
++                None
++            };
++
++            Some(EncodedChunk {
++                position: pos,
++                payload: Bytes::from(chunk_buf.into_boxed_slice()),
++                light_payload,
++                chunk_ref: Arc::downgrade(chunk),
+             })
+-            .collect();
++        };
++        #[cfg(not(feature = "single-threaded"))]
++        let encoded_results: Vec<_> = batch.chunks.par_iter().filter_map(encode).collect();
++        #[cfg(feature = "single-threaded")]
++        let encoded_results = {
++            let mut results = Vec::new();
++            let mut bytes = 0usize;
++            for candidate in &batch.chunks {
++                if bytes >= byte_limit.saturating_sub(16) {
++                    break;
++                }
++                if let Some(encoded) = encode(candidate) {
++                    bytes = bytes
++                        .saturating_add(encoded.payload.len())
++                        .saturating_add(encoded.light_payload.as_ref().map_or(0, Bytes::len));
++                    results.push(encoded);
++                }
++            }
++            results
++        };
+ 
+         let mut output = Vec::with_capacity(encoded_results.len());
+-        for encoded in encoded_results.into_iter().flatten() {
++        for encoded in encoded_results {
+             cache.insert(encoded.position, encoded.clone());
+             output.push(encoded);
+         }
+@@ -261,47 +289,90 @@ impl ChunkSender {
+         client: &ClientPlatform,
+         current_epoch: u32,
+     ) -> Vec<Vector2<i32>> {
+-        if current_epoch != batch.epoch_snapshot || encoded_chunks.is_empty() {
++        let ClientPlatform::Java(java) = client else {
+             return Vec::new();
+-        }
+-
+-        let mut dispatched_positions = Vec::with_capacity(encoded_chunks.len());
+-        let version = batch.target_version;
++        };
++        self.commit_java_batch(
++            batch,
++            encoded_chunks,
++            current_epoch,
++            java.available_chunk_bytes(),
++            |selected| {
++                let mut packets = Vec::with_capacity(selected.len() * 2 + 2);
++                if batch.target_version >= JavaMinecraftVersion::V_1_20_2 {
++                    let Ok(start) = java.serialize_packet(&CChunkBatchStart) else {
++                        return false;
++                    };
++                    packets.push(start);
++                }
++                for chunk in selected {
++                    packets.push(chunk.payload.clone());
++                    if let Some(light) = &chunk.light_payload {
++                        packets.push(light.clone());
++                    }
++                }
++                if batch.target_version >= JavaMinecraftVersion::V_1_20_2 {
++                    let Ok(end) =
++                        java.serialize_packet(&CChunkBatchEnd::new(selected.len() as u16))
++                    else {
++                        return false;
++                    };
++                    packets.push(end);
++                }
++                java.try_enqueue_chunk_batch(packets)
++            },
++        )
++    }
+ 
+-        if version >= JavaMinecraftVersion::V_1_20_2
+-            && let ClientPlatform::Java(java_client) = client
+-        {
+-            java_client.try_send_packet(&CChunkBatchStart);
++    fn commit_java_batch(
++        &mut self,
++        batch: &PreparedBatch,
++        encoded_chunks: &[EncodedChunk],
++        current_epoch: u32,
++        available_bytes: usize,
++        enqueue: impl FnOnce(&[&EncodedChunk]) -> bool,
++    ) -> Vec<Vector2<i32>> {
++        if current_epoch != batch.epoch_snapshot || available_bytes <= 16 {
++            return Vec::new();
+         }
+-
++        // Leave room for the batch markers. A single larger chunk may use the
++        // whole budget, but only once the previous batch has released all credit.
++        let payload_limit = available_bytes.saturating_sub(16);
++        let mut bytes = 0usize;
++        let mut selected = Vec::new();
+         for chunk in encoded_chunks {
+             if !self.pending_chunks.contains(&chunk.position) {
+                 continue;
+             }
+-
+-            client.try_enqueue_packet(chunk.payload.clone());
+-            if let Some(ref light) = chunk.light_payload {
+-                client.try_enqueue_packet(light.clone());
++            let size = chunk
++                .payload
++                .len()
++                .saturating_add(chunk.light_payload.as_ref().map_or(0, Bytes::len));
++            if bytes.saturating_add(size) > payload_limit
++                && (!selected.is_empty() || available_bytes != MAX_CHUNK_QUEUE_BYTES)
++            {
++                break;
+             }
+-
++            bytes = bytes.saturating_add(size);
++            selected.push(chunk);
++            if bytes >= payload_limit {
++                break;
++            }
++        }
++        if selected.is_empty() || !enqueue(&selected) {
++            return Vec::new();
++        }
++        let mut dispatched = Vec::with_capacity(selected.len());
++        for chunk in selected {
+             self.pending_chunks.remove(&chunk.position);
+             self.sent_chunks.insert(chunk.position);
+-            dispatched_positions.push(chunk.position);
++            dispatched.push(chunk.position);
+         }
+-
+-        let sent_count = dispatched_positions.len();
+-        if sent_count > 0 {
+-            if version >= JavaMinecraftVersion::V_1_20_2
+-                && let ClientPlatform::Java(java_client) = client
+-            {
+-                java_client.try_send_packet(&CChunkBatchEnd::new(sent_count as u16));
+-                self.in_flight_batches = self.in_flight_batches.saturating_add(1);
+-            }
+-
+-            self.send_quota -= sent_count as f32;
++        if batch.target_version >= JavaMinecraftVersion::V_1_20_2 {
++            self.in_flight_batches = self.in_flight_batches.saturating_add(1);
+         }
+-
+-        dispatched_positions
++        self.send_quota -= dispatched.len() as f32;
++        dispatched
+     }
+ 
+     /// Marks a prepared Bedrock batch as dispatched and returns its chunks for encoding.
+@@ -343,6 +414,66 @@ impl Default for ChunkSender {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn byte_backpressure_keeps_unsent_chunks_pending_for_retry() {
++        let chunks: Vec<_> = (0..3)
++            .map(|x| PreparedChunk {
++                position: Vector2::new(x, 0),
++                chunk: ChunkData::empty_sync(x, 0),
++            })
++            .collect();
++        let encoded: Vec<_> = chunks
++            .iter()
++            .map(|chunk| EncodedChunk {
++                position: chunk.position,
++                payload: Bytes::from(vec![0; 20]),
++                light_payload: None,
++                chunk_ref: Arc::downgrade(&chunk.chunk),
++            })
++            .collect();
++        let batch = PreparedBatch {
++            chunks,
++            epoch_snapshot: 7,
++            target_version: JavaMinecraftVersion::V_1_20_2,
++        };
++        let mut sender = ChunkSender::new();
++        sender.send_quota = 3.0;
++        for chunk in &batch.chunks {
++            sender.enqueue_chunk(chunk.position);
++        }
++        assert!(
++            sender
++                .commit_java_batch(&batch, &encoded, 7, 64, |_| false)
++                .is_empty()
++        );
++        assert_eq!(sender.pending_chunks.len(), 3);
++        assert_eq!(sender.in_flight_batches, 0);
++        assert_eq!(sender.send_quota, 3.0);
++        let sent = sender.commit_java_batch(&batch, &encoded, 7, 64, |selected| {
++            assert_eq!(selected.len(), 2);
++            true
++        });
++        assert_eq!(sent.len(), 2);
++        assert_eq!(sender.pending_chunks.len(), 1);
++        assert_eq!(sender.sent_chunks_count(), 2);
++        assert_eq!(sender.in_flight_batches, 1);
++        assert_eq!(sender.send_quota, 1.0);
++        assert!(
++            sender
++                .commit_java_batch(&batch, &encoded, 8, 64, |_| panic!(
++                    "stale batch was queued"
++                ))
++                .is_empty()
++        );
++        assert_eq!(
++            sender
++                .commit_java_batch(&batch, &encoded, 7, 64, |_| true)
++                .len(),
++            1
++        );
++        assert!(sender.pending_chunks.is_empty());
++    }
++
+     #[test]
+     fn bedrock_batch_moves_pending_chunks_to_sent() {
+         let position = Vector2::new(3, -2);
 diff --git a/crates/pumpkin/src/net/java/config/known_packs.rs b/crates/pumpkin/src/net/java/config/known_packs.rs
 index 7e45c3db..8a4d5af4 100644
 --- a/crates/pumpkin/src/net/java/config/known_packs.rs
@@ -1781,10 +2345,41 @@ index 7e45c3db..8a4d5af4 100644
                  let mut packets = Vec::new();
                  let mut sent_dimension_type = false;
 diff --git a/crates/pumpkin/src/net/java/mod.rs b/crates/pumpkin/src/net/java/mod.rs
-index fb0e9c90..6583eb12 100644
+index fb0e9c90..b1e2bfdf 100644
 --- a/crates/pumpkin/src/net/java/mod.rs
 +++ b/crates/pumpkin/src/net/java/mod.rs
-@@ -190,7 +190,7 @@ async fn frame_batch_maybe_offload(
+@@ -43,7 +43,7 @@ use pumpkin_util::version::JavaMinecraftVersion;
+ use tokio::{
+     io::{BufReader, BufWriter},
+     net::tcp::{OwnedReadHalf, OwnedWriteHalf},
+-    sync::oneshot,
++    sync::{OwnedSemaphorePermit, Semaphore, oneshot},
+ };
+ use tokio::{
+     sync::mpsc::{Receiver, Sender, error::TryRecvError},
+@@ -102,6 +102,9 @@ pub struct JavaClient {
+     outgoing_packet_priority_send: Sender<OutgoingPacket>,
+     /// A high-priority queue of serialized packets to send to the network.
+     outgoing_packet_priority_recv: Option<Receiver<OutgoingPacket>>,
++    // Keep chunk-batch start/end markers ordered when a batch yields between groups.
++    chunk_send_lock: tokio::sync::Mutex<()>,
++    chunk_queue_budget: Arc<Semaphore>,
+     /// The packet encoder for outgoing packets.
+     network_writer: std::sync::Mutex<Option<TCPNetworkEncoder<BufWriter<OwnedWriteHalf>>>>,
+     /// The packet decoder for incoming packets.
+@@ -132,8 +135,11 @@ pub enum OutgoingPacketType {
+ struct OutgoingPacket {
+     data: Bytes,
+     completion: Option<oneshot::Sender<()>>,
++    _chunk_budget: Option<Arc<OwnedSemaphorePermit>>,
+ }
+ 
++pub(crate) const MAX_CHUNK_QUEUE_BYTES: usize = 2 * 1024 * 1024;
++
+ const MAX_FRAME_BATCH_DATA_SIZE: usize = MAX_PACKET_SIZE as usize;
+ 
+ fn take_frame_batch(packets: &mut VecDeque<OutgoingPacket>) -> Vec<OutgoingPacket> {
+@@ -190,7 +196,7 @@ async fn frame_batch_maybe_offload(
          .any(|packet| writer.is_compressing_packet(&packet.data));
  
      if needs_offload {
@@ -1793,15 +2388,345 @@ index fb0e9c90..6583eb12 100644
              let (writer, frame, frame_err) = frame_packet_batch(writer, &packet_batch);
              (writer, packet_batch, frame, frame_err)
          })
-@@ -406,7 +406,7 @@ impl JavaClient {
+@@ -206,6 +212,7 @@ impl OutgoingPacket {
+         Self {
+             data,
+             completion: None,
++            _chunk_budget: None,
+         }
+     }
+ 
+@@ -213,10 +220,44 @@ impl OutgoingPacket {
+         Self {
+             data,
+             completion: Some(completion),
++            _chunk_budget: None,
+         }
+     }
+ }
+ 
++// Reserve the complete batch before publishing its start marker. Shared byte
++// credit remains held until every packet in the batch has left the writer.
++fn try_enqueue_chunk_packets(
++    sender: &Sender<OutgoingPacket>,
++    budget: &Arc<Semaphore>,
++    limit: usize,
++    packets: Vec<Bytes>,
++) -> bool {
++    if packets.is_empty() {
++        return true;
++    }
++    let bytes = packets
++        .iter()
++        .fold(0usize, |total, packet| total.saturating_add(packet.len()));
++    // A single valid chunk larger than the target budget must still make progress.
++    let Ok(credit) = budget
++        .clone()
++        .try_acquire_many_owned(bytes.min(limit) as u32)
++    else {
++        return false;
++    };
++    let Ok(slots) = sender.try_reserve_many(packets.len()) else {
++        return false;
++    };
++    let credit = Arc::new(credit);
++    for (slot, data) in slots.zip(packets) {
++        let mut packet = OutgoingPacket::normal(data);
++        packet._chunk_budget = Some(credit.clone());
++        slot.send(packet);
++    }
++    true
++}
++
+ impl JavaClient {
+     #[must_use]
+     pub fn from_pending(
+@@ -242,6 +283,8 @@ impl JavaClient {
+             outgoing_packet_priority_send: priority_send,
+             outgoing_packet_priority_recv: Some(priority_recv),
+             version: pending.version,
++            chunk_send_lock: tokio::sync::Mutex::new(()),
++            chunk_queue_budget: Arc::new(Semaphore::new(MAX_CHUNK_QUEUE_BYTES)),
+             network_writer: std::sync::Mutex::new(Some(pending.network_writer)),
+             network_reader: std::sync::Mutex::new(Some(pending.network_reader)),
+             brand: ArcSwap::from_pointee(pending.brand),
+@@ -382,6 +425,48 @@ impl JavaClient {
+         }
+     }
+ 
++    pub fn available_chunk_bytes(&self) -> usize {
++        if self.close_token.is_cancelled() || self.chunk_send_lock.try_lock().is_err() {
++            return 0;
++        }
++        self.chunk_queue_budget.available_permits()
++    }
++
++    pub fn try_enqueue_chunk_batch(&self, packets: Vec<Bytes>) -> bool {
++        let Ok(_batch) = self.chunk_send_lock.try_lock() else {
++            return false;
++        };
++        if self.close_token.is_cancelled() {
++            return false;
++        }
++        try_enqueue_chunk_packets(
++            &self.outgoing_packet_queue_send,
++            &self.chunk_queue_budget,
++            MAX_CHUNK_QUEUE_BYTES,
++            packets,
++        )
++    }
++
++    async fn enqueue_chunk_packet(&self, data: Bytes) {
++        let credit = tokio::select! {
++            biased;
++            () = self.close_token.cancelled() => return,
++            credit = self.chunk_queue_budget.clone().acquire_many_owned(data.len().min(MAX_CHUNK_QUEUE_BYTES) as u32) => credit,
++        };
++        let Ok(credit) = credit else {
++            return;
++        };
++        let mut packet = OutgoingPacket::normal(data);
++        packet._chunk_budget = Some(Arc::new(credit));
++        tokio::select! {
++            biased;
++            () = self.close_token.cancelled() => {},
++            result = self.outgoing_packet_queue_send.send(packet) => {
++                if result.is_err() { self.close(); }
++            }
++        }
++    }
++
+     pub async fn send_chunks(&self, chunks: &[SyncChunk]) {
+         let player = self.player.load_full();
+         let Some(player) = player.as_ref() else {
+@@ -405,69 +490,78 @@ impl JavaClient {
+         }
  
          let version = self.version.load();
-         let (tx, rx) = oneshot::channel();
+-        let (tx, rx) = oneshot::channel();
 -        rayon::spawn(move || {
-+        pumpkin_util::rayon_spawn(move || {
-             let mut serialized = Vec::with_capacity(valid_chunks.len());
-             for chunk in valid_chunks {
-                 let mut buf = Vec::with_capacity(32 * 1024);
+-            let mut serialized = Vec::with_capacity(valid_chunks.len());
+-            for chunk in valid_chunks {
+-                let mut buf = Vec::with_capacity(32 * 1024);
+-                if let Err(err) = buf.write_var_int(&VarInt(CChunkData::to_id(version))) {
+-                    error!("Failed to write chunk data id: {err:?}");
+-                    continue;
+-                }
+-                if let Err(err) = CChunkData(&chunk).write_packet_data(&mut buf, &version) {
+-                    error!("Failed to write chunk data: {err:?}");
+-                    continue;
+-                }
++        let _batch_guard = self.chunk_send_lock.lock().await;
++        if self.close_token.is_cancelled() {
++            return;
++        }
++        if version >= JavaMinecraftVersion::V_1_20_2 {
++            self.send_packet(&CChunkBatchStart).await;
++        }
++        // Bound temporary serialization storage independently of the player's view.
++        for group in valid_chunks.chunks(8) {
++            if self.close_token.is_cancelled() {
++                return;
++            }
++            let valid_chunks = group.to_vec();
++            let (tx, rx) = oneshot::channel();
++            pumpkin_util::rayon_spawn(move || {
++                let mut serialized = Vec::with_capacity(valid_chunks.len());
++                for chunk in valid_chunks {
++                    let mut buf = Vec::with_capacity(32 * 1024);
++                    if let Err(err) = buf.write_var_int(&VarInt(CChunkData::to_id(version))) {
++                        error!("Failed to write chunk data id: {err:?}");
++                        continue;
++                    }
++                    if let Err(err) = CChunkData(&chunk).write_packet_data(&mut buf, &version) {
++                        error!("Failed to write chunk data: {err:?}");
++                        continue;
++                    }
+ 
+-                let light_buf = if version >= JavaMinecraftVersion::V_1_14
+-                    && version < JavaMinecraftVersion::V_1_18
+-                {
+-                    match CLightUpdate::from_chunk(&chunk, version) {
+-                        Ok(light_packet) => {
+-                            let mut light_buf = Vec::new();
+-                            if let Err(err) =
+-                                light_buf.write_var_int(&VarInt(CLightUpdate::to_id(version)))
+-                            {
+-                                error!("Failed to write light update id: {err:?}");
+-                                None
+-                            } else if let Err(err) =
+-                                light_packet.write_packet_data(&mut light_buf, &version)
+-                            {
+-                                error!("Failed to write light update data: {err:?}");
++                    let light_buf = if version >= JavaMinecraftVersion::V_1_14
++                        && version < JavaMinecraftVersion::V_1_18
++                    {
++                        match CLightUpdate::from_chunk(&chunk, version) {
++                            Ok(light_packet) => {
++                                let mut light_buf = Vec::new();
++                                if let Err(err) =
++                                    light_buf.write_var_int(&VarInt(CLightUpdate::to_id(version)))
++                                {
++                                    error!("Failed to write light update id: {err:?}");
++                                    None
++                                } else if let Err(err) =
++                                    light_packet.write_packet_data(&mut light_buf, &version)
++                                {
++                                    error!("Failed to write light update data: {err:?}");
++                                    None
++                                } else {
++                                    Some(Bytes::from(light_buf.into_boxed_slice()))
++                                }
++                            }
++                            Err(err) => {
++                                error!("Failed to create light update packet: {err:?}");
+                                 None
+-                            } else {
+-                                Some(Bytes::from(light_buf))
+                             }
+                         }
+-                        Err(err) => {
+-                            error!("Failed to create light update packet: {err:?}");
+-                            None
+-                        }
+-                    }
+-                } else {
+-                    None
+-                };
+-
+-                serialized.push((Bytes::from(buf), light_buf));
+-            }
+-            let _ = tx.send(serialized);
+-        });
++                    } else {
++                        None
++                    };
+ 
+-        let Ok(serialized) = rx.await else {
+-            return;
+-        };
++                    serialized.push((Bytes::from(buf.into_boxed_slice()), light_buf));
++                }
++                let _ = tx.send(serialized);
++            });
+ 
+-        if version >= JavaMinecraftVersion::V_1_20_2 {
+-            self.send_packet(&CChunkBatchStart).await;
+-        }
++            let Ok(serialized) = rx.await else {
++                return;
++            };
+ 
+-        for (chunk_data, light_data) in serialized {
+-            self.enqueue_packet(chunk_data).await;
+-            if let Some(light_data) = light_data {
+-                self.enqueue_packet(light_data).await;
++            for (chunk_data, light_data) in serialized {
++                self.enqueue_chunk_packet(chunk_data).await;
++                if let Some(light_data) = light_data {
++                    self.enqueue_chunk_packet(light_data).await;
++                }
+             }
+         }
+-
+         if version >= JavaMinecraftVersion::V_1_20_2 {
+             self.send_packet(&CChunkBatchEnd::new(chunks.len() as u16))
+                 .await;
+@@ -746,7 +840,7 @@ impl JavaClient {
+                 }
+ 
+                 let mut packets_to_frame = VecDeque::from(packet_batch);
+-                let mut written_packets = Vec::with_capacity(packets_to_frame.len());
++                let mut completions = Vec::with_capacity(packets_to_frame.len());
+                 let mut send_failed = false;
+ 
+                 while !packets_to_frame.is_empty() {
+@@ -780,7 +874,11 @@ impl JavaClient {
+                         break;
+                     }
+ 
+-                    written_packets.extend(returned_batch);
++                    for packet in returned_batch {
++                        if let Some(completion) = packet.completion {
++                            completions.push(completion);
++                        }
++                    }
+                 }
+ 
+                 if !send_failed && let Err(err) = writer.flush().await {
+@@ -796,10 +894,8 @@ impl JavaClient {
+                     break;
+                 }
+ 
+-                for packet in written_packets {
+-                    if let Some(completion) = packet.completion {
+-                        let _ = completion.send(());
+-                    }
++                for completion in completions {
++                    let _ = completion.send(());
+                 }
+             }
+         });
+@@ -1311,3 +1407,59 @@ impl JavaClient {
+         Ok(())
+     }
+ }
++
++#[cfg(test)]
++mod chunk_queue_tests {
++    use super::*;
++
++    #[test]
++    fn full_byte_budget_rejects_the_whole_batch_without_publishing_a_marker() {
++        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
++        let budget = Arc::new(Semaphore::new(10));
++        let busy = budget.clone().try_acquire_many_owned(6).unwrap();
++        assert!(!try_enqueue_chunk_packets(
++            &sender,
++            &budget,
++            10,
++            vec![Bytes::from_static(b"start"), Bytes::from_static(b"data")]
++        ));
++        assert!(receiver.try_recv().is_err());
++        assert_eq!(sender.capacity(), 4);
++        assert_eq!(budget.available_permits(), 4);
++        drop(busy);
++        assert!(try_enqueue_chunk_packets(
++            &sender,
++            &budget,
++            10,
++            vec![Bytes::from_static(b"start"), Bytes::from_static(b"data")]
++        ));
++        assert_eq!(budget.available_permits(), 1);
++        drop(receiver.try_recv().unwrap());
++        assert_eq!(budget.available_permits(), 1);
++        drop(receiver.try_recv().unwrap());
++        assert_eq!(budget.available_permits(), 10);
++    }
++
++    #[test]
++    fn insufficient_slots_return_byte_credit_and_leave_the_queue_unchanged() {
++        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
++        let budget = Arc::new(Semaphore::new(10));
++        assert!(!try_enqueue_chunk_packets(
++            &sender,
++            &budget,
++            10,
++            vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")]
++        ));
++        assert!(receiver.try_recv().is_err());
++        assert_eq!(budget.available_permits(), 10);
++        assert!(try_enqueue_chunk_packets(
++            &sender,
++            &budget,
++            10,
++            vec![Bytes::from(vec![0; 20])]
++        ));
++        assert_eq!(budget.available_permits(), 0);
++        drop(receiver.try_recv().unwrap());
++        assert_eq!(budget.available_permits(), 10);
++    }
++}
 diff --git a/crates/pumpkin/src/net/java/play/chat_message.rs b/crates/pumpkin/src/net/java/play/chat_message.rs
 index 58927731..ba28c745 100644
 --- a/crates/pumpkin/src/net/java/play/chat_message.rs
@@ -1842,32 +2767,66 @@ index fa7f8c5a..61bbe63f 100644
      WasmInitializationError(#[from] PluginInitError),
  }
 diff --git a/crates/pumpkin/src/plugin/mod.rs b/crates/pumpkin/src/plugin/mod.rs
-index b686898d..33ed73b3 100644
+index b686898d..ed4d4cec 100644
 --- a/crates/pumpkin/src/plugin/mod.rs
 +++ b/crates/pumpkin/src/plugin/mod.rs
 @@ -1,6 +1,9 @@
  use arc_swap::ArcSwap;
  use futures::future::join_all;
 -use loader::{LoaderError, PluginLoader, native::NativePluginLoader};
-+use loader::{LoaderError, PluginLoader};
 +#[cfg(feature = "plugin-loaders")]
 +use loader::native::NativePluginLoader;
++use loader::{LoaderError, PluginLoader};
 +#[cfg(feature = "plugin-loaders")]
  use notify::{EventKind, RecursiveMode, Watcher, event::ModifyKind};
  use std::{
      any::Any,
-@@ -27,7 +30,9 @@ pub mod loader;
+@@ -12,11 +15,12 @@ use std::{
+     time::Duration,
+ };
+ use thiserror::Error;
+-use tokio::{
+-    sync::{Notify, RwLock},
+-    task::JoinHandle,
+-};
+-use tracing::{debug, error, info, warn};
++use tokio::sync::{Notify, RwLock};
++#[cfg(feature = "plugin-loaders")]
++use tokio::task::JoinHandle;
++#[cfg(feature = "plugin-loaders")]
++use tracing::debug;
++use tracing::{error, info, warn};
+ 
+ pub mod api;
+ pub mod cache;
+@@ -27,7 +31,9 @@ pub mod loader;
  /// host features.
  pub mod permissions;
  
 -use crate::{LOGGER_IMPL, plugin::loader::wasm::WasmPluginLoader, server::Server};
-+use crate::{LOGGER_IMPL, server::Server};
 +#[cfg(feature = "plugin-loaders")]
 +use crate::plugin::loader::wasm::WasmPluginLoader;
++use crate::{LOGGER_IMPL, server::Server};
  pub use api::*;
  
  pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
-@@ -238,10 +243,20 @@ impl PluginManager {
+@@ -192,6 +198,7 @@ pub struct PluginManager {
+     // Notification for plugin state changes
+     state_notify: Arc<Notify>,
+     // Background task for hot reloading
++    #[cfg(feature = "plugin-loaders")]
+     hot_reload_task: RwLock<Option<JoinHandle<()>>>,
+     hot_reload_enabled: AtomicBool,
+     // Thread ID of the thread that created the plugin manager.
+@@ -210,6 +217,7 @@ struct LoadedPlugin {
+     loader_data: Option<Box<dyn Any + Send + Sync>>,
+     is_active: bool,
+     context: Arc<Context>,
++    #[cfg(feature = "plugin-loaders")]
+     path: PathBuf,
+ }
+ 
+@@ -238,15 +246,26 @@ impl PluginManager {
      pub fn new(verify_plugin_signatures: bool) -> Self {
          Self {
              plugins: SyncRwLock::new(Vec::new()),
@@ -1892,7 +2851,13 @@ index b686898d..33ed73b3 100644
              handlers: Arc::new(ArcSwap::from_pointee(HashMap::new())),
              unloaded_files: RwLock::new(HashSet::new()),
              services: Arc::new(RwLock::new(HashMap::new())),
-@@ -285,6 +300,7 @@ impl PluginManager {
+             plugin_states: RwLock::new(HashMap::new()),
+             state_notify: Arc::new(Notify::new()),
++            #[cfg(feature = "plugin-loaders")]
+             hot_reload_task: RwLock::new(None),
+             hot_reload_enabled: AtomicBool::new(false),
+             main_thread_id: std::thread::current().id(),
+@@ -285,6 +304,7 @@ impl PluginManager {
      }
  
      /// Start watching the plugins directory for changes
@@ -1900,7 +2865,7 @@ index b686898d..33ed73b3 100644
      pub async fn start_watcher(self: &Arc<Self>, server: &Arc<Server>) -> Result<(), ManagerError> {
          if self.hot_reload_task.read().await.is_some() {
              return Ok(());
-@@ -368,6 +384,7 @@ impl PluginManager {
+@@ -368,6 +388,7 @@ impl PluginManager {
      }
  
      /// Stop watching the plugins directory for changes
@@ -1908,13 +2873,16 @@ index b686898d..33ed73b3 100644
      pub async fn stop_watcher(&self) {
          let mut task_lock = self.hot_reload_task.write().await;
          if let Some(handle) = task_lock.take() {
-@@ -376,6 +393,15 @@ impl PluginManager {
+@@ -376,6 +397,18 @@ impl PluginManager {
          self.set_hot_reload_enabled(false);
      }
  
 +    /// No-op watcher controls when plugin loaders are compiled out.
 +    #[cfg(not(feature = "plugin-loaders"))]
-+    pub async fn start_watcher(self: &Arc<Self>, _server: &Arc<Server>) -> Result<(), ManagerError> {
++    pub async fn start_watcher(
++        self: &Arc<Self>,
++        _server: &Arc<Server>,
++    ) -> Result<(), ManagerError> {
 +        Ok(())
 +    }
 +
@@ -1924,7 +2892,7 @@ index b686898d..33ed73b3 100644
      pub fn set_hot_reload_enabled(&self, enabled: bool) {
          self.hot_reload_enabled
              .store(enabled, std::sync::atomic::Ordering::Relaxed);
-@@ -512,6 +538,7 @@ impl PluginManager {
+@@ -512,6 +545,7 @@ impl PluginManager {
              "Do you want to allow these permissions and load the plugin?".bold()
          );
  
@@ -1932,7 +2900,7 @@ index b686898d..33ed73b3 100644
          let mut rl_taken = if let Some(logger_option) = crate::LOGGER_IMPL.get()
              && let Some((wrapper, _, _)) = logger_option
              && let Some(rl) = wrapper.take_readline()
-@@ -520,7 +547,10 @@ impl PluginManager {
+@@ -520,7 +554,10 @@ impl PluginManager {
          } else {
              None
          };
@@ -1943,7 +2911,7 @@ index b686898d..33ed73b3 100644
          let result = if let Some((_, ref mut rl)) = rl_taken {
              rl.readline(&prompt).is_ok_and(|line| {
                  let input = line.trim().to_lowercase();
-@@ -533,7 +563,17 @@ impl PluginManager {
+@@ -533,7 +570,17 @@ impl PluginManager {
              );
              false
          };
@@ -1961,7 +2929,26 @@ index b686898d..33ed73b3 100644
          if let Some((wrapper, rl)) = rl_taken {
              wrapper.return_readline(rl);
          }
-@@ -731,14 +771,17 @@ impl PluginManager {
+@@ -550,7 +597,7 @@ impl PluginManager {
+         metadata: PluginMetadata,
+         loader_data: Box<dyn Any + Send + Sync>,
+         loader: Arc<dyn PluginLoader>,
+-        path: PathBuf,
++        _path: PathBuf,
+     ) -> Result<tokio::task::JoinHandle<()>, ManagerError> {
+         // Mark plugin as loading
+         self.plugin_states
+@@ -574,7 +621,8 @@ impl PluginManager {
+             loader_data: Some(loader_data),
+             is_active: false, // Will be set to true after successful initialization
+             context: context.clone(),
+-            path,
++            #[cfg(feature = "plugin-loaders")]
++            path: _path,
+         };
+ 
+         let plugin_index = {
+@@ -731,14 +779,17 @@ impl PluginManager {
                                      .extension()
                                      .is_some_and(|ext| ext.eq_ignore_ascii_case("wasm"))
                              {
@@ -1987,7 +2974,7 @@ index b686898d..33ed73b3 100644
                                  }
                              }
  
-@@ -940,16 +983,19 @@ impl PluginManager {
+@@ -940,16 +991,19 @@ impl PluginManager {
                          .extension()
                          .is_some_and(|ext| ext.eq_ignore_ascii_case("wasm"))
                  {
@@ -2017,7 +3004,7 @@ index b686898d..33ed73b3 100644
                      }
                  }
  
-@@ -1257,6 +1303,7 @@ impl PluginManager {
+@@ -1257,6 +1311,7 @@ impl PluginManager {
              return;
          }
  
@@ -2025,7 +3012,7 @@ index b686898d..33ed73b3 100644
          if tokio::runtime::Handle::try_current().is_ok() {
              tokio::task::block_in_place(|| {
                  server.runtime.block_on(self.fire(server, event));
-@@ -1264,6 +1311,13 @@ impl PluginManager {
+@@ -1264,6 +1319,13 @@ impl PluginManager {
          } else {
              server.runtime.block_on(self.fire(server, event));
          }
@@ -2094,15 +3081,24 @@ index 28690a86..5f58b8b5 100644
          self.scheduled_functions.tick(
              self,
 diff --git a/crates/pumpkin/src/server/scheduler.rs b/crates/pumpkin/src/server/scheduler.rs
-index e2056b48..f6221d64 100644
+index e2056b48..1cfb9bb5 100644
 --- a/crates/pumpkin/src/server/scheduler.rs
 +++ b/crates/pumpkin/src/server/scheduler.rs
-@@ -1,3 +1,4 @@
+@@ -1,12 +1,19 @@
 +#[cfg(feature = "plugin-loaders")]
  use crate::plugin::loader::wasm::wasm_host::WasmPlugin;
  use crate::server::Server;
  use std::cmp::Ordering;
-@@ -7,6 +8,7 @@ use std::sync::{Arc, Mutex, Weak};
+-use std::collections::{BinaryHeap, HashSet};
++use std::collections::BinaryHeap;
++#[cfg(feature = "plugin-loaders")]
++use std::collections::HashSet;
++#[cfg(feature = "plugin-loaders")]
++use std::sync::Weak;
++#[cfg(feature = "plugin-loaders")]
+ use std::sync::atomic::Ordering as AtomicOrdering;
+-use std::sync::{Arc, Mutex, Weak};
++use std::sync::{Arc, Mutex};
  
  pub type TaskId = u32;
  
@@ -2110,7 +3106,7 @@ index e2056b48..f6221d64 100644
  pub struct ScheduledTask {
      pub id: TaskId,
      pub plugin: Arc<WasmPlugin>,
-@@ -15,20 +17,24 @@ pub struct ScheduledTask {
+@@ -15,20 +22,24 @@ pub struct ScheduledTask {
      pub period: Option<u64>,
  }
  
@@ -2135,7 +3131,7 @@ index e2056b48..f6221d64 100644
  impl Ord for ScheduledTask {
      fn cmp(&self, other: &Self) -> Ordering {
          // Reverse order so BinaryHeap is a min-heap
-@@ -36,6 +42,7 @@ impl Ord for ScheduledTask {
+@@ -36,6 +47,7 @@ impl Ord for ScheduledTask {
      }
  }
  
@@ -2143,7 +3139,7 @@ index e2056b48..f6221d64 100644
  pub struct TaskScheduler {
      tasks: Mutex<BinaryHeap<ScheduledTask>>,
      cancelled_tasks: Mutex<HashSet<TaskId>>,
-@@ -43,12 +50,14 @@ pub struct TaskScheduler {
+@@ -43,12 +55,14 @@ pub struct TaskScheduler {
      next_task_id: std::sync::atomic::AtomicU32,
  }
  
@@ -2245,10 +3241,18 @@ index ae45c2b0..1f35b272 100644
                  if STOP_INTERRUPT.is_cancelled() {
                      break 'ticker;
 diff --git a/crates/pumpkin/src/world/portal/mod.rs b/crates/pumpkin/src/world/portal/mod.rs
-index aeadba75..85bf10af 100644
+index aeadba75..c62761b3 100644
 --- a/crates/pumpkin/src/world/portal/mod.rs
 +++ b/crates/pumpkin/src/world/portal/mod.rs
-@@ -92,6 +92,7 @@ impl PortalType {
+@@ -4,6 +4,7 @@ use pumpkin_data::Block;
+ use pumpkin_data::block_properties::HorizontalAxis;
+ use pumpkin_data::dimension::Dimension;
+ use pumpkin_util::math::position::BlockPos;
++#[cfg(not(feature = "single-threaded"))]
+ use pumpkin_util::math::vector2::Vector2;
+ use pumpkin_util::math::vector3::Vector3;
+ use pumpkin_world::world::BlockFlags;
+@@ -92,6 +93,7 @@ impl PortalType {
                          let platform_pos = BlockPos::new(100, 49, 0);
  
                          // Ensure chunks covering the platform are loaded/generated
@@ -2256,7 +3260,7 @@ index aeadba75..85bf10af 100644
                          if let Ok(handle) = tokio::runtime::Handle::try_current() {
                              tokio::task::block_in_place(|| {
                                  handle.block_on(async {
-@@ -207,6 +208,7 @@ impl PortalType {
+@@ -207,6 +209,7 @@ impl PortalType {
                  )
                  .or_else(|| {
                      // Ensure the chunks around approximate_exit_pos are generated/loaded in dest_world

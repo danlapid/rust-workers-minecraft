@@ -50,10 +50,6 @@ graph, including the branch commits.
   `build/`. `EMSCRIPTEN`/`EMSDK` select a local toolchain instead.
 - Node: 24+; 26 recommended and selected in CI. Used for build tools and tests.
 - Python: 3.11+ (Emscripten scripts, emsdk and TOML parsing).
-- Emscripten backend: LLVM, Binaryen and Node through emsdk under `.work/emsdk`
-  (or an activated emsdk selected with `EMSDK`). `scripts/common.sh` hands the
-  frontend checkout and emsdk to worker-build through `EMSCRIPTEN` and `EMSDK`;
-  it uses the frontend unpatched.
 - workerd 1.20260918.1 (Wrangler's bundled version, also pinned directly in
   `package.json`): the first release with `net.Server` inbound routing into
   Durable Objects (`handleAsNodeConnection`, cloudflare/workerd#7306, #7313) and
@@ -100,7 +96,10 @@ bash scripts/setup.sh --sources-only
 
 `package-lock.json` pins Wrangler 4.135.0, workerd 1.20260918.1, `worker-fs-mount` 0.2.0 and
 `durable-object-fs` 1.0.0 (the SQLite filesystem mount, imported by
-`src/js/mount.js` and bundled by worker-build). worker-build generates
+`src/js/mount.js` and bundled by worker-build). `npm install` applies
+`patches/worker-fs-mount-open-mode.patch` to the installed `worker-fs-mount`
+(numeric open modes masked to their permission bits, as Node does; pending
+upstream). worker-build generates
 `build/index.js`, which wraps the exports into the entrypoint and derives the
 Durable Object class from `DurableObject` for RPC.
 

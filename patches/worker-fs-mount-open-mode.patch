@@ -1,0 +1,30 @@
+Subject: [PATCH] Mask numeric open/fchmod modes to their permission bits
+
+Node's fs accepts a numeric mode with type bits set (parseFileMode keeps
+mode & 0o7777); worker-fs-mount's fd-sync rejected anything above 0o7777
+with ERR_OUT_OF_RANGE. Emscripten's FS.open passes S_IFREG | perms to its
+backend, so file creation through NODERAWFS on a mounted path failed.
+
+Applied to the installed package by `npm install` (postinstall) until
+danlapid/worker-fs-mount ships the fix (guybedford/worker-fs-mount
+fix/open-mode-mask).
+
+Base-package: worker-fs-mount@0.2.0
+
+---
+--- a/node_modules/worker-fs-mount/dist/fd-sync.js
++++ b/node_modules/worker-fs-mount/dist/fd-sync.js
+@@ -36,10 +36,12 @@
+     }
+     return value;
+ }
++// Like Node's parseFileMode: a numeric mode keeps only its permission bits, so
++// callers passing a full st_mode (e.g. S_IFREG | 0o644) are accepted.
+ function permissionMode(mode) {
+     if (typeof mode === 'string' && !/^[0-7]+$/.test(mode))
+         fail('ERR_INVALID_ARG_VALUE', 'mode');
+-    return integer(typeof mode === 'string' ? Number.parseInt(mode, 8) : mode, 'mode', 0o7777);
++    return integer(typeof mode === 'string' ? Number.parseInt(mode, 8) : mode, 'mode') & 0o7777;
+ }
+ function options(flags, mode) {
+     const c = realFs.constants;

@@ -16,21 +16,26 @@ and serves `build/index.js`.
 ```sh
 npm run build          # Compile the production Worker
 npm test               # Full Wrangler integration suite
-npm run test:scheduler # Native queue/backpressure and shutdown regressions
+npm run test:scheduler # Native scheduler, chunk-queue and shutdown regressions
 npm run test:memory    # Two-player memory probe on a fresh, fixed-seed world
+npm run test:experience # Configuration and movement/traffic probe
 ```
 
-Tests fail if their loopback ports (25565 and 8787) are occupied. They start and
+Tests fail if their loopback ports (25565 and 8787 by default) are occupied; set
+`TEST_TCP_PORT` and `TEST_HTTP_PORT` to use others. They start and
 stop only their own Wrangler process groups. Their databases and logs live in
 `.data/probes/`; playable worlds are separate under `.data/workers/server/`.
 
-`npm test` must finish with `PUMPKIN-DO-SQLITE-RESTART-OK`. It checks two-player
-gameplay, a real block edit, and player/block restoration after a restart, which
-exercises the SQLite-mounted world across a restart.
+`npm test` must finish with `PUMPKIN-DO-SQLITE-RESTART-OK`. It runs the unit
+tests (`tests/*.test.mjs`: protocol framing), then
+two-player gameplay with compression, server-list pings that must not start the
+runtime, the player limit, a real block edit, a reconnect during the idle window,
+and player/block restoration after a restart from the SQLite-mounted world.
 
-The memory probe waits for both clients to receive 81 chunks, observes 30 seconds
+The memory probe waits for both clients to receive their configured view, observes 30 seconds
 of stationary play, then checkpoints. Each run creates a fresh isolated world
-with a fixed seed; use the same seed when comparing builds:
+with a fixed seed; use the same seed when comparing builds. See
+[configuration](configuration.md) for the exploration probe:
 
 ```sh
 npm run test:memory -- --seed 1789200079352125165

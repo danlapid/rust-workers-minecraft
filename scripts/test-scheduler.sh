@@ -6,3 +6,6 @@ TEST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
 CARGO_TARGET_DIR="$REPO/target/native-tests" cargo test \
   --manifest-path .work/pumpkin/Cargo.toml --target "$TEST_TARGET" \
   -p pumpkin-world --no-default-features --features single-threaded --lib storage_tests
+CARGO_TARGET_DIR="$REPO/target/native-tests" cargo test \
+  --manifest-path .work/pumpkin/Cargo.toml --target "$TEST_TARGET" \
+  -p pumpkin --no-default-features --features single-threaded --lib -- chunk_sender chunk_queue_tests

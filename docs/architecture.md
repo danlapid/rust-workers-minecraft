@@ -4,15 +4,21 @@
 
 The whole Worker is Rust: `worker-build --emscripten`, with the `worker` crate's
 `experimental_tokio` feature, links the `pumpkin-do` bin for `wasm32-unknown-emscripten`
-through emcc and emits the module Wrangler serves. The entrypoint's `connect` handler forwards each TCP
-connection to the named `MinecraftWorld` object with `stub.connect` and pipes
-both directions; `fetch` (a `worker` crate `#[event(fetch)]`) serves status.
+through emcc and emits the module Wrangler serves. The entrypoint's
+`#[event(connect)]` handler reads a bounded Minecraft handshake over the
+`worker::Socket` (`src/handshake.rs`): server-list requests are answered from
+the object's metadata (`serverList`) without starting a server, and gameplay
+connections are forwarded to the named `MinecraftWorld` object with
+`Stub::connect`, writing the consumed bytes ahead and copying both directions
+with Tokio. `fetch` (`#[event(fetch)]`) serves status.
 
-`MinecraftWorld` is a `#[wasm_bindgen]` class constructed with the object's
-state. Its `connect` is a `#[wasm_bindgen(experimental_tokio)]` export: the future runs on
-the thread's Tokio `LocalEventLoop` (tokio-rs/tokio#8484), the current-thread
-scheduler and drivers with the host event loop as their wait, and the export
-returns the Promise of its outcome. Nothing blocks or suspends. The first
+`MinecraftWorld` is a `#[durable_object(connect)]`; its constructor mounts
+`state.storage().as_raw()` and the server root awaits `Storage::sync`. The
+macro exports the object's handlers with `experimental_tokio` (ambient): the
+future runs on the thread's Tokio `LocalEventLoop` (tokio-rs/tokio#8484), the
+current-thread scheduler and drivers with the host event loop as their wait,
+and the export returns the Promise of its outcome. Nothing blocks or suspends.
+`status` and `serverList` are plain `#[wasm_bindgen]` RPC methods. The first
 `connect` after idle runs the server lifetime: it starts Pumpkin on the mounted
 world, awaits the server's return after its final save, awaits `storage.sync()`,
 and settles the connection's promise. Later connections and `status` calls enter
@@ -25,18 +31,24 @@ so a readiness or timer callback resumes the scheduler on the host loop.
 
 Pumpkin binds its stock `TcpListener` on port 25565. Emscripten's Node socket
 backend implements that with `net.BoundSocket`/`net.Server`, which workerd scopes
-to the Durable Object's own port table. `connect` routes each inbound socket to
-that listener with `handleAsNodeConnection`; the accepted connection surfaces
+to the Durable Object's own port table. The object's `connect` routes each
+inbound socket to that listener with `Socket::handle_as_node_connection`; the
+accepted connection surfaces
 through epoll readiness and Pumpkin's normal accept loop, reporting the bound
 address and an unspecified peer.
 
 One wasm instance serves the isolate, so one object hosts one server at a time;
-`WORLD_NAME` selects it. When the last connection closes, the server root calls
-`stop_server`, Pumpkin saves and returns, and `reset_stop` clears the process-wide
-stop state so the next connection can start a fresh server in the same instance.
+`WORLD_NAME` selects it. When the last connection closes, the server root saves
+players, level data and dirty chunks, then keeps the server running for the
+`IDLE_TIMEOUT_SECONDS` reconnect window (`idle_deadline` in status); a new
+connection cancels the shutdown. When the window expires the root calls
+`stop_server`, Pumpkin performs its final save and returns, and `reset_stop`
+clears the process-wide stop state so the next connection can start a fresh
+server in the same instance. Operator settings ([configuration](configuration.md))
+are read from the environment in the object's constructor.
 
-Pumpkin's `single-threaded` feature selects cooperative inline chunk generation
-and the async ticker. The same scheduler loop serves native builds, which
+Pumpkin's `single-threaded` feature runs chunk generation as Tokio tasks
+and selects the async ticker. The same scheduler loop serves native builds, which
 dispatch generation onto Rayon. Save batches await queue capacity; shutdown
 drains results with an elapsed-time timeout before the final flush. Bounded CPU
 tasks use regular Tokio tasks because `spawn_blocking` requires OS threads.
@@ -72,7 +84,8 @@ The supplied configuration listens on loopback TCP port 25565 and HTTP port 8787
 The world name comes from `WORLD_NAME` in `wrangler.jsonc`.
 
 - `GET /health`: Worker readiness.
-- `GET /`: phase, connection count, runtime statistics, and last save time.
+- `GET /`: phase, connection count, runtime statistics, the runtime start
+  count, last shutdown save time, reconnect deadline, and effective settings.
 
 Runtime statistics include Wasm capacity and allocator in-use/free/arena bytes.
 Allocator counters include allocation metadata and unused container capacity;

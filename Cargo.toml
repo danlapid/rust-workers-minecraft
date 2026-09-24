@@ -25,7 +25,9 @@ web-sys = { version = "0.3.106", features = ["AbortController", "AbortSignal", "
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "sync", "time", "net", "io-util"] }
 pumpkin = { path = ".work/pumpkin/crates/pumpkin", default-features = false, features = ["single-threaded"] }
 pumpkin-config = { path = ".work/pumpkin/crates/pumpkin-config", default-features = false }
+pumpkin-world = { path = ".work/pumpkin/crates/pumpkin-world", default-features = false, features = ["single-threaded"] }
 rayon = "1.12"
+serde_json = "1"
 
 # wasm32-unknown-emscripten support pending upstream releases.
 [patch.crates-io]

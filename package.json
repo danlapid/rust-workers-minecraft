@@ -14,11 +14,13 @@
     "wrangler": "4.135.0"
   },
   "scripts": {
+    "postinstall": "node scripts/patch-packages.mjs",
     "build": "bash scripts/build.sh",
     "dev": "bash scripts/serve.sh",
     "test": "bash scripts/test.sh",
     "test:memory": "npm run build && node tests/memory.mjs",
-    "test:scheduler": "bash scripts/test-scheduler.sh"
+    "test:scheduler": "bash scripts/test-scheduler.sh",
+    "test:experience": "npm run build && node tests/experience.mjs"
   },
   "overrides": {
     "durable-object-fs": {

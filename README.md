@@ -31,15 +31,17 @@ minutes; later builds use Cargo's cache.
 Connect **Minecraft Java 26.2** to **`localhost:25565`**. Status is available at
 **http://localhost:8787/**.
 
-The example uses offline mode, with encryption and compression disabled. Local
+The example uses offline mode with encryption disabled and fast packet compression. Local
 listeners bind to loopback. `WORLD_NAME` in [wrangler.jsonc](wrangler.jsonc) selects
-the Durable Object; server settings are in [src/config.rs](src/config.rs).
+the Durable Object; [gameplay settings](docs/configuration.md) such as view
+distance and the player limit are Worker variables.
 
 World data lives under `.data/workers/server/`, written through to the Durable
-Object's SQLite storage as Pumpkin saves. After the last connection closes, the
-server saves and stops; the next connection starts it on the same world. Wait for
-status to report `phase: "idle"` before stopping Wrangler so the final save
-completes.
+Object's SQLite storage as Pumpkin saves. After the last player leaves, the
+server saves and keeps a short reconnect window before stopping; the next
+connection starts it on the same world. Server-list pings do not start the
+runtime. Wait for status to report `phase: "idle"` before stopping Wrangler so
+the final save completes.
 
 ## Build and contribute
 
