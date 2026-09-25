@@ -17,7 +17,7 @@ name = "pumpkin-do"
 path = "src/main.rs"
 
 [dependencies]
-worker = { git = "https://github.com/cloudflare/workers-rs", rev = "b81387da2476a28805c98086676c7edf8eec77fc", features = ["experimental_tokio"] }
+worker = { version = "0.8.7", features = ["experimental_tokio"] }
 wasm-bindgen = "0.2.129"
 wasm-bindgen-futures = "0.4.79"
 js-sys = "0.3.106"

@@ -78,14 +78,12 @@ RUST_CHANNEL="$(python3 -c 'import tomllib,sys; print(tomllib.load(open(sys.argv
 rustup toolchain install "$RUST_CHANNEL" --profile minimal --target wasm32-unknown-emscripten --no-self-update
 
 echo "==> worker-build"
-# cloudflare/workers-rs#1061, the same revision Cargo.toml takes the `worker`
-# crate from. Built for the host, overriding the wasm target .cargo/config.toml sets.
-WORKERS_RS_REV="$(python3 -c 'import tomllib,sys; print(tomllib.load(open(sys.argv[1],"rb"))["dependencies"]["worker"]["rev"])' "$REPO/Cargo.toml")"
-if [ "$(cat "$BIN/.worker-build-rev" 2>/dev/null)" != "$WORKERS_RS_REV" ]; then
+# The release matching the `worker` crate version in Cargo.toml. Built for the
+# host, overriding the wasm target .cargo/config.toml sets.
+WORKER_VERSION="$(python3 -c 'import tomllib,sys; print(tomllib.load(open(sys.argv[1],"rb"))["dependencies"]["worker"]["version"])' "$REPO/Cargo.toml")"
+if [ "$("$BIN/worker-build" --version 2>/dev/null || true)" != "worker-build $WORKER_VERSION" ]; then
   HOST="$(rustc "+$RUST_CHANNEL" -vV | sed -n 's/^host: //p')"
-  cargo "+$RUST_CHANNEL" install --force --locked --target "$HOST" \
-    --git https://github.com/cloudflare/workers-rs --rev "$WORKERS_RS_REV" worker-build --root "$WORK"
-  echo "$WORKERS_RS_REV" > "$BIN/.worker-build-rev"
+  cargo "+$RUST_CHANNEL" install --force --locked --target "$HOST" worker-build --version "$WORKER_VERSION" --root "$WORK"
 fi
 
 echo "==> Worker dependencies"

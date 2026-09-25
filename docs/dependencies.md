@@ -10,7 +10,6 @@ worker-build provisions its own Emscripten and wasm-bindgen CLI under
 | Component | Source / ref | Commit or tag | Local changes or purpose |
 | --- | --- | --- | --- |
 | pumpkin | [master](https://github.com/Pumpkin-MC/Pumpkin) | `b5b9b9d7010e793806a83c495af223c67e1d35ee` | Checkout under `.work/pumpkin`: headless embedding, shared async scheduler, restartable stop signal, compact templates/generation chunks, and build-script fixes |
-| workers-rs | [gbedford/worker-build-emscripten](https://github.com/cloudflare/workers-rs/pull/1061) | `b81387da2476a28805c98086676c7edf8eec77fc` | cloudflare/workers-rs#1061: the `worker` crate (`experimental_tokio` feature, a git dependency in Cargo.toml) and `worker-build --emscripten` (installed by setup from the same revision); unmodified |
 | tokio | [guybedford/tokio](https://github.com/guybedford/tokio) | tag `1.53.1-cf.emscripten` | `LocalEventLoop` (tokio-rs/tokio#8484) and `net` over epoll on Emscripten; a `[patch.crates-io]` git dependency; unmodified |
 | emscripten | [guybedford/emscripten](https://github.com/guybedford/emscripten) | tag `6.0.10-cf.emscripten` | The 6.0.10 release plus emscripten-core/emscripten#27547 (epoll listeners on the host loop) and #27742 (async DNS lookup). worker-build installs emsdk 6.0.10 and applies these as its bundled patches |
 
@@ -42,8 +41,9 @@ graph, including the branch commits.
   `wasm32-unknown-emscripten`; setup installs both through rustup. rustc needs a
   larger compile-thread stack for pumpkin-data's generated tables; the scripts
   set `RUST_MIN_STACK`.
-- worker-build: installed by setup with `cargo install --git` at the workers-rs
-  revision Cargo.toml pins, into `.work/bin/`. It provisions emsdk 6.0.10 with
+- worker-build 0.8.7 (cloudflare/workers-rs#1061 released): installed by setup
+  with `cargo install`, matching the `worker` crate version in Cargo.toml, into
+  `.work/bin/`. It provisions emsdk 6.0.10 with
   its bundled Emscripten patches and the matching wasm-bindgen CLI under
   `~/.cache/worker-build`, drives cargo and emcc with the common link settings,
   wraps the exports into the entrypoint and Durable Object classes, and emits
