@@ -32,10 +32,8 @@ jobs:
             ~/.cargo/git
             ~/.cache/worker-build
           key: minecraft-toolchain-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'scripts/setup.sh') }}
-      - name: Setup pinned sources and toolchain
+      - name: Setup pinned sources, toolchain and Worker dependencies
         run: bash scripts/setup.sh
-      - name: Install Worker dependencies
-        run: npm ci
       - name: Worker TCP, shared world, and SQLite restart
         run: |
           set -o pipefail

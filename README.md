@@ -17,7 +17,6 @@ Linux and macOS build hosts are supported. Install Git,
 [rustup](https://rustup.rs/), Python 3.11+, and Node 24+ (26 recommended). From a checkout of this repository:
 
 ```sh
-npm ci
 bash scripts/setup.sh
 npm run dev
 ```

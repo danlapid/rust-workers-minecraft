@@ -88,4 +88,7 @@ if [ "$(cat "$BIN/.worker-build-rev" 2>/dev/null)" != "$WORKERS_RS_REV" ]; then
   echo "$WORKERS_RS_REV" > "$BIN/.worker-build-rev"
 fi
 
+echo "==> Worker dependencies"
+(cd "$REPO" && "$NODE" "$(dirname "$("$NODE" -p 'process.execPath')")/npm" ci --no-audit --no-fund)
+
 echo "Setup complete. Run: bash scripts/test.sh  or  bash scripts/serve.sh"

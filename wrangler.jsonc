@@ -10,8 +10,7 @@
   "compatibility_flags": ["nodejs_compat", "new_module_registry", "no_handle_cross_request_promise_resolution"],
   "dev": { "ip": "127.0.0.1", "port": 8787 },
   "connect": [{ "protocol": "tcp", "address": "127.0.0.1", "port": 25565 }],
-  "durable_objects": { "bindings": [{ "name": "WORLD", "class_name": "MinecraftWorld" }] },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["MinecraftWorld"] }],
+  "exports": { "MinecraftWorld": { "type": "durable-object", "storage": "sqlite" } },
   "vars": {
     "WORLD_NAME": "world",
     "VIEW_DISTANCE": "4",

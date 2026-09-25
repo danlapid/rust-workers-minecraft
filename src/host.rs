@@ -12,6 +12,14 @@ extern "C" {
     pub static MOUNT_ROOT: JsValue;
 }
 
+#[wasm_bindgen(module = "cloudflare:workers")]
+extern "C" {
+    /// The entrypoint's declared exports (`exports` in wrangler.jsonc), keyed
+    /// by class name; Durable Object namespaces among them.
+    #[wasm_bindgen(js_name = exports, thread_local_v2)]
+    pub static EXPORTS: JsValue;
+}
+
 pub fn property(target: &JsValue, name: &str) -> Result<JsValue, JsValue> {
     js_sys::Reflect::get(target, &name.into())
 }

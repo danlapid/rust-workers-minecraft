@@ -10,8 +10,8 @@
     "worker-fs-mount": "0.2.0"
   },
   "devDependencies": {
-    "workerd": "1.20260918.1",
-    "wrangler": "4.135.0"
+    "workerd": "1.20260925.1",
+    "wrangler": "4.141.0"
   },
   "scripts": {
     "postinstall": "node scripts/patch-packages.mjs",

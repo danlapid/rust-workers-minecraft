@@ -7,14 +7,15 @@ mod world;
 
 use host::method;
 use wasm_bindgen::prelude::*;
-use worker::{event, Context, Env, Request, Response, Socket, Stub};
+use worker::{event, Context, Env, Request, Response, Socket};
 
 fn main() {}
 
-/// The world's Durable Object.
-fn world(env: &Env) -> worker::Result<Stub> {
+/// The world's Durable Object stub, from the declared `MinecraftWorld` export.
+fn world(env: &Env) -> worker::Result<worker::worker_sys::DurableObject> {
     let name = env.var("WORLD_NAME")?.to_string();
-    env.durable_object("WORLD")?.get_by_name(&name)
+    let namespace = host::EXPORTS.with(|exports| host::property(exports, "MinecraftWorld"))?;
+    Ok(method(&namespace, "getByName", &[&JsValue::from(name)])?.unchecked_into())
 }
 
 /// Serves an inbound TCP connection. Server-list pings are answered from the
@@ -23,7 +24,7 @@ fn world(env: &Env) -> worker::Result<Stub> {
 #[event(connect)]
 async fn connect(mut socket: Socket, env: Env, _ctx: Context) -> worker::Result<()> {
     let world = world(&env)?;
-    let rpc: JsValue = self::world(&env)?.into_rpc();
+    let rpc: JsValue = world.clone().into();
     let server_list = |protocol: u32| async move {
         let promise =
             method(&rpc, "serverList", &[&JsValue::from(protocol)]).map_err(js_message)?;
@@ -42,7 +43,9 @@ async fn connect(mut socket: Socket, env: Env, _ctx: Context) -> worker::Result<
             return Ok(());
         }
     };
-    let mut upstream = world.connect(&world::authority())?;
+    let options = js_sys::Object::new();
+    js_sys::Reflect::set(&options, &"allowHalfOpen".into(), &JsValue::TRUE)?;
+    let mut upstream = Socket::from(world.connect(&world::authority(), options.into())?);
     // Either side closing ends the connection; a disconnect is not an error
     // of the handler (which the `connect` event treats as fatal).
     if let Err(error) = tokio::io::AsyncWriteExt::write_all(&mut upstream, &consumed).await {
@@ -67,7 +70,7 @@ async fn fetch(request: Request, env: Env, _ctx: Context) -> worker::Result<Resp
     match request.path().as_str() {
         "/health" => Response::ok(r#"{"ready":true}"#).map(json),
         "/" if request.method() == worker::Method::Get => {
-            let rpc: JsValue = world(&env)?.into_rpc();
+            let rpc: JsValue = world(&env)?.into();
             let status = method(&rpc, "status", &[])?;
             let status =
                 wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(status)).await?;

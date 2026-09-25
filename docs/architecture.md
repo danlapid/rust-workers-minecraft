@@ -8,8 +8,9 @@ through emcc and emits the module Wrangler serves. The entrypoint's
 `#[event(connect)]` handler reads a bounded Minecraft handshake over the
 `worker::Socket` (`src/handshake.rs`): server-list requests are answered from
 the object's metadata (`serverList`) without starting a server, and gameplay
-connections are forwarded to the named `MinecraftWorld` object with
-`Stub::connect`, writing the consumed bytes ahead and copying both directions
+connections are forwarded to the named `MinecraftWorld` object (declared under
+`exports` in `wrangler.jsonc` and reached through `cloudflare:workers`'
+`exports`) with its `connect`, writing the consumed bytes ahead and copying both directions
 with Tokio. `fetch` (`#[event(fetch)]`) serves status.
 
 `MinecraftWorld` is a `#[durable_object(connect)]`; its constructor mounts

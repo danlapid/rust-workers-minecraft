@@ -50,8 +50,8 @@ graph, including the branch commits.
   `build/`. `EMSCRIPTEN`/`EMSDK` select a local toolchain instead.
 - Node: 24+; 26 recommended and selected in CI. Used for build tools and tests.
 - Python: 3.11+ (Emscripten scripts, emsdk and TOML parsing).
-- workerd 1.20260918.1 (Wrangler's bundled version, also pinned directly in
-  `package.json`): the first release with `net.Server` inbound routing into
+- workerd 1.20260925.1 (Wrangler 4.141.0's bundled version, also pinned directly
+  in `package.json`); 1.20260918.1 was the first release with `net.Server` inbound routing into
   Durable Objects (`handleAsNodeConnection`, cloudflare/workerd#7306, #7313) and
   the `node:fs` fixes for positional buffer I/O (#7368), `O_TRUNC` (#7369),
   `O_CREAT` (#7393), and rename over an existing path (#7394).
@@ -94,7 +94,7 @@ bash scripts/setup.sh --sources-only
 
 ## JavaScript dependencies
 
-`package-lock.json` pins Wrangler 4.135.0, workerd 1.20260918.1, `worker-fs-mount` 0.2.0 and
+`package-lock.json` pins Wrangler 4.141.0, workerd 1.20260925.1, `worker-fs-mount` 0.2.0 and
 `durable-object-fs` 1.0.0 (the SQLite filesystem mount, imported by
 `src/js/mount.js` and bundled by worker-build). `npm install` applies
 `patches/worker-fs-mount-open-mode.patch` to the installed `worker-fs-mount`
