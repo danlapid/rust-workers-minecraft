@@ -10,7 +10,7 @@ worker-build provisions its own Emscripten and wasm-bindgen CLI under
 | Component | Source / ref | Commit or tag | Local changes or purpose |
 | --- | --- | --- | --- |
 | pumpkin | [master](https://github.com/Pumpkin-MC/Pumpkin) | `b5b9b9d7010e793806a83c495af223c67e1d35ee` | Checkout under `.work/pumpkin`: headless embedding, shared async scheduler, restartable stop signal, compact templates/generation chunks, and build-script fixes |
-| workers-rs | [gbedford/worker-build-emscripten](https://github.com/cloudflare/workers-rs/pull/1061) | `490b6baa6e45d98a4c6f40565e9eb7d214ee2a93` | cloudflare/workers-rs#1061: the `worker` crate (`experimental_tokio` feature, a git dependency in Cargo.toml) and `worker-build --emscripten` (installed by setup from the same revision); unmodified |
+| workers-rs | [gbedford/worker-build-emscripten](https://github.com/cloudflare/workers-rs/pull/1061) | `b81387da2476a28805c98086676c7edf8eec77fc` | cloudflare/workers-rs#1061: the `worker` crate (`experimental_tokio` feature, a git dependency in Cargo.toml) and `worker-build --emscripten` (installed by setup from the same revision); unmodified |
 | tokio | [guybedford/tokio](https://github.com/guybedford/tokio) | tag `1.53.1-cf.emscripten` | `LocalEventLoop` (tokio-rs/tokio#8484) and `net` over epoll on Emscripten; a `[patch.crates-io]` git dependency; unmodified |
 | emscripten | [guybedford/emscripten](https://github.com/guybedford/emscripten) | tag `6.0.10-cf.emscripten` | The 6.0.10 release plus emscripten-core/emscripten#27547 (epoll listeners on the host loop) and #27742 (async DNS lookup). worker-build installs emsdk 6.0.10 and applies these as its bundled patches |
 

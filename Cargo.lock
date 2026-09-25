@@ -3035,7 +3035,7 @@ dependencies = [
 [[package]]
 name = "worker"
 version = "0.8.6"
-source = "git+https://github.com/cloudflare/workers-rs?rev=490b6baa6e45d98a4c6f40565e9eb7d214ee2a93#490b6baa6e45d98a4c6f40565e9eb7d214ee2a93"
+source = "git+https://github.com/cloudflare/workers-rs?rev=b81387da2476a28805c98086676c7edf8eec77fc#b81387da2476a28805c98086676c7edf8eec77fc"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3065,7 +3065,7 @@ dependencies = [
 [[package]]
 name = "worker-macros"
 version = "0.8.6"
-source = "git+https://github.com/cloudflare/workers-rs?rev=490b6baa6e45d98a4c6f40565e9eb7d214ee2a93#490b6baa6e45d98a4c6f40565e9eb7d214ee2a93"
+source = "git+https://github.com/cloudflare/workers-rs?rev=b81387da2476a28805c98086676c7edf8eec77fc#b81387da2476a28805c98086676c7edf8eec77fc"
 dependencies = [
  "async-trait",
  "proc-macro2",
@@ -3080,7 +3080,7 @@ dependencies = [
 [[package]]
 name = "worker-sys"
 version = "0.8.6"
-source = "git+https://github.com/cloudflare/workers-rs?rev=490b6baa6e45d98a4c6f40565e9eb7d214ee2a93#490b6baa6e45d98a4c6f40565e9eb7d214ee2a93"
+source = "git+https://github.com/cloudflare/workers-rs?rev=b81387da2476a28805c98086676c7edf8eec77fc#b81387da2476a28805c98086676c7edf8eec77fc"
 dependencies = [
  "cfg-if",
  "js-sys",

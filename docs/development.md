@@ -2,10 +2,6 @@
 
 Follow the [README setup instructions](../README.md#try-it) to install the pinned
 Rust toolchain, provision the patched Pumpkin checkout and install worker-build.
-On macOS the build runs wasm-opt single-threaded (`BINARYEN_CORES=1`, main
-thread at the hard stack limit): Binaryen's worker threads overflow their stack
-on this module and crash with SIGBUS.
-
 The initial Pumpkin compilation takes several minutes. Later builds use Cargo's
 cache. worker-build owns the common codegen and link settings; `build.rs` adds
 the application's own and the JS library (`src/workerd.js`), tracking changes to

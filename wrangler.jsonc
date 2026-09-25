@@ -2,7 +2,7 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "rust-workers-minecraft",
   "main": "build/index.js",
-  "build_": {
+  "build": {
     "command": "bash scripts/build.sh",
     "watch_dir": ["src", "scripts", ".cargo", "Cargo.toml", "Cargo.lock", "build.rs", "rust-toolchain.toml"]
   },
