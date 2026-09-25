@@ -29,7 +29,7 @@ runtime, the player limit, a real block edit, a reconnect during the idle window
 and player/block restoration after a restart from the SQLite-mounted world.
 
 The memory probe waits for both clients to receive their configured view, observes 30 seconds
-of stationary play, then checkpoints. Each run creates a fresh isolated world
+of stationary play, then stops the server. Each run creates a fresh isolated world
 with a fixed seed; use the same seed when comparing builds. See
 [configuration](configuration.md) for the exploration probe:
 
@@ -39,7 +39,7 @@ npm run test:memory -- --seed 1789200079352125165
 
 The probe writes `memory.json` under `.data/probes/`, recording the seed, Wasm and
 host-glue hashes, observed capacity, and sampled allocator usage. Sampling ends
-before checkpointing and can miss short-lived allocations. These numbers exclude
+before the stop and can miss short-lived allocations. These numbers exclude
 JavaScript memory; use an inspector snapshot to check the combined footprint.
 
 The test harness sets `WORLD_SEED` to known terrain with a stable spawn block.

@@ -58,17 +58,18 @@ See [development](docs/development.md), [architecture](docs/architecture.md), an
 
 ## Deploy
 
-After setup, build the runtime and deploy the Worker:
+After setup, deploy the Worker; Wrangler builds the Rust runtime first:
 
 ```sh
-npm run build
 npx wrangler deploy
 ```
 
-Deployment uses standard SQLite-backed Durable Objects with Workers TCP ingress.
+The Durable Object is declared under `exports` in `wrangler.jsonc` as a
+SQLite-backed class. Workers TCP ingress maps a public IP and port to the
+Worker's `connect` handler; that mapping is provisioned separately and is tied
+to the Worker's name, so deploy under the mapped name. Players connect to the
+mapped `ip:port`. The listener in `wrangler.jsonc` is for local development.
 See [memory usage](docs/memory-reduction.md) for the optimizations and measurements.
-Provision the public TCP endpoint separately and route it to this Worker's
-`connect` handler. The listener in `wrangler.jsonc` is for local development.
 
 ## Credits and license
 

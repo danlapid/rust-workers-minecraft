@@ -26,7 +26,7 @@ and settles the connection's promise. Later connections and `status` calls enter
 the same instance as ordinary calls while that future is parked. A connection
 arriving while the server is starting or stopping waits for the next phase
 change and then retries, so a client that connects as the previous server
-checkpoints starts the next one. The runtime's epoll and timer waits register
+saves and stops starts the next one. The runtime's epoll and timer waits register
 with the host through Emscripten's Node backend (emscripten-core/emscripten#27547),
 so a readiness or timer callback resumes the scheduler on the host loop.
 

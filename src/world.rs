@@ -1,11 +1,11 @@
 //! The Durable Object hosting one Pumpkin server.
 //!
-//! `connect` is a `#[wasm_bindgen(experimental_tokio)]` export: its future runs on the
-//! thread's Tokio event loop, whose wait is the host event loop, so nothing
-//! blocks or suspends and the export returns a Promise. The server lifetime is
-//! one such future: the first `connect` after idle runs it on the world mounted
-//! from the object's storage, and it completes after the final save is synced.
-//! Later connections are routed to the running listener.
+//! A `#[durable_object(connect)]`: its handlers run on the thread's ambient
+//! Tokio event loop, whose wait is the host event loop, so nothing blocks or
+//! suspends. The server lifetime is one such future: the first `connect` after
+//! idle runs it on the world mounted from the object's storage, and it
+//! completes after the final save is synced. Later connections are routed to
+//! the running listener, and the handler outlives each routed connection.
 
 use crate::{config, host, memory, settings::Settings};
 use host::{js_error, method, property};
