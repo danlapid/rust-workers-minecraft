@@ -86,6 +86,11 @@ impl DurableObject for MinecraftWorld {
             });
             eprintln!("RUST PANIC: {info}");
         }));
+        // There are no Rayon workers: spawned jobs wait until this thread
+        // yields to Rayon. A wake fires once per idle-to-pending transition,
+        // so the driver runs jobs until the queue is idle, one per turn of the
+        // event loop, and stops until the next wake.
+        let _ = rayon::set_fallback_wake_hook(drive_rayon);
         let storage = state.storage();
         host::mount_storage(storage.as_raw());
         MinecraftWorld {
@@ -376,6 +381,16 @@ async fn save_world(server: &Server) {
         }
         level.chunk_saver.block_and_await_ongoing_tasks().await;
     }
+}
+
+/// Runs one queued Rayon job per turn of the event loop until the fallback
+/// queue is idle.
+fn drive_rayon() {
+    wasm_bindgen_futures::spawn_local(async {
+        if rayon::yield_now() == Some(rayon::Yield::Executed) {
+            drive_rayon();
+        }
+    });
 }
 
 fn with_resolvers() -> Result<JsValue, JsValue> {

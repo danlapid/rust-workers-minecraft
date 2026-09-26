@@ -28,6 +28,7 @@ commit.
 | --- | --- | --- |
 | mio | https://github.com/guybedford/mio tag `1.2.3-cf.emscripten` | Emscripten epoll selector (tokio-rs/mio#1969) |
 | libc | https://github.com/rust-lang/libc branch `libc-0.2` | Emscripten epoll bindings, unreleased |
+| rayon, rayon-core | https://github.com/guybedford/rayon branch `fallback-spawn` | rayon-rs/rayon#1323: the single-threaded fallback wakes the host to run spawned jobs |
 | ring | https://github.com/guybedford/ring branch `emscripten` | getrandom-backed `SystemRandom` on Emscripten |
 
 The root Cargo.toml applies these overrides and the local checkouts; the
