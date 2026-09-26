@@ -13,40 +13,41 @@ Minecraft → Workers TCP ingress → MinecraftWorld → Pumpkin + SQLite
 
 ## Try it
 
-The supported build host is macOS with Homebrew. Install Git,
-[rustup](https://rustup.rs/), Python 3.11+, and Node 24+ (26 recommended).
-From a checkout of this repository:
+Linux and macOS build hosts are supported. Install Git,
+[rustup](https://rustup.rs/), Python 3.11+, and Node 24+ (26 recommended). From a checkout of this repository:
 
 ```sh
-brew install emscripten
-npm ci
 bash scripts/setup.sh
 npm run dev
 ```
 
-Setup installs the pinned Rust toolchain, fetches dependency sources, and builds
-the matching wasm-bindgen CLI. `npm run dev` compiles Pumpkin and starts Wrangler.
-The first build takes several minutes; later builds use Cargo's cache.
+Setup installs the pinned Rust toolchain, fetches and patches Pumpkin under
+`.work/`, and installs worker-build, which provisions Emscripten and
+wasm-bindgen itself. `npm run dev` compiles Pumpkin with
+`worker-build --emscripten` and starts Wrangler. The first build takes several
+minutes; later builds use Cargo's cache.
 
 Connect **Minecraft Java 26.2** to **`localhost:25565`**. Status is available at
 **http://localhost:8787/**.
 
-The example uses offline mode, with encryption and compression disabled. Local
+The example uses offline mode with encryption disabled and fast packet compression. Local
 listeners bind to loopback. `WORLD_NAME` in [wrangler.jsonc](wrangler.jsonc) selects
-the Durable Object; server settings are in [src/config.rs](src/config.rs).
+the Durable Object; [gameplay settings](docs/configuration.md) such as view
+distance and the player limit are Worker variables.
 
-World data lives under `.data/workers/server/`. After the last connection closes,
-the server saves and stops. The next connection restores the same world. Wait for
-status to report `phase: "idle"` and a checkpoint timestamp before stopping
-Wrangler; changes held in memory can be lost if the process is terminated early.
+World data lives under `.data/workers/server/`, written through to the Durable
+Object's SQLite storage as Pumpkin saves. After the last player leaves, the
+server saves and keeps a short reconnect window before stopping; the next
+connection starts it on the same world. Server-list pings do not start the
+runtime. Wait for status to report `phase: "idle"` before stopping Wrangler so
+the final save completes.
 
 ## Build and contribute
 
 ```sh
-npm run build        # Compile the server without starting Wrangler
+npm run build        # Compile the Worker without starting Wrangler
 npm test             # Two-player gameplay, a persistent block edit, and restart
 npm run test:scheduler
-npm run typecheck
 ```
 
 The tests use separate data under `.data/probes/`. They verify that two clients
@@ -57,24 +58,26 @@ See [development](docs/development.md), [architecture](docs/architecture.md), an
 
 ## Deploy
 
-After setup, build the runtime and deploy the Worker:
+After setup, deploy the Worker; Wrangler builds the Rust runtime first:
 
 ```sh
-npm run build
 npx wrangler deploy
 ```
 
-Deployment uses standard SQLite-backed Durable Objects with Workers TCP ingress.
+The Durable Object is declared under `exports` in `wrangler.jsonc` as a
+SQLite-backed class. Workers TCP ingress maps a public IP and port to the
+Worker's `connect` handler; that mapping is provisioned separately and is tied
+to the Worker's name, so deploy under the mapped name. Players connect to the
+mapped `ip:port`. The listener in `wrangler.jsonc` is for local development.
 See [memory usage](docs/memory-reduction.md) for the optimizations and measurements.
-Provision the public TCP endpoint separately and route it to this Worker's
-`connect` handler. The listener in `wrangler.jsonc` is for local development.
 
 ## Credits and license
 
 Built on [Pumpkin](https://github.com/Pumpkin-MC/Pumpkin),
-[Guy Bedford's Rust/Emscripten work](https://github.com/guybedford),
-[workers-rs](https://github.com/cloudflare/workers-rs), Thomas Rubini's TCP ingress
-work, and [worker-fs-mount](https://github.com/danlapid/worker-fs-mount).
+[workers-rs](https://github.com/cloudflare/workers-rs),
+[Tokio](https://github.com/tokio-rs/tokio), [Emscripten](https://emscripten.org/),
+[wasm-bindgen](https://github.com/wasm-bindgen/wasm-bindgen), and
+[Guy Bedford's Rust/Emscripten work](https://github.com/guybedford).
 
 Licensed under [GPL-3.0-only](LICENSE), consistent with Pumpkin. The
 [original MIT notice](LICENSES/rust-workers-minecraft-MIT.txt) is retained for

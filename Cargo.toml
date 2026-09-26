@@ -12,45 +12,37 @@ autobins = false
 exclude = [".work"]
 resolver = "2"
 
-[features]
-test-fixtures = []
-
-[[bin]]
-name = "filesystem-probe"
-path = "tests/fixtures/filesystem.rs"
-required-features = ["test-fixtures"]
-
 [[bin]]
 name = "pumpkin-do"
 path = "src/main.rs"
 
 [dependencies]
-wasm-bindgen = { path = ".work/wasm-bindgen" }
-js-sys = { path = ".work/wasm-bindgen/crates/js-sys" }
+worker = { version = "0.8.7", features = ["experimental_tokio"] }
+wasm-bindgen = "0.2.129"
+wasm-bindgen-futures = "0.4.79"
+js-sys = "0.3.106"
+web-sys = { version = "0.3.106", features = ["AbortController", "AbortSignal", "ReadableStream", "StreamPipeOptions", "WritableStream", "console"] }
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "sync", "time", "net", "io-util"] }
 pumpkin = { path = ".work/pumpkin/crates/pumpkin", default-features = false, features = ["single-threaded"] }
 pumpkin-config = { path = ".work/pumpkin/crates/pumpkin-config", default-features = false }
+pumpkin-world = { path = ".work/pumpkin/crates/pumpkin-world", default-features = false, features = ["single-threaded"] }
 rayon = "1.12"
-worker = { path = ".work/workers-rs/worker", default-features = false }
+serde_json = "1"
 
+# wasm32-unknown-emscripten support pending upstream releases.
 [patch.crates-io]
-js-sys = { path = ".work/wasm-bindgen/crates/js-sys" }
-wasm-bindgen = { path = ".work/wasm-bindgen" }
-wasm-bindgen-futures = { path = ".work/wasm-bindgen/crates/futures" }
-wasm-bindgen-macro-support = { path = ".work/wasm-bindgen/crates/macro-support" }
-wasm-bindgen-shared = { path = ".work/wasm-bindgen/crates/shared" }
-web-sys = { path = ".work/wasm-bindgen/crates/web-sys" }
-wasm-streams = { path = ".work/wasm-streams" }
-libc = { path = ".work/libc" }
-mio = { git = "https://github.com/guybedford/mio", rev = "a62c9e46833fc255c9217ab9aa362c6221ed4401" }
-ring = { path = ".work/ring" }
-socket2 = { git = "https://github.com/rust-lang/socket2", rev = "239dd83a4ced08e514d2c38942aab99791119f0d" }
-tokio = { path = ".work/tokio/tokio" }
-tokio-macros = { path = ".work/tokio/tokio-macros" }
+# LocalEventLoop: the host event loop drives Tokio (tokio-rs/tokio#8484).
+tokio = { git = "https://github.com/guybedford/tokio", tag = "1.53.1-cf.emscripten" }
+tokio-macros = { git = "https://github.com/guybedford/tokio", tag = "1.53.1-cf.emscripten" }
+# tokio-rs/mio#1969; its emscripten epoll bindings come from libc's unreleased libc-0.2 branch.
+mio = { git = "https://github.com/guybedford/mio", tag = "1.2.3-cf.emscripten" }
+libc = { git = "https://github.com/rust-lang/libc", branch = "libc-0.2" }
+# getrandom-backed SystemRandom on emscripten.
+ring = { git = "https://github.com/guybedford/ring", branch = "emscripten" }
 
+# mio's own libc source, unified with the crates.io users above.
 [patch."https://github.com/guybedford/libc"]
-libc = { path = ".work/libc" }
-
+libc = { git = "https://github.com/rust-lang/libc", branch = "libc-0.2" }
 
 [profile.release]
 opt-level = "s"

@@ -1,12 +1,26 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "rust-workers-minecraft",
-  "main": "worker/index.ts",
+  "main": "build/index.js",
+  "build": {
+    "command": "bash scripts/build.sh",
+    "watch_dir": ["src", "scripts", ".cargo", "Cargo.toml", "Cargo.lock", "build.rs", "rust-toolchain.toml"]
+  },
   "compatibility_date": "2026-09-05",
   "compatibility_flags": ["nodejs_compat", "new_module_registry", "no_handle_cross_request_promise_resolution"],
   "dev": { "ip": "127.0.0.1", "port": 8787 },
   "connect": [{ "protocol": "tcp", "address": "127.0.0.1", "port": 25565 }],
   "exports": { "MinecraftWorld": { "type": "durable-object", "storage": "sqlite" } },
-  "vars": { "WORLD_NAME": "world" },
+  "limits": { "cpu_ms": 3000000 },
+  "vars": {
+    "WORLD_NAME": "world",
+    "VIEW_DISTANCE": "4",
+    "SIMULATION_DISTANCE": "3",
+    "MAX_PLAYERS": "20",
+    "COMPRESSION_THRESHOLD": "512",
+    "COMPRESSION_LEVEL": "1",
+    "IDLE_TIMEOUT_SECONDS": "10",
+    "MOTD": "Minecraft on Cloudflare Workers"
+  },
   "observability": { "enabled": true, "head_sampling_rate": 1 }
 }

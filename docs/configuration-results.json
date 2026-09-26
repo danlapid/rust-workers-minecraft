@@ -1,0 +1,174 @@
+{
+  "date": "2026-09-12",
+  "environment": "macOS arm64, Node 26.4.0, Wrangler 4.129.0, pinned Rust/Emscripten",
+  "scope": "Single local runs with synthetic movement. Wasm capacity excludes JS memory. Samples may miss transient peaks.",
+  "runs": [
+    {
+      "label": "size-v2-two",
+      "settings": {
+        "VIEW_DISTANCE": "2",
+        "SIMULATION_DISTANCE": "2",
+        "MAX_PLAYERS": "2",
+        "COMPRESSION_THRESHOLD": "512",
+        "COMPRESSION_LEVEL": "1",
+        "IDLE_TIMEOUT_SECONDS": "0"
+      },
+      "players": 2,
+      "seed": "1789195700909824175",
+      "steps": 32,
+      "wasm_sha256": "4288be9cd44fe68e57bb358e8d041b886b4b43a8f30719477a76c27df97fa0c6",
+      "join_ms": 5174.268208,
+      "peak_wasm_mib": 107.75,
+      "received_mb": 1.5,
+      "exploration_tps": 18.28,
+      "status_p95_ms": 246.2
+    },
+    {
+      "label": "size-v3-compressed",
+      "settings": {
+        "VIEW_DISTANCE": "3",
+        "SIMULATION_DISTANCE": "3",
+        "MAX_PLAYERS": "2",
+        "COMPRESSION_THRESHOLD": "512",
+        "COMPRESSION_LEVEL": "1",
+        "IDLE_TIMEOUT_SECONDS": "0"
+      },
+      "players": 2,
+      "seed": "1789195700909824175",
+      "steps": 32,
+      "wasm_sha256": "4288be9cd44fe68e57bb358e8d041b886b4b43a8f30719477a76c27df97fa0c6",
+      "join_ms": 6301.3658749999995,
+      "peak_wasm_mib": 121.75,
+      "received_mb": 2.16,
+      "exploration_tps": 16.7,
+      "status_p95_ms": 301.1
+    },
+    {
+      "label": "size-v3-four",
+      "settings": {
+        "VIEW_DISTANCE": "3",
+        "SIMULATION_DISTANCE": "3",
+        "MAX_PLAYERS": "4",
+        "COMPRESSION_THRESHOLD": "512",
+        "COMPRESSION_LEVEL": "1",
+        "IDLE_TIMEOUT_SECONDS": "0"
+      },
+      "players": 4,
+      "seed": "1789195700909824175",
+      "steps": 32,
+      "wasm_sha256": "4288be9cd44fe68e57bb358e8d041b886b4b43a8f30719477a76c27df97fa0c6",
+      "join_ms": 6185.213540999999,
+      "peak_wasm_mib": 159.75,
+      "received_mb": 4.33,
+      "exploration_tps": 15.2,
+      "status_p95_ms": 1200.8
+    },
+    {
+      "label": "size-v3-uncompressed",
+      "settings": {
+        "VIEW_DISTANCE": "3",
+        "SIMULATION_DISTANCE": "3",
+        "MAX_PLAYERS": "2",
+        "COMPRESSION_THRESHOLD": "-1",
+        "COMPRESSION_LEVEL": "1",
+        "IDLE_TIMEOUT_SECONDS": "0"
+      },
+      "players": 2,
+      "seed": "1789195700909824175",
+      "steps": 32,
+      "wasm_sha256": "4288be9cd44fe68e57bb358e8d041b886b4b43a8f30719477a76c27df97fa0c6",
+      "join_ms": 6294.287249999999,
+      "peak_wasm_mib": 123.75,
+      "received_mb": 19.62,
+      "exploration_tps": 16.5,
+      "status_p95_ms": 380.9
+    },
+    {
+      "label": "size-v4-two",
+      "settings": {
+        "VIEW_DISTANCE": "4",
+        "SIMULATION_DISTANCE": "3",
+        "MAX_PLAYERS": "2",
+        "COMPRESSION_THRESHOLD": "512",
+        "COMPRESSION_LEVEL": "1",
+        "IDLE_TIMEOUT_SECONDS": "0"
+      },
+      "players": 2,
+      "seed": "1789195700909824175",
+      "steps": 32,
+      "wasm_sha256": "4288be9cd44fe68e57bb358e8d041b886b4b43a8f30719477a76c27df97fa0c6",
+      "join_ms": 7427.388416,
+      "peak_wasm_mib": 129.75,
+      "received_mb": 2.76,
+      "exploration_tps": 16.68,
+      "status_p95_ms": 354.3
+    }
+  ],
+  "optimization_experiment": {
+    "opt_level": 3,
+    "result": "Build failed: wasm-metadce received SIGBUS in the pinned Binaryen toolchain."
+  },
+  "final_preset_validation": {
+    "wasm_sha256": "b182e11d18a2694f6cf72e0444576873f498aef184aee7672baf14cd58efc74e",
+    "settings": {
+      "VIEW_DISTANCE": "2",
+      "SIMULATION_DISTANCE": "2",
+      "MAX_PLAYERS": "2",
+      "COMPRESSION_THRESHOLD": "512",
+      "COMPRESSION_LEVEL": "1",
+      "IDLE_TIMEOUT_SECONDS": "0"
+    },
+    "seed": "1789195700909824175",
+    "players": 2,
+    "steps": 32,
+    "join_ms": 4923.233542,
+    "peak_wasm_mib": 107.81,
+    "received_mb": 1.48,
+    "exploration_tps": 17.78,
+    "status_p95_ms": 228.9
+  },
+  "extended_validation": [
+    {
+      "label": "default-long",
+      "failure": null,
+      "seed": "1789195700909824175",
+      "steps": 128,
+      "settings": {
+        "VIEW_DISTANCE": "2",
+        "SIMULATION_DISTANCE": "2",
+        "MAX_PLAYERS": "2",
+        "COMPRESSION_THRESHOLD": "512",
+        "COMPRESSION_LEVEL": "1",
+        "IDLE_TIMEOUT_SECONDS": "0"
+      },
+      "players": 2,
+      "wasm_sha256": "5cc604276208e8d5ce72e4e05b9c45343a33f0974487c86f76ebf69e1b77b63f",
+      "peak_wasm_mib": 125.75,
+      "peak_allocated_heap_mib": 88.47,
+      "received_mb": 4.18,
+      "exploration_tps": 18.3,
+      "status_p95_ms": 249.9
+    },
+    {
+      "label": "default-second-seed",
+      "failure": null,
+      "seed": "1789200079352125165",
+      "steps": 32,
+      "settings": {
+        "VIEW_DISTANCE": "2",
+        "SIMULATION_DISTANCE": "2",
+        "MAX_PLAYERS": "2",
+        "COMPRESSION_THRESHOLD": "512",
+        "COMPRESSION_LEVEL": "1",
+        "IDLE_TIMEOUT_SECONDS": "0"
+      },
+      "players": 2,
+      "wasm_sha256": "5cc604276208e8d5ce72e4e05b9c45343a33f0974487c86f76ebf69e1b77b63f",
+      "peak_wasm_mib": 113.75,
+      "peak_allocated_heap_mib": 81.76,
+      "received_mb": 1.89,
+      "exploration_tps": 16.91,
+      "status_p95_ms": 204.5
+    }
+  ]
+}

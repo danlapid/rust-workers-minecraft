@@ -10,23 +10,21 @@
     "worker-fs-mount": "0.2.0"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "5.20260905.1",
-    "@types/node": "26.4.1",
-    "typescript": "~5.9.3",
-    "wrangler": "4.129.0"
+    "workerd": "1.20260925.1",
+    "wrangler": "4.141.0"
+  },
+  "scripts": {
+    "postinstall": "node scripts/patch-packages.mjs",
+    "build": "bash scripts/build.sh",
+    "dev": "bash scripts/serve.sh",
+    "test": "bash scripts/test.sh",
+    "test:memory": "npm run build && node tests/memory.mjs",
+    "test:scheduler": "bash scripts/test-scheduler.sh",
+    "test:experience": "npm run build && node tests/experience.mjs"
   },
   "overrides": {
     "durable-object-fs": {
       "worker-fs-mount": "$worker-fs-mount"
     }
-  },
-  "scripts": {
-    "build": "bash scripts/build.sh",
-    "dev": "bash scripts/serve.sh",
-    "test": "bash scripts/test.sh",
-    "test:memory": "npm run build && node tests/memory.mjs",
-    "types": "wrangler types worker/env.d.ts --strict-vars=false",
-    "typecheck": "npm run types && tsc --noEmit",
-    "test:scheduler": "bash scripts/test-scheduler.sh"
   }
 }

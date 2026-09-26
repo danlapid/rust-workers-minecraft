@@ -5,25 +5,28 @@ Read [README.md](README.md), [architecture](docs/architecture.md), and
 
 ## Project layout
 
-- `src/`: Pumpkin entry points and configuration. The hosted Tokio bridge lives in workers-rs.
-- `worker/`: TCP ingress, Durable Object lifecycle, and SQLite filesystem.
-- `tests/`: protocol clients, integration tests, and isolated filesystem fixtures.
-- `scripts/setup.sh`: provision pinned sources and build the toolchain.
+- `src/`: the Worker: TCP ingress, the Durable Object, the SQLite filesystem
+  mount (`js/mount.js`), Pumpkin configuration, and the Emscripten JS library
+  (`workerd.js`).
+- `tests/`: protocol clients and the integration test.
+- `scripts/setup.sh`: provision the patched Pumpkin checkout, worker-build (which
+  provisions Emscripten and wasm-bindgen) and npm dependencies.
 - `scripts/{build,serve,test}.sh`: build, run, and validate the Workers server.
 
-Use Node 24+ (26 recommended) and the pinned Rust nightly. Run `npm test` after
+Use Node 24+ (26 recommended) and the pinned Rust toolchain. Run `npm test` after
 build/runtime changes; it must print `PUMPKIN-DO-SQLITE-RESTART-OK` after verifying
-player and chunk restoration. Keep test fixtures out of the production bundle.
+player and chunk restoration.
 Scripts bind to loopback and fail if their ports are occupied. Do not kill another
 process to free a port.
 
 ## Reproducibility and data
 
-Changes to patched checkouts (Pumpkin, wasm-bindgen, workers-rs, wasm-streams) must
-be reflected in `patches/`. Keep unpatched checkouts unmodified; update pins for
-upstream changes. Preserve the unified ticker and cooperative scheduler unless
-the task requires a runtime change. Do not reintroduce old Tokio/libc networking
-patches.
+Changes to the patched Pumpkin checkout must be reflected in `patches/`
+(`node_modules` patches are applied by `npm install`). Update pins for
+upstream changes; workers-rs, tokio and mio are git dependencies in Cargo.toml. Preserve the unified ticker and cooperative scheduler unless
+the task requires a runtime change. Keep the event-loop model: exports
+return promises and nothing blocks or suspends; do not reintroduce JSPI, old
+Tokio/libc networking patches, or a JS-side driver.
 
 Worlds under `.data/` are user data; do not remove or copy them into commits.
 Playable databases live in `.data/workers/server/`; tests use `.data/probes/`.

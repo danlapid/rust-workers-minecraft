@@ -6,7 +6,7 @@ import { createHash } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
-import { play, waitFor } from './client.mjs';
+import { play, waitFor, viewChunkCount } from './client.mjs';
 import { testServer } from './server.mjs';
 
 const repo = fileURLToPath(new URL('../', import.meta.url));
@@ -35,13 +35,14 @@ const sampler = (async () => {
   }
 })().catch(error => { sampleFailure = error; });
 try {
+  const expectedChunks = viewChunkCount((await request()).settings.viewDistance);
   clients.push(await play('ProbeA'));
   clients.push(await play('ProbeB'));
   await waitFor(() => {
     worker.healthy();
     clients.forEach(client => client.assertHealthy());
     if (sampleFailure) throw sampleFailure;
-    return clients.every(client => client.chunks.size >= 81);
+    return clients.every(client => client.chunks.size >= expectedChunks);
   }, 'both clients to receive their view distance');
   const joinedMs = Date.now() - started;
   phase = 'stationary';

@@ -4,6 +4,9 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$REPO/.work"
 NODE="${NODE:-node}"
+# Setup provisions the patched Pumpkin checkout and the worker-build CLI under
+# .work/; worker-build provisions Emscripten and the wasm-bindgen CLI itself.
+BIN="$WORK/bin"
 
 require_node() {
   local major
@@ -15,17 +18,16 @@ require_node() {
 }
 
 require_toolchain() {
-  if [ ! -f "$WORK/emscripten/.emscripten_cf" ] ||
-     [ ! -x "$WORK/bin/wasm-bindgen" ] ||
-     [ ! -f "$WORK/pumpkin/crates/pumpkin/Cargo.toml" ] ||
-     [ ! -f "$WORK/workers-rs/worker/Cargo.toml" ]; then
+  if [ ! -x "$BIN/worker-build" ] ||
+     [ ! -f "$WORK/pumpkin/crates/pumpkin/Cargo.toml" ]; then
     echo "error: run bash scripts/setup.sh first." >&2
     exit 1
   fi
-  export EM_CONFIG="$WORK/emscripten/.emscripten_cf"
-  export PATH="$WORK/emscripten:$WORK/bin:$PATH"
-  export CARGO_TARGET_WASM32_UNKNOWN_EMSCRIPTEN_LINKER="$WORK/emscripten/emcc"
+  export PATH="$BIN:$PATH"
   export CARGO_TARGET_DIR="$REPO/target/workers"
+  # rustc's LLVM const emission recurses deeply on pumpkin-data's generated tables
+  # and overflows its default 8 MiB compile-thread stack on current toolchains.
+  export RUST_MIN_STACK="${RUST_MIN_STACK:-268435456}"
 }
 
 require_packages() {

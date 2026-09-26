@@ -1,4 +1,4 @@
-Subject: [PATCH] Reduce Pumpkin structure-template and generation memory
+Subject: [PATCH] Reduce Pumpkin template, chunk, and idle pathfinder memory
 
 Loaded structure templates previously retained a block-state description for
 every block and a second placement list. Store palette indices, share the first
@@ -12,11 +12,559 @@ dense arrays. Use a dense scratch buffer only during the active noise pass to
 avoid per-voxel palette bookkeeping, then compact it before retaining the chunk.
 Generation dependencies, dimensions, and block values remain unchanged.
 
+Use packed in-memory palette indices, share light arrays with copy-on-write,
+allocate carving-mask words on demand, and grow pathfinding heaps only when
+needed. Preserve block values, lighting initialization, and search behavior.
+
+Limit pooled density buffers by bytes and prune structure-start entries that
+no active generation task references. Concurrent cache misses share a canonical
+collector so pointer-based structure deduplication remains valid.
+
 Base-commit: b5b9b9d7010e793806a83c495af223c67e1d35ee
 
 ---
+diff --git a/crates/pumpkin-world/src/chunk/format/mod.rs b/crates/pumpkin-world/src/chunk/format/mod.rs
+index 68432e19..cd52b03b 100644
+--- a/crates/pumpkin-world/src/chunk/format/mod.rs
++++ b/crates/pumpkin-world/src/chunk/format/mod.rs
+@@ -2,7 +2,7 @@ use std::{
+     path::PathBuf,
+     str::FromStr,
+     sync::{
+-        RwLock,
++        Arc, LazyLock, RwLock,
+         atomic::{AtomicBool, AtomicU64, Ordering},
+     },
+ };
+@@ -256,9 +256,9 @@ impl ChunkData {
+                         });
+ 
+                     block_lights[index] =
+-                        block_light.map_or(LightContainer::Empty(0), LightContainer::Full);
++                        block_light.map_or(LightContainer::Empty(0), LightContainer::new);
+                     sky_lights[index] =
+-                        sky_light.map_or(LightContainer::Empty(0), LightContainer::Full);
++                        sky_light.map_or(LightContainer::Empty(0), LightContainer::new);
+ 
+                     if let Some(bs_compound) = section_compound.get_compound("block_states") {
+                         let data = bs_compound
+@@ -810,7 +810,8 @@ pub struct ChunkSectionBlockStates {
+ #[derive(Debug, Clone)]
+ pub enum LightContainer {
+     Empty(u8),
+-    Full(Box<[u8]>),
++    // Clones share immutable data; writes detach through Arc::make_mut.
++    Full(Arc<[u8]>),
+ }
+ 
+ impl LightContainer {
+@@ -830,14 +831,38 @@ impl LightContainer {
+             "Data length must be {}",
+             Self::ARRAY_SIZE
+         );
+-        Self::Full(data)
++        let value = data[0];
++        if value >> 4 == value & 15 && data.iter().all(|&byte| byte == value) {
++            Self::new_filled(value & 15)
++        } else {
++            Self::Full(data.into())
++        }
+     }
+ 
+     #[must_use]
+     pub fn new_filled(default: u8) -> Self {
+         assert!(default <= 15, "Default value must be between 0 and 15");
+-        let value = default << 4 | default;
+-        Self::Full([value; Self::ARRAY_SIZE].into())
++        // Keep initialized uniform light distinct from Empty: packet masks and
++        // saved light data must retain the same semantics as a full array.
++        static UNIFORM: LazyLock<[Arc<[u8]>; 16]> = LazyLock::new(|| {
++            std::array::from_fn(|value| vec![(value as u8) * 17; LightContainer::ARRAY_SIZE].into())
++        });
++        Self::Full(Arc::clone(&UNIFORM[default as usize]))
++    }
++
++    /// Intern arrays that became uniform while lighting was propagated.
++    pub fn compact(&mut self) {
++        if let Self::Full(data) = self {
++            // Shared uniform arrays are already interned. Other shared arrays
++            // remain unchanged until a writer detaches them.
++            if Arc::strong_count(data) != 1 || data.len() != Self::ARRAY_SIZE {
++                return;
++            }
++            let value = data[0];
++            if value >> 4 == value & 15 && data.iter().all(|&byte| byte == value) {
++                *self = Self::new_filled(value & 15);
++            }
++        }
+     }
+ 
+     #[must_use]
+@@ -869,7 +894,10 @@ impl LightContainer {
+                 let index = Self::index(x, y, z);
+                 let shift = 4 * (index & 1);
+                 let mask = 0x0F << shift;
+-                data[index >> 1] = (data[index >> 1] & !mask) | (value << shift);
++                let updated = (data[index >> 1] & !mask) | (value << shift);
++                if data[index >> 1] != updated {
++                    Arc::make_mut(data)[index >> 1] = updated;
++                }
+             }
+             Self::Empty(default) => {
+                 if value != *default {
+@@ -898,6 +926,10 @@ impl LightContainer {
+                 let mask = 0x0F << shift;
+                 let val = (value & 0x0F) << shift;
+                 let mut byte_idx = (y_start * 256 + z * 16 + x) >> 1;
++                if (0..y_end - y_start).all(|dy| data[byte_idx + dy * 128] & mask == val) {
++                    return;
++                }
++                let data = Arc::make_mut(data);
+                 for _ in y_start..y_end {
+                     data[byte_idx] = (data[byte_idx] & !mask) | val;
+                     byte_idx += 128;
+@@ -931,6 +963,58 @@ mod tests {
+     use pumpkin_nbt::compound::NbtCompound;
+     use pumpkin_nbt::tag::NbtTag;
+ 
++    #[test]
++    fn propagated_uniform_light_is_compacted_without_becoming_empty() {
++        let mut light = LightContainer::new_empty(0);
++        for x in 0..16 {
++            for z in 0..16 {
++                light.set_column_y_range(x, z, 0, 16, 15);
++            }
++        }
++        light.compact();
++        let shared = LightContainer::new_filled(15);
++        let (LightContainer::Full(a), LightContainer::Full(b)) = (&light, &shared) else {
++            panic!("compaction must preserve initialized light");
++        };
++        assert!(Arc::ptr_eq(a, b));
++        assert!(a.iter().all(|&value| value == 255));
++        light.set(0, 0, 0, 0);
++        assert_eq!(shared.get(0, 0, 0), 15);
++    }
++
++    #[test]
++    fn uniform_light_is_shared_without_changing_initialized_state() {
++        let mut a = LightContainer::new_filled(15);
++        let b = LightContainer::new(vec![255; LightContainer::ARRAY_SIZE].into_boxed_slice());
++        assert!(!a.is_empty());
++        let (LightContainer::Full(a_data), LightContainer::Full(b_data)) = (&a, &b) else {
++            panic!("initialized light must remain Full");
++        };
++        assert!(Arc::ptr_eq(a_data, b_data));
++        a.set(1, 2, 3, 15);
++        let LightContainer::Full(a_data) = &a else {
++            unreachable!()
++        };
++        assert!(Arc::ptr_eq(a_data, b_data));
++        a.set(1, 2, 3, 7);
++        assert_eq!(a.get(1, 2, 3), 7);
++        assert_eq!(a.get(0, 2, 3), 15);
++        assert_eq!(b.get(1, 2, 3), 15);
++    }
++
++    #[test]
++    fn cloned_light_columns_do_not_mutate_the_source() {
++        let mut source = LightContainer::new_filled(0);
++        source.set(4, 3, 2, 6);
++        let mut copy = source.clone();
++        copy.set_column_y_range(4, 2, 0, 16, 12);
++        for y in 0..16 {
++            assert_eq!(copy.get(4, y, 2), 12);
++            assert_eq!(copy.get(5, y, 2), 0);
++            assert_eq!(source.get(4, y, 2), if y == 3 { 6 } else { 0 });
++        }
++    }
++
+     #[test]
+     fn extract_u16_array_from_vanilla_compound_palette() {
+         let mut entry1 = NbtCompound::new();
+diff --git a/crates/pumpkin-world/src/chunk/palette.rs b/crates/pumpkin-world/src/chunk/palette.rs
+index 39ed39a7..911e320d 100644
+--- a/crates/pumpkin-world/src/chunk/palette.rs
++++ b/crates/pumpkin-world/src/chunk/palette.rs
+@@ -51,7 +51,66 @@ pub struct HeterogeneousPaletteData<V: Hash + Eq + Copy, const DIM: usize> {
+ #[derive(Clone)]
+ enum PaletteStorage<V, const DIM: usize> {
+     Dense(Box<AbstractCube<V, DIM>>),
+-    Indexed(Box<AbstractCube<u8, DIM>>),
++    Indexed(PackedIndices),
++}
++
++/// In-memory palette indices use 1, 2, 4, or 8 bits per block. Wire-format
++/// packing remains independent because Minecraft pads entries within each u64.
++#[derive(Clone)]
++struct PackedIndices {
++    bytes: Box<[u8]>,
++    len: usize,
++    bits: u8,
++}
++
++impl PackedIndices {
++    fn width(palette_len: usize) -> u8 {
++        match palette_len {
++            0..=2 => 1,
++            3..=4 => 2,
++            5..=16 => 4,
++            _ => 8,
++        }
++    }
++
++    fn new(len: usize, palette_len: usize) -> Self {
++        let bits = Self::width(palette_len);
++        Self {
++            bytes: vec![0; len.div_ceil(8 / bits as usize)].into_boxed_slice(),
++            len,
++            bits,
++        }
++    }
++
++    fn from_slice(indices: &[u8], palette_len: usize) -> Self {
++        let mut packed = Self::new(indices.len(), palette_len);
++        for (i, &index) in indices.iter().enumerate() {
++            packed.set(i, index);
++        }
++        packed
++    }
++
++    #[inline]
++    fn get(&self, index: usize) -> u8 {
++        let bit = index * self.bits as usize;
++        (self.bytes[bit >> 3] >> (bit & 7)) & (u8::MAX >> (8 - self.bits))
++    }
++
++    #[inline]
++    fn set(&mut self, index: usize, value: u8) {
++        if value > (u8::MAX >> (8 - self.bits)) {
++            let mut wider = Self::new(self.len, value as usize + 1);
++            for i in 0..self.len {
++                wider.set(i, self.get(i));
++            }
++            *self = wider;
++        }
++        let bit = index * self.bits as usize;
++        let shift = bit & 7;
++        let mask = (u8::MAX >> (8 - self.bits)) << shift;
++        let byte = &mut self.bytes[bit >> 3];
++        *byte = (*byte & !mask) | (value << shift);
++    }
+ }
+ 
+ impl<V: Hash + Eq + Copy + Default, const DIM: usize> HeterogeneousPaletteData<V, DIM> {
+@@ -62,7 +121,9 @@ impl<V: Hash + Eq + Copy + Default, const DIM: usize> HeterogeneousPaletteData<V
+ 
+         match &self.storage {
+             PaletteStorage::Dense(cube) => cube[y][z][x],
+-            PaletteStorage::Indexed(indices) => self.palette[indices[y][z][x] as usize],
++            PaletteStorage::Indexed(indices) => {
++                self.palette[indices.get((y * DIM + z) * DIM + x) as usize]
++            }
+         }
+     }
+ 
+@@ -101,7 +162,7 @@ impl<V: Hash + Eq + Copy + Default, const DIM: usize> HeterogeneousPaletteData<V
+             }
+             PaletteStorage::Indexed(indices) => {
+                 if new_index <= 255 {
+-                    indices[y][z][x] = new_index as u8;
++                    indices.set((y * DIM + z) * DIM + x, new_index as u8);
+                 } else {
+                     // Upgrade to Dense
+                     let mut cube = Box::new([[[V::default(); DIM]; DIM]; DIM]);
+@@ -111,10 +172,7 @@ impl<V: Hash + Eq + Copy + Default, const DIM: usize> HeterogeneousPaletteData<V
+                         .iter_mut()
+                         .enumerate()
+                     {
+-                        let y = i / (DIM * DIM);
+-                        let z = (i / DIM) % DIM;
+-                        let x = i % DIM;
+-                        *v = self.palette[indices[y][z][x] as usize];
++                        *v = self.palette[indices.get(i) as usize];
+                     }
+                     cube[y][z][x] = value;
+                     self.storage = PaletteStorage::Dense(cube);
+@@ -138,13 +196,9 @@ impl<V: Hash + Eq + Copy + Default, const DIM: usize> HeterogeneousPaletteData<V
+ 
+             // If we are indexed, we need to update all indices because swap_remove changed indices
+             if !upgraded && let PaletteStorage::Indexed(indices) = &mut self.storage {
+-                for row in indices.iter_mut() {
+-                    for col in row.iter_mut() {
+-                        for idx in col.iter_mut() {
+-                            if *idx as usize == last_index {
+-                                *idx = original_index as u8;
+-                            }
+-                        }
++                for i in 0..indices.len {
++                    if indices.get(i) as usize == last_index {
++                        indices.set(i, original_index as u8);
+                     }
+                 }
+             }
+@@ -194,7 +248,10 @@ impl<V: Hash + Eq + Copy + Default, const DIM: usize> PalettedContainer<V, DIM>
+                     indices.as_flattened_mut().as_flattened_mut()[i] = idx as u8;
+                 }
+                 Self::Heterogeneous(Box::new(HeterogeneousPaletteData {
+-                    storage: PaletteStorage::Indexed(indices),
++                    storage: PaletteStorage::Indexed(PackedIndices::from_slice(
++                        indices.as_flattened().as_flattened(),
++                        palette.len(),
++                    )),
+                     palette,
+                     counts,
+                 }))
+@@ -241,7 +298,10 @@ impl<V: Hash + Eq + Copy + Default, const DIM: usize> PalettedContainer<V, DIM>
+         }
+ 
+         let storage = if palette.len() <= 256 && std::mem::size_of::<V>() > 1 {
+-            PaletteStorage::Indexed(indices)
++            PaletteStorage::Indexed(PackedIndices::from_slice(
++                indices.as_flattened().as_flattened(),
++                palette.len(),
++            ))
+         } else {
+             PaletteStorage::Dense(cube)
+         };
+@@ -286,19 +346,16 @@ impl<V: Hash + Eq + Copy + Default, const DIM: usize> PalettedContainer<V, DIM>
+                             })
+                         })
+                         .collect(),
+-                    PaletteStorage::Indexed(indices) => indices
+-                        .as_flattened()
+-                        .as_flattened()
+-                        .chunks(blocks_per_i64 as usize)
+-                        .map(|chunk| {
+-                            chunk.iter().enumerate().fold(0, |acc, (index, key_index)| {
+-                                let key_index = *key_index as usize;
+-                                debug_assert!((1 << bits_per_entry) > key_index);
+-
+-                                let packed_offset_index =
+-                                    (key_index as u64) << (bits_per_entry as u64 * index as u64);
+-                                acc | packed_offset_index as i64
+-                            })
++                    PaletteStorage::Indexed(indices) => (0..indices.len)
++                        .step_by(blocks_per_i64 as usize)
++                        .map(|start| {
++                            (start..(start + blocks_per_i64 as usize).min(indices.len))
++                                .enumerate()
++                                .fold(0i64, |word, (offset, i)| {
++                                    word | ((indices.get(i) as u64)
++                                        << (bits_per_entry as usize * offset))
++                                        as i64
++                                })
+                         })
+                         .collect(),
+                 };
+@@ -352,14 +409,15 @@ impl<V: Hash + Eq + Copy + Default, const DIM: usize> PalettedContainer<V, DIM>
+                     counts[idx] += 1;
+                 } else {
+                     warn!("Lookup index out of bounds! Defaulting...");
+-                    // value is already 0, and counts[0] will be updated correctly if we track it
++                    counts[0] += 1;
+                 }
+             }
+-            // fix counts[0] if it was skipped in out-of-bounds cases (rare)
+-            // But actually we should just ensure it's correct.
+ 
+             return Self::Heterogeneous(Box::new(HeterogeneousPaletteData {
+-                storage: PaletteStorage::Indexed(indices),
++                storage: PaletteStorage::Indexed(PackedIndices::from_slice(
++                    indices.as_flattened().as_flattened(),
++                    palette.len(),
++                )),
+                 palette: palette.to_vec(),
+                 counts,
+             }));
+@@ -459,13 +517,9 @@ impl<V: Hash + Eq + Copy + Default, const DIM: usize> PalettedContainer<V, DIM>
+                 PaletteStorage::Dense(cube) => {
+                     Box::new(cube.as_flattened().as_flattened().iter().copied())
+                 }
+-                PaletteStorage::Indexed(indices) => Box::new(
+-                    indices
+-                        .as_flattened()
+-                        .as_flattened()
+-                        .iter()
+-                        .map(|&idx| data.palette[idx as usize]),
+-                ),
++                PaletteStorage::Indexed(indices) => {
++                    Box::new((0..indices.len).map(move |i| data.palette[indices.get(i) as usize]))
++                }
+             },
+         }
+     }
+@@ -494,13 +548,9 @@ impl<'a, V: Hash + Eq + Copy + Default, const DIM: usize> IntoIterator
+                 PaletteStorage::Dense(cube) => {
+                     Box::new(cube.as_flattened().as_flattened().iter().copied())
+                 }
+-                PaletteStorage::Indexed(indices) => Box::new(
+-                    indices
+-                        .as_flattened()
+-                        .as_flattened()
+-                        .iter()
+-                        .map(|&idx| data.palette[idx as usize]),
+-                ),
++                PaletteStorage::Indexed(indices) => {
++                    Box::new((0..indices.len).map(move |i| data.palette[indices.get(i) as usize]))
++                }
+             },
+         }
+     }
+@@ -1004,7 +1054,7 @@ pub(crate) const BIOME_NETWORK_MAX_BITS: u8 = 7;
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::{BlockPalette, NetworkPalette};
++    use super::{BlockPalette, NetworkPalette, PackedIndices, PaletteStorage, PalettedContainer};
+     use pumpkin_data::{Block, BlockStateId};
+ 
+     fn network_palette_values(palette: NetworkPalette<u16>) -> Option<Box<[u16]>> {
+@@ -1047,6 +1097,65 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn packed_palette_growth_remapping_and_serialization_preserve_values() {
++        for colors in [2usize, 3, 5, 17, 257] {
++            let mut palette = PalettedContainer::<u16, 16>::from_fn(|x, y, z| {
++                (((y * 16 + z) * 16 + x) % colors) as u16
++            });
++            let mut expected: Vec<u16> = (0..4096).map(|i| (i % colors) as u16).collect();
++            assert_eq!(palette.iter().collect::<Vec<_>>(), expected);
++            if colors <= 256 {
++                let PalettedContainer::Heterogeneous(data) = &palette else {
++                    unreachable!()
++                };
++                let PaletteStorage::Indexed(indices) = &data.storage else {
++                    unreachable!()
++                };
++                assert_eq!(
++                    indices.bytes.len(),
++                    4096 * PackedIndices::width(colors) as usize / 8
++                );
++            }
++            for i in [0, 1, 15, 16, 63, 255, 1024, 4095] {
++                let value = (colors + i % 7) as u16;
++                let old = palette.set(i % 16, i / 256, i / 16 % 16, value);
++                assert_eq!(old, expected[i]);
++                expected[i] = value;
++            }
++            assert_eq!(palette.iter().collect::<Vec<_>>(), expected);
++            let bits = palette.bits_per_entry().max(4);
++            let (keys, words) = palette.to_palette_and_packed_data(bits);
++            let decoded =
++                PalettedContainer::<u16, 16>::from_palette_and_packed_data(&keys, &words, 4);
++            assert_eq!(decoded.iter().collect::<Vec<_>>(), expected);
++            for i in 0..4096 {
++                palette.set(i % 16, i / 256, i / 16 % 16, 7);
++            }
++            assert!(matches!(palette, PalettedContainer::Homogeneous(7)));
++        }
++    }
++
++    #[test]
++    fn packed_indices_expand_across_all_widths() {
++        let mut indices = PackedIndices::new(27, 2);
++        for value in [1, 3, 15, 255] {
++            for i in [0, 1, 7, 8, 26] {
++                indices.set(i, value);
++            }
++            for i in 0..27 {
++                assert_eq!(
++                    indices.get(i),
++                    if [0, 1, 7, 8, 26].contains(&i) {
++                        value
++                    } else {
++                        0
++                    }
++                );
++            }
++        }
++    }
++
+     #[test]
+     fn bulk_palette_matches_individual_mutations() {
+         let states = [
+diff --git a/crates/pumpkin-world/src/generation/carver/mask.rs b/crates/pumpkin-world/src/generation/carver/mask.rs
+index f9ccd277..8e47504f 100644
+--- a/crates/pumpkin-world/src/generation/carver/mask.rs
++++ b/crates/pumpkin-world/src/generation/carver/mask.rs
+@@ -1,6 +1,7 @@
+ pub struct CarvingMask {
+     min_y: i32,
+     mask: Vec<u64>,
++    words: usize,
+ }
+ 
+ impl CarvingMask {
+@@ -11,7 +12,8 @@ impl CarvingMask {
+         let num_u64s = (total_bits as usize).div_ceil(64);
+         Self {
+             min_y,
+-            mask: vec![0; num_u64s],
++            mask: Vec::new(),
++            words: num_u64s,
+         }
+     }
+ 
+@@ -27,6 +29,14 @@ impl CarvingMask {
+         let bit_index = self.get_bit_index(x, y, z);
+         let u64_idx = bit_index / 64;
+         let bit_in_u64 = bit_index % 64;
++        assert!(
++            u64_idx < self.words,
++            "Carving mask position is outside the chunk"
++        );
++        if u64_idx >= self.mask.len() {
++            self.mask.reserve_exact(u64_idx + 1 - self.mask.len());
++            self.mask.resize(u64_idx + 1, 0);
++        }
+         self.mask[u64_idx] |= 1 << bit_in_u64;
+     }
+ 
+@@ -35,6 +45,38 @@ impl CarvingMask {
+         let bit_index = self.get_bit_index(x, y, z);
+         let u64_idx = bit_index / 64;
+         let bit_in_u64 = bit_index % 64;
+-        (self.mask[u64_idx] >> bit_in_u64) & 1 != 0
++        assert!(
++            u64_idx < self.words,
++            "Carving mask position is outside the chunk"
++        );
++        self.mask
++            .get(u64_idx)
++            .is_some_and(|word| (word >> bit_in_u64) & 1 != 0)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::CarvingMask;
++
++    #[test]
++    fn uncarved_space_needs_no_backing_array() {
++        let mut mask = CarvingMask::new(384, -64);
++        assert!(!mask.get(0, 319, 0));
++        assert!(mask.mask.is_empty());
++        mask.set(-1, -64, 17);
++        assert!(mask.get(15, -64, 1));
++        assert!(!mask.get(14, -64, 1));
++        assert!(!mask.get(15, 319, 1));
++        assert!(mask.mask.capacity() < mask.words);
++        mask.set(15, 319, 15);
++        assert!(mask.get(15, 319, 15));
++        assert!(mask.get(15, -64, 1));
++    }
++
++    #[test]
++    #[should_panic(expected = "outside the chunk")]
++    fn reads_outside_the_dimension_still_fail() {
++        let _ = CarvingMask::new(384, -64).get(0, -65, 0);
+     }
+ }
 diff --git a/crates/pumpkin-world/src/generation/feature/features/fossil.rs b/crates/pumpkin-world/src/generation/feature/features/fossil.rs
-index 226ee1833..0e774e8bc 100644
+index 226ee183..0e774e8b 100644
 --- a/crates/pumpkin-world/src/generation/feature/features/fossil.rs
 +++ b/crates/pumpkin-world/src/generation/feature/features/fossil.rs
 @@ -169,7 +169,7 @@ fn place_fossil_template<T: GenerationCache>(
@@ -27,9 +575,115 @@ index 226ee1833..0e774e8bc 100644
 +    for block in template.blocks.iter() {
          let local_pos = rotation.transform_pos(block.pos, template.size);
          let world_pos = origin + local_pos;
-
+ 
+diff --git a/crates/pumpkin-world/src/generation/noise/router/density_volume.rs b/crates/pumpkin-world/src/generation/noise/router/density_volume.rs
+index 106a65d5..10f24c74 100644
+--- a/crates/pumpkin-world/src/generation/noise/router/density_volume.rs
++++ b/crates/pumpkin-world/src/generation/noise/router/density_volume.rs
+@@ -6,9 +6,10 @@ pub use pumpkin_util::noise::volume::DensityVolume;
+ const BUFFER_SIZE_INCREMENT: usize = 16;
+ const MAX_REUSE_SIZE_FACTOR: usize = 2;
+ const MAX_POOLED_BUFFERS: usize = 1024;
++const MAX_POOLED_BYTES: usize = 4 * 1024 * 1024;
+ 
+ thread_local! {
+-    static DENSITY_BUFFER_POOL: RefCell<Vec<Box<[f32]>>> = const { RefCell::new(Vec::new()) };
++    static DENSITY_BUFFER_POOL: RefCell<BufferPool> = const { RefCell::new(BufferPool { buffers: Vec::new(), bytes: 0 }) };
+ }
+ 
+ fn take_best(
+@@ -31,6 +32,27 @@ fn take_best(
+     best_index.map(|i| pool.remove(i))
+ }
+ 
++struct BufferPool {
++    buffers: Vec<Box<[f32]>>,
++    bytes: usize,
++}
++
++impl BufferPool {
++    fn take(&mut self, min: usize, max: usize) -> Option<Box<[f32]>> {
++        let buffer = take_best(&mut self.buffers, min, max)?;
++        self.bytes -= std::mem::size_of_val(&*buffer);
++        Some(buffer)
++    }
++
++    fn put(&mut self, buffer: Box<[f32]>) {
++        let bytes = std::mem::size_of_val(&*buffer);
++        if self.buffers.len() < MAX_POOLED_BUFFERS && bytes <= MAX_POOLED_BYTES - self.bytes {
++            self.bytes += bytes;
++            self.buffers.push(buffer);
++        }
++    }
++}
++
+ pub struct DensityBuffer {
+     values: Box<[f32]>,
+     len: usize,
+@@ -47,11 +69,8 @@ impl DensityBuffer {
+         let min_capacity = len.next_multiple_of(BUFFER_SIZE_INCREMENT);
+         let values = DENSITY_BUFFER_POOL
+             .with(|pool| {
+-                take_best(
+-                    &mut pool.borrow_mut(),
+-                    min_capacity,
+-                    min_capacity * MAX_REUSE_SIZE_FACTOR,
+-                )
++                pool.borrow_mut()
++                    .take(min_capacity, min_capacity * MAX_REUSE_SIZE_FACTOR)
+             })
+             .unwrap_or_else(|| vec![0.0; min_capacity].into_boxed_slice());
+         Self { values, len }
+@@ -83,10 +102,43 @@ impl Drop for DensityBuffer {
+     fn drop(&mut self) {
+         let values = std::mem::take(&mut self.values);
+         DENSITY_BUFFER_POOL.with(|pool| {
+-            let mut pool = pool.borrow_mut();
+-            if pool.len() < MAX_POOLED_BUFFERS {
+-                pool.push(values);
+-            }
++            pool.borrow_mut().put(values);
+         });
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn retained_buffers_obey_byte_budget_and_return_credit_on_reuse() {
++        let mut pool = BufferPool {
++            buffers: Vec::new(),
++            bytes: 0,
++        };
++        let len = MAX_POOLED_BYTES / std::mem::size_of::<f32>();
++        pool.put(vec![7.0; len].into_boxed_slice());
++        pool.put(vec![0.0; 16].into_boxed_slice());
++        assert_eq!(pool.buffers.len(), 1);
++        assert_eq!(pool.bytes, MAX_POOLED_BYTES);
++        assert!(pool.take(16, 32).is_none());
++        assert_eq!(pool.bytes, MAX_POOLED_BYTES);
++        let buffer = pool.take(len, len).unwrap();
++        assert_eq!(pool.bytes, 0);
++        assert!(buffer.iter().all(|&value| value == 7.0));
++        pool.put(buffer);
++        assert_eq!(pool.bytes, MAX_POOLED_BYTES);
++    }
++
++    #[test]
++    fn oversized_buffers_are_not_retained() {
++        let mut pool = BufferPool {
++            buffers: Vec::new(),
++            bytes: 0,
++        };
++        pool.put(vec![0.0; MAX_POOLED_BYTES / 4 + 16].into_boxed_slice());
++        assert!(pool.buffers.is_empty());
++        assert_eq!(pool.bytes, 0);
++    }
++}
 diff --git a/crates/pumpkin-world/src/generation/proto_chunk.rs b/crates/pumpkin-world/src/generation/proto_chunk.rs
-index 727a58a31..cc4c8e77e 100644
+index 727a58a3..cc4c8e77 100644
 --- a/crates/pumpkin-world/src/generation/proto_chunk.rs
 +++ b/crates/pumpkin-world/src/generation/proto_chunk.rs
 @@ -38,6 +38,7 @@ use super::{
@@ -68,7 +722,7 @@ index 727a58a31..cc4c8e77e 100644
 @@ -506,13 +513,6 @@ impl ProtoChunk {
          x as usize * CHUNK_DIM as usize + z as usize
      }
-
+ 
 -    #[inline]
 -    const fn local_pos_to_block_index(&self, x: i32, y: i32, z: i32) -> usize {
 -        self.height() as usize * CHUNK_DIM as usize * x as usize
@@ -90,12 +744,12 @@ index 727a58a31..cc4c8e77e 100644
 +        }
 +        self.block_sections[y as usize / 16].get(x as usize, y as usize & 15, z as usize)
      }
-
+ 
      #[inline]
 @@ -573,8 +575,17 @@ impl ProtoChunk {
              }
          }
-
+ 
 -        let index = self.local_pos_to_block_index(local_x, local_y, local_z);
 -        self.flat_block_map[index] = block_state.id;
 +        if let Some(blocks) = &mut self.noise_blocks {
@@ -110,12 +764,12 @@ index 727a58a31..cc4c8e77e 100644
 +            );
 +        }
      }
-
+ 
      #[inline]
 @@ -869,6 +880,18 @@ impl ProtoChunk {
          let volume = *noise_sampler.volume();
          let densities = noise_sampler.sample_density();
-
+ 
 +        let height = self.height as usize;
 +        let mut blocks = vec![BlockStateId::AIR; CHUNK_AREA * height];
 +        for x in 0..16 {
@@ -141,10 +795,150 @@ index 727a58a31..cc4c8e77e 100644
 +                BlockPalette::from_fn(|x, y, z| blocks[(x * height + section * 16 + y) * 16 + z]);
 +        }
      }
-
+ 
      pub fn spawn_mobs<T: GenerationCache>(cache: &mut T, block_registry: &dyn WorldPortalExt) {
+diff --git a/crates/pumpkin-world/src/generation/structure/placement.rs b/crates/pumpkin-world/src/generation/structure/placement.rs
+index 250263ff..c96f1ad3 100644
+--- a/crates/pumpkin-world/src/generation/structure/placement.rs
++++ b/crates/pumpkin-world/src/generation/structure/placement.rs
+@@ -10,7 +10,8 @@ use pumpkin_util::{
+     },
+ };
+ use std::f64::consts::PI;
+-use std::sync::OnceLock;
++use std::sync::atomic::{AtomicUsize, Ordering};
++use std::sync::{Arc, OnceLock};
+ 
+ use crate::ProtoChunk;
+ use dashmap::DashMap;
+@@ -31,6 +32,7 @@ pub struct GlobalStructureCache {
+     /// world seed, so it is computed once here instead of being recomputed for every
+     /// surrounding chunk whose structure references overlap it.
+     structure_starts: OnceLock<DashMap<(StructureKeys, i32, i32), Option<StructurePosition>>>,
++    inserted_starts: AtomicUsize,
+ }
+ impl GlobalStructureCache {
+     /// Creates a new, empty global structure cache.
+@@ -39,6 +41,7 @@ impl GlobalStructureCache {
+         Self {
+             stronghold_chunks: OnceLock::new(),
+             structure_starts: OnceLock::new(),
++            inserted_starts: AtomicUsize::new(0),
+         }
+     }
+ 
+@@ -66,8 +69,29 @@ impl GlobalStructureCache {
+             return cached.value().clone();
+         }
+         let computed = compute();
+-        cache.insert((key, chunk_x, chunk_z), computed.clone());
+-        computed
++        // Concurrent requests must share the same collector: generation deduplicates
++        // structure references by Arc identity.
++        let result = cache
++            .entry((key, chunk_x, chunk_z))
++            .or_insert(computed)
++            .clone();
++        if self.inserted_starts.fetch_add(1, Ordering::Relaxed) % 256 == 255 && cache.len() > 2048 {
++            self.evict_unused_starts();
++        }
++        result
++    }
++
++    fn evict_unused_starts(&self) {
++        if let Some(cache) = self.structure_starts.get() {
++            // Active generation keeps its own Arc. Never replace a collector that
++            // another chunk can still use; idle placements can be recomputed from
++            // their world seed and start coordinates.
++            cache.retain(|_, position| {
++                position
++                    .as_ref()
++                    .is_some_and(|position| Arc::strong_count(&position.collector) > 1)
++            });
++        }
+     }
+ 
+     /// Retrieves the list of chunk coordinates for Concentric Ring structures.
+@@ -450,3 +474,77 @@ mod tests {
+         ));
+     }
+ }
++
++#[cfg(test)]
++mod cache_tests {
++    use super::*;
++    use crate::generation::structure::structures::StructurePiecesCollector;
++    use pumpkin_util::math::position::BlockPos;
++    use std::sync::Mutex;
++
++    fn position() -> StructurePosition {
++        StructurePosition {
++            start_pos: BlockPos::new(1, 2, 3),
++            collector: Arc::new(Mutex::new(StructurePiecesCollector::new())),
++        }
++    }
++
++    #[test]
++    fn exploration_releases_idle_entries_but_preserves_active_collectors() {
++        let cache = GlobalStructureCache::new();
++        let active = cache
++            .get_or_compute_structure_start(StructureKeys::Monument, -1, -1, || Some(position()))
++            .unwrap();
++        for x in 0..10_000 {
++            assert!(
++                cache
++                    .get_or_compute_structure_start(StructureKeys::Monument, x, 0, || None)
++                    .is_none()
++            );
++        }
++        assert!(cache.structure_starts.get().unwrap().len() <= 2304);
++        cache.evict_unused_starts();
++        let reused = cache
++            .get_or_compute_structure_start(StructureKeys::Monument, -1, -1, || {
++                panic!("active collector was evicted")
++            })
++            .unwrap();
++        assert!(Arc::ptr_eq(&active.collector, &reused.collector));
++        drop(reused);
++        drop(active);
++        cache.evict_unused_starts();
++        assert!(cache.structure_starts.get().unwrap().is_empty());
++        let rebuilt = cache
++            .get_or_compute_structure_start(StructureKeys::Monument, -1, -1, || Some(position()))
++            .unwrap();
++        assert_eq!(rebuilt.start_pos, BlockPos::new(1, 2, 3));
++    }
++
++    #[test]
++    fn concurrent_misses_return_one_canonical_collector() {
++        let cache = GlobalStructureCache::new();
++        let barrier = std::sync::Barrier::new(2);
++        std::thread::scope(|scope| {
++            let a = scope.spawn(|| {
++                cache
++                    .get_or_compute_structure_start(StructureKeys::Monument, 0, 0, || {
++                        barrier.wait();
++                        Some(position())
++                    })
++                    .unwrap()
++            });
++            let b = scope.spawn(|| {
++                cache
++                    .get_or_compute_structure_start(StructureKeys::Monument, 0, 0, || {
++                        barrier.wait();
++                        Some(position())
++                    })
++                    .unwrap()
++            });
++            assert!(Arc::ptr_eq(
++                &a.join().unwrap().collector,
++                &b.join().unwrap().collector
++            ));
++        });
++    }
++}
 diff --git a/crates/pumpkin-world/src/generation/structure/structures/end_city/layout.rs b/crates/pumpkin-world/src/generation/structure/structures/end_city/layout.rs
-index a7f29d8dc..ca0dc47dd 100644
+index a7f29d8d..ca0dc47d 100644
 --- a/crates/pumpkin-world/src/generation/structure/structures/end_city/layout.rs
 +++ b/crates/pumpkin-world/src/generation/structure/structures/end_city/layout.rs
 @@ -663,7 +663,7 @@ mod tests {
@@ -157,7 +951,7 @@ index a7f29d8dc..ca0dc47dd 100644
                      Rotation::None,
                      Rotation::Clockwise90,
 diff --git a/crates/pumpkin-world/src/generation/structure/structures/end_city/mod.rs b/crates/pumpkin-world/src/generation/structure/structures/end_city/mod.rs
-index 8089b3e69..9bb82ed9c 100644
+index 8089b3e6..9bb82ed9 100644
 --- a/crates/pumpkin-world/src/generation/structure/structures/end_city/mod.rs
 +++ b/crates/pumpkin-world/src/generation/structure/structures/end_city/mod.rs
 @@ -98,7 +98,7 @@ impl EndCityTemplatePiece {
@@ -176,36 +970,36 @@ index 8089b3e69..9bb82ed9c 100644
 -            Self::place_block_entity(chunk, palette, block.nbt.as_ref(), position, random);
 +            Self::place_block_entity(chunk, palette, block.nbt.as_deref(), position, random);
          }
-
+ 
 -        for block in &self.descriptor.template.blocks {
 +        for block in self.descriptor.template.blocks.iter() {
              let palette = &self.descriptor.template.palette[block.state as usize];
              if palette.name != "minecraft:structure_block" {
                  continue;
 diff --git a/crates/pumpkin-world/src/generation/structure/structures/igloo.rs b/crates/pumpkin-world/src/generation/structure/structures/igloo.rs
-index 9130b4626..363993029 100644
+index 9130b462..36399302 100644
 --- a/crates/pumpkin-world/src/generation/structure/structures/igloo.rs
 +++ b/crates/pumpkin-world/src/generation/structure/structures/igloo.rs
 @@ -190,7 +190,7 @@ impl IglooPiece {
              &mut context_rng,
          );
-
+ 
 -        for block in &self.template.blocks {
 +        for block in self.template.blocks.iter() {
              let palette_entry = &self.template.palette[block.state as usize];
-
+ 
              let local_pos =
 @@ -226,7 +226,7 @@ impl IglooPiece {
                  continue;
              }
-
+ 
 -            let mut block_entity_nbt = block.nbt.clone();
 +            let mut block_entity_nbt = block.nbt.as_deref().cloned();
              let placed_entry = palette_entry.clone();
-
+ 
              let Some(state) = BlockStateResolver::resolve(&placed_entry, rotation, mirror) else {
 diff --git a/crates/pumpkin-world/src/generation/structure/structures/jigsaw.rs b/crates/pumpkin-world/src/generation/structure/structures/jigsaw.rs
-index ef4f28879..17adbfbf0 100644
+index ef4f2887..17adbfbf 100644
 --- a/crates/pumpkin-world/src/generation/structure/structures/jigsaw.rs
 +++ b/crates/pumpkin-world/src/generation/structure/structures/jigsaw.rs
 @@ -310,7 +310,7 @@ impl PoolElementKind {
@@ -218,7 +1012,7 @@ index ef4f28879..17adbfbf0 100644
                          block,
                          &template.palette[block.state as usize],
 diff --git a/crates/pumpkin-world/src/generation/structure/structures/mansion/mod.rs b/crates/pumpkin-world/src/generation/structure/structures/mansion/mod.rs
-index e4cb49032..53b67b4a6 100644
+index e4cb4903..53b67b4a 100644
 --- a/crates/pumpkin-world/src/generation/structure/structures/mansion/mod.rs
 +++ b/crates/pumpkin-world/src/generation/structure/structures/mansion/mod.rs
 @@ -276,7 +276,7 @@ impl MansionTemplatePiece {
@@ -240,68 +1034,68 @@ index e4cb49032..53b67b4a6 100644
                  random,
              );
 diff --git a/crates/pumpkin-world/src/generation/structure/structures/nether_fossil.rs b/crates/pumpkin-world/src/generation/structure/structures/nether_fossil.rs
-index 73047f6d6..da14d13c1 100644
+index 73047f6d..da14d13c 100644
 --- a/crates/pumpkin-world/src/generation/structure/structures/nether_fossil.rs
 +++ b/crates/pumpkin-world/src/generation/structure/structures/nether_fossil.rs
 @@ -182,10 +182,10 @@ impl NetherFossilPiece {
              &mut context_rng,
          );
-
+ 
 -        for block in &self.template.blocks {
 +        for block in self.template.blocks.iter() {
              let palette_entry = &self.template.palette[block.state as usize];
-
+ 
 -            let mut block_entity_nbt = block.nbt.clone();
 +            let mut block_entity_nbt = block.nbt.as_deref().cloned();
              let placed_entry = palette_entry.clone();
-
+ 
              let Some(state) = BlockStateResolver::resolve(&placed_entry, rotation, mirror) else {
 diff --git a/crates/pumpkin-world/src/generation/structure/structures/ocean_ruin.rs b/crates/pumpkin-world/src/generation/structure/structures/ocean_ruin.rs
-index 5823f93bd..abe91eba9 100644
+index 5823f93b..abe91eba 100644
 --- a/crates/pumpkin-world/src/generation/structure/structures/ocean_ruin.rs
 +++ b/crates/pumpkin-world/src/generation/structure/structures/ocean_ruin.rs
 @@ -459,7 +459,7 @@ impl StructurePieceBase for OceanRuinPiece {
-
+ 
          let mut suspicious_count = 0;
-
+ 
 -        for block in &self.template.blocks {
 +        for block in self.template.blocks.iter() {
              let palette_entry = &self.template.palette[block.state as usize];
-
+ 
              if palette_entry.name == "minecraft:structure_void"
 diff --git a/crates/pumpkin-world/src/generation/structure/structures/ruined_portal.rs b/crates/pumpkin-world/src/generation/structure/structures/ruined_portal.rs
-index 404a63b21..a486ec2a9 100644
+index 404a63b2..a486ec2a 100644
 --- a/crates/pumpkin-world/src/generation/structure/structures/ruined_portal.rs
 +++ b/crates/pumpkin-world/src/generation/structure/structures/ruined_portal.rs
 @@ -293,10 +293,10 @@ impl RuinedPortalPiece {
              &mut context_rng,
          );
-
+ 
 -        for block in &self.template.blocks {
 +        for block in self.template.blocks.iter() {
              let palette_entry = &self.template.palette[block.state as usize];
-
+ 
 -            let mut block_entity_nbt = block.nbt.clone();
 +            let mut block_entity_nbt = block.nbt.as_deref().cloned();
              let placed_entry = palette_entry.clone();
-
+ 
              let Some(mut state) = BlockStateResolver::resolve(&placed_entry, rotation, mirror)
 diff --git a/crates/pumpkin-world/src/generation/structure/structures/shipwreck.rs b/crates/pumpkin-world/src/generation/structure/structures/shipwreck.rs
-index 53ced600c..029775470 100644
+index 53ced600..02977547 100644
 --- a/crates/pumpkin-world/src/generation/structure/structures/shipwreck.rs
 +++ b/crates/pumpkin-world/src/generation/structure/structures/shipwreck.rs
 @@ -307,7 +307,7 @@ impl StructurePieceBase for ShipwreckPiece {
-
+ 
          // Place non-marker blocks
          let box_limit = self.piece.bounding_box;
 -        for block in &self.template.blocks {
 +        for block in self.template.blocks.iter() {
              let palette_entry = &self.template.palette[block.state as usize];
-
+ 
              if palette_entry.name == "minecraft:structure_block"
 @@ -393,7 +393,7 @@ impl StructurePieceBase for ShipwreckPiece {
          }
-
+ 
          // Process data markers
 -        for block in &self.template.blocks {
 +        for block in self.template.blocks.iter() {
@@ -309,43 +1103,43 @@ index 53ced600c..029775470 100644
              if palette_entry.name == "minecraft:structure_block"
                  && let Some(nbt) = &block.nbt
 diff --git a/crates/pumpkin-world/src/generation/structure/template/mod.rs b/crates/pumpkin-world/src/generation/structure/template/mod.rs
-index 5e1f6636c..aa7938006 100644
+index 5e1f6636..aa793800 100644
 --- a/crates/pumpkin-world/src/generation/structure/template/mod.rs
 +++ b/crates/pumpkin-world/src/generation/structure/template/mod.rs
 @@ -117,7 +117,7 @@ pub fn place_template_with_options(
      let mut context_rng = LegacyRand::from_seed(hash_block_pos(world_x, origin.y, world_z) as u64);
      let mut context = processor::ProcessorContext::new(origin, processors, &mut context_rng);
-
+ 
 -    for block in &template.blocks {
 +    for block in template.blocks.iter() {
          let palette_entry = &template.palette[block.state as usize];
-
+ 
          // Structure blocks are data markers.
 @@ -125,7 +125,7 @@ pub fn place_template_with_options(
              continue;
          }
-
+ 
 -        let mut block_entity_nbt = block.nbt.clone();
 +        let mut block_entity_nbt = block.nbt.as_deref().cloned();
          let mut placed_entry = palette_entry.clone();
-
+ 
          // Jigsaw blocks are replaced during template processing, before block entities are
 diff --git a/crates/pumpkin-world/src/generation/structure/template/structure_template.rs b/crates/pumpkin-world/src/generation/structure/template/structure_template.rs
-index 211c79e90..bd0406775 100644
+index 211c79e9..bd040677 100644
 --- a/crates/pumpkin-world/src/generation/structure/template/structure_template.rs
 +++ b/crates/pumpkin-world/src/generation/structure/template/structure_template.rs
 @@ -4,6 +4,7 @@
  //! into a runtime representation with palettes, entities, block info, and transformations.
-
+ 
  use std::io::Cursor;
 +use std::sync::Arc;
-
+ 
  use pumpkin_data::{Mirror, Rotation};
  use pumpkin_nbt::{compound::NbtCompound, nbt_compress::read_gzip_compound_tag, tag::NbtTag};
 @@ -195,9 +196,9 @@ pub struct StructureTemplate {
      pub size: Vector3<i32>,
      pub author: String,
-
+ 
 -    // Backward-compatible fields
 -    pub palette: Vec<PaletteEntry>,
 -    pub blocks: Vec<TemplateBlock>,
@@ -354,11 +1148,11 @@ index 211c79e90..bd0406775 100644
 +    pub blocks: Arc<[TemplateBlock]>,
      pub entities: Vec<TemplateEntity>,
  }
-
+ 
 @@ -332,6 +333,20 @@ pub struct StructureBlockInfo {
      pub nbt: Option<NbtCompound>,
  }
-
+ 
 +/// A borrowed view over an indexed template block. Only callers producing a
 +/// transformed/mutable block need to materialize owned strings and NBT.
 +pub struct StructureBlockInfoRef<'a> {
@@ -385,7 +1179,7 @@ index 211c79e90..bd0406775 100644
 +    entries: Arc<[PaletteEntry]>,
      cached_jigsaws: Option<Vec<JigsawBlockInfo>>,
  }
-
+ 
  impl Palette {
      #[must_use]
 -    pub const fn new(blocks: Vec<StructureBlockInfo>) -> Self {
@@ -405,7 +1199,7 @@ index 211c79e90..bd0406775 100644
              cached_jigsaws: None,
          }
      }
-
+ 
      #[must_use]
 -    pub fn blocks(&self) -> &[StructureBlockInfo] {
 -        &self.blocks
@@ -420,7 +1214,7 @@ index 211c79e90..bd0406775 100644
 +            nbt: block.nbt.as_deref(),
 +        }
      }
-
+ 
      #[must_use]
      pub fn blocks_by_name(&self, filter: &str) -> Vec<StructureBlockInfo> {
 -        self.blocks
@@ -431,7 +1225,7 @@ index 211c79e90..bd0406775 100644
 +            .map(StructureBlockInfoRef::into_owned)
              .collect()
      }
-
+ 
      pub fn jigsaws(&mut self) -> &[JigsawBlockInfo] {
 -        self.cached_jigsaws.get_or_insert_with(|| {
 -            self.blocks
@@ -451,10 +1245,10 @@ index 211c79e90..bd0406775 100644
 +        self.cached_jigsaws.as_deref().unwrap()
      }
  }
-
+ 
 @@ -507,11 +542,11 @@ impl SimplePalette {
  }
-
+ 
  /// A single block placement in the template (legacy format).
 -#[derive(Debug, Clone)]
 +#[derive(Debug, Clone, PartialEq)]
@@ -464,7 +1258,7 @@ index 211c79e90..bd0406775 100644
 -    pub nbt: Option<NbtCompound>,
 +    pub nbt: Option<Arc<NbtCompound>>,
  }
-
+ 
  /// An entity to spawn when placing the template (legacy format).
 @@ -842,7 +877,7 @@ impl StructureTemplate {
                      result.push(StructureBlockInfo::new(
@@ -582,7 +1376,7 @@ index 211c79e90..bd0406775 100644
 +        });
          Ok(())
      }
-
+ 
 -    fn add_to_lists(
 -        info: StructureBlockInfo,
 -        full_block_list: &mut Vec<StructureBlockInfo>,
@@ -604,7 +1398,7 @@ index 211c79e90..bd0406775 100644
 @@ -1066,48 +1091,13 @@ impl StructureTemplate {
              || stripped.contains("scaffolding"))
      }
-
+ 
 -    fn build_info_list(
 -        mut full_block_list: Vec<StructureBlockInfo>,
 -        mut block_entities_list: Vec<StructureBlockInfo>,
@@ -652,12 +1446,12 @@ index 211c79e90..bd0406775 100644
 +            self.palette = Arc::default();
 +            self.blocks = Arc::default();
          }
-
+ 
          self.entities = self
 @@ -1140,7 +1130,7 @@ impl StructureTemplate {
              let mut block_list = Vec::new();
              let main_palette_blocks = self.palettes[0].blocks();
-
+ 
 -            for (i, block_info) in main_palette_blocks.iter().enumerate() {
 +            for (i, block_info) in main_palette_blocks.enumerate() {
                  let mut block_tag = NbtCompound::new();
@@ -666,14 +1460,14 @@ index 211c79e90..bd0406775 100644
 @@ -1152,14 +1142,15 @@ impl StructureTemplate {
                  let id = palettes[0].id_for(block_info.state.clone());
                  block_tag.put_int(Self::BLOCK_TAG_STATE, id as i32);
-
+ 
 -                if let Some(nbt) = &block_info.nbt {
 +                if let Some(nbt) = block_info.nbt {
                      block_tag.put_compound(Self::BLOCK_TAG_NBT, nbt.clone());
                  }
-
+ 
                  block_list.push(NbtTag::Compound(block_tag));
-
+ 
                  for p in 1..self.palettes.len() {
 -                    let state = self.palettes[p].blocks()[i].state.clone();
 +                    let state =
@@ -683,17 +1477,17 @@ index 211c79e90..bd0406775 100644
              }
 @@ -1263,7 +1254,7 @@ impl StructureTemplate {
      }
-
+ 
      #[must_use]
 -    pub const fn block_count(&self) -> usize {
 +    pub fn block_count(&self) -> usize {
          self.blocks.len()
      }
-
+ 
 @@ -1282,6 +1273,102 @@ impl StructureTemplate {
  mod tests {
      use super::*;
-
+ 
 +    fn assert_same_blocks(before: &Palette, after: &Palette) {
 +        assert_eq!(before.blocks.len(), after.blocks.len());
 +        for (index, (a, b)) in before.blocks().zip(after.blocks()).enumerate() {
@@ -794,24 +1588,87 @@ index 211c79e90..bd0406775 100644
      fn palette_entry_creation() {
          let entry = PaletteEntry::new("minecraft:stone".to_string());
 diff --git a/crates/pumpkin-world/src/generation/structure/template/template_piece.rs b/crates/pumpkin-world/src/generation/structure/template/template_piece.rs
-index e3f9357b6..68c33f67a 100644
+index e3f9357b..68c33f67 100644
 --- a/crates/pumpkin-world/src/generation/structure/template/template_piece.rs
 +++ b/crates/pumpkin-world/src/generation/structure/template/template_piece.rs
 @@ -176,7 +176,7 @@ impl TemplatePiece {
              .get_bounding_box(&self.place_settings, self.template_position);
          let box_limit = self.piece.bounding_box;
-
+ 
 -        for block in &self.template.blocks {
 +        for block in self.template.blocks.iter() {
              let palette_entry = &self.template.palette[block.state as usize];
-
+ 
              // Structure blocks are data markers
 @@ -185,7 +185,7 @@ impl TemplatePiece {
              }
-
+ 
              let mut placed_entry = palette_entry.clone();
 -            let mut block_entity_nbt = block.nbt.clone();
 +            let mut block_entity_nbt = block.nbt.as_deref().cloned();
-
+ 
              // Jigsaw blocks are replaced with final_state
              if palette_entry.name == "minecraft:jigsaw" {
+diff --git a/crates/pumpkin-world/src/lighting/engine.rs b/crates/pumpkin-world/src/lighting/engine.rs
+index 47318e43..d28e77f3 100644
+--- a/crates/pumpkin-world/src/lighting/engine.rs
++++ b/crates/pumpkin-world/src/lighting/engine.rs
+@@ -786,6 +786,10 @@ impl LightEngine {
+ 
+         self.block_light.clear();
+         self.sky_light.clear();
++        let light = &mut cache.get_center_chunk_mut().light;
++        for section in light.sky_light.iter_mut().chain(&mut light.block_light) {
++            section.compact();
++        }
+     }
+ 
+     pub fn update_block_light(
+diff --git a/crates/pumpkin/src/entity/ai/pathfinder/binary_heap.rs b/crates/pumpkin/src/entity/ai/pathfinder/binary_heap.rs
+index 5bf1caa5..e6990a67 100644
+--- a/crates/pumpkin/src/entity/ai/pathfinder/binary_heap.rs
++++ b/crates/pumpkin/src/entity/ai/pathfinder/binary_heap.rs
+@@ -19,8 +19,8 @@ pub struct BinaryHeap {
+ impl BinaryHeap {
+     #[must_use]
+     pub fn new() -> Self {
+-        let mut heap = Vec::with_capacity(1024);
+-        heap.push(None);
++        // Most navigators are idle. Reserve nodes when a search actually needs them.
++        let heap = vec![None];
+ 
+         Self {
+             heap,
+@@ -238,3 +238,32 @@ impl Default for BinaryHeap {
+         Self::new()
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::{BinaryHeap, Node};
++    use pumpkin_util::math::position::BlockPos;
++
++    #[test]
++    fn idle_heaps_grow_without_changing_pathfinding_order() {
++        let mut heap = BinaryHeap::new();
++        assert!(heap.heap.capacity() < 1024);
++        assert!(heap.is_empty());
++        for x in (0..1500).rev() {
++            let mut node = Node::new(BlockPos::new(x, 0, 0));
++            node.f = x as f32;
++            heap.insert(node);
++        }
++        for x in 0..1500 {
++            assert_eq!(heap.pop().unwrap().pos, BlockPos::new(x, 0, 0));
++        }
++        assert!(heap.pop().is_none());
++        heap.clear();
++        assert!(heap.get_heap().is_empty());
++        let mut node = Node::new(BlockPos::new(42, 0, 0));
++        node.f = 1.0;
++        heap.insert(node);
++        assert_eq!(heap.drain().len(), 1);
++        assert!(heap.is_empty());
++    }
++}

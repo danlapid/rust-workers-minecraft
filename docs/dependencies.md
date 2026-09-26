@@ -1,23 +1,21 @@
 # Dependency sources and pins
 
-A clean checkout is self-contained after `bash scripts/setup.sh`. Dependency sources
-are ignored under `.work/`. Both Cargo and npm dependency graphs are locked.
+A clean checkout is self-contained after `bash scripts/setup.sh`. The patched
+Pumpkin checkout and the worker-build CLI live under `.work/` (ignored);
+worker-build provisions its own Emscripten and wasm-bindgen CLI under
+`~/.cache/worker-build`. Both Cargo and npm dependency graphs are locked.
 
-## Direct checkouts
+## Pinned sources
 
-| Component | Source / branch | Commit | Local changes or purpose |
+| Component | Source / ref | Commit or tag | Local changes or purpose |
 | --- | --- | --- | --- |
-| emscripten | [cf](https://github.com/guybedford/emscripten) | `21166256c4c4d73d39b3685c8973d7cbe427ce8c` | Fork frontend: epoll, JSPI, wasm-bindgen post-link |
-| wasm-bindgen | [emscripten-non-identifier-names](https://github.com/guybedford/wasm-bindgen) | `4b69f3b3ba4212c857be6854f77fa5aec8b62871` | Closure-finalizer string escaping |
-| tokio | [emscripten-layering](https://github.com/guybedford/tokio) | `7c1d4977c510866775ed6164b58b2218a6a2955b` | HostedRuntime and normal Tokio TCP/UDP APIs; unmodified |
-| libc | [libc-0.2-emscripten](https://github.com/guybedford/libc) | `4091fe0b0dc5f9c1a27bed75be1ff02bb27e756d` | Emscripten epoll and socket support; unmodified |
-| ring | [emscripten](https://github.com/guybedford/ring) | `6671f7cfbb13f249b571ffa6326275a8596e0ca2` | Portable Emscripten crypto backend; unmodified |
-| pumpkin | [master](https://github.com/Pumpkin-MC/Pumpkin) | `b5b9b9d7010e793806a83c495af223c67e1d35ee` | Headless embedding, shared async scheduler, compact templates/generation chunks, and build-script fixes |
-| workers-rs | [connect-bindings](https://github.com/ThomasRubini/workers-rs) | `7db011ec97658a5d907f3e3102028ce86c044f19` | TCP ingress PR #1041; pinned ABI, Emscripten Tokio promise adapter, host-owned initialization, and socket shutdown flushing |
-| wasm-streams | [v0.6.0](https://github.com/MattiasBuelens/wasm-streams) | `35665f7b1da830b5ac51b4c6c3ff13f5c1a09ccb` | Build only the Rust library; its standalone `cdylib` is incompatible with static Emscripten linking |
+| pumpkin | [master](https://github.com/Pumpkin-MC/Pumpkin) | `b5b9b9d7010e793806a83c495af223c67e1d35ee` | Checkout under `.work/pumpkin`: headless embedding, shared async scheduler, restartable stop signal, compact templates/generation chunks, and build-script fixes |
+| tokio | [guybedford/tokio](https://github.com/guybedford/tokio) | tag `1.53.1-cf.emscripten` | `LocalEventLoop` (tokio-rs/tokio#8484) and `net` over epoll on Emscripten; a `[patch.crates-io]` git dependency; unmodified |
+| emscripten | [guybedford/emscripten](https://github.com/guybedford/emscripten) | tag `6.0.10-cf.emscripten` | The 6.0.10 release plus emscripten-core/emscripten#27547 (epoll listeners on the host loop) and #27742 (async DNS lookup). worker-build installs emsdk 6.0.10 and applies these as its bundled patches |
 
-Patches are relative to the pinned commits above. Setup checks reverse application
-before applying a patch and refuses to repin a modified checkout.
+The Pumpkin patches are relative to the pinned commit above. Setup checks
+reverse application before applying a patch and refuses to repin a modified
+checkout.
 
 Pumpkin has two patches: `pumpkin-emscripten.patch` for embedding/runtime support,
 followed by `pumpkin-memory.patch` for compact templates and generation chunks.
@@ -26,26 +24,37 @@ commit.
 
 ## Cargo-managed forks
 
-| Crate | Source | Commit |
+| Crate | Source | Purpose |
 | --- | --- | --- |
-| mio | https://github.com/guybedford/mio | `a62c9e46833fc255c9217ab9aa362c6221ed4401` |
-| socket2 | https://github.com/rust-lang/socket2 | `239dd83a4ced08e514d2c38942aab99791119f0d` |
+| mio | https://github.com/guybedford/mio tag `1.2.3-cf.emscripten` | Emscripten epoll selector (tokio-rs/mio#1969) |
+| libc | https://github.com/rust-lang/libc branch `libc-0.2` | Emscripten epoll bindings, unreleased |
+| ring | https://github.com/guybedford/ring branch `emscripten` | getrandom-backed `SystemRandom` on Emscripten |
 
-The root Cargo.toml applies these overrides and the local checkouts. Cargo.lock
-pins the full application graph. `toolchain/wasm-bindgen.Cargo.lock` separately pins
-the host CLI graph, since that upstream workspace does not commit a lockfile.
+The root Cargo.toml applies these overrides and the local checkouts; the
+wasm-bindgen crates (0.2.129, with `#[wasm_bindgen(experimental_tokio)]`) and
+wasm-streams 0.7 come from crates.io. Cargo.lock pins the full application
+graph, including the branch commits.
 
 ## Host tools
 
-- Rust: `nightly-2026-07-20`, target `wasm32-unknown-emscripten`; setup installs both through rustup.
+- Rust: `beta` channel (1.99; `OwnedFd::try_clone` on Emscripten), target
+  `wasm32-unknown-emscripten`; setup installs both through rustup. rustc needs a
+  larger compile-thread stack for pumpkin-data's generated tables; the scripts
+  set `RUST_MIN_STACK`.
+- worker-build 0.8.7 (cloudflare/workers-rs#1061 released): installed by setup
+  with `cargo install`, matching the `worker` crate version in Cargo.toml, into
+  `.work/bin/`. It provisions emsdk 6.0.10 with
+  its bundled Emscripten patches and the matching wasm-bindgen CLI under
+  `~/.cache/worker-build`, drives cargo and emcc with the common link settings,
+  wraps the exports into the entrypoint and Durable Object classes, and emits
+  `build/`. `EMSCRIPTEN`/`EMSDK` select a local toolchain instead.
 - Node: 24+; 26 recommended and selected in CI. Used for build tools and tests.
-- Python: 3.11+ (Emscripten scripts and TOML parsing).
-- Backend: Homebrew `emscripten`, detected with `brew --prefix emscripten`.
-  Homebrew backend versions are external prerequisites, not pinned source files.
-
-Setup deliberately uses the fork frontend with Homebrew's LLVM/binaryen backend;
-emsdk is not needed. It writes a machine-local `.emscripten_cf`, builds wasm-bindgen
-explicitly for the host target, and places the CLI in `.work/bin/`.
+- Python: 3.11+ (Emscripten scripts, emsdk and TOML parsing).
+- workerd 1.20260925.1 (Wrangler 4.141.0's bundled version, also pinned directly
+  in `package.json`); 1.20260918.1 was the first release with `net.Server` inbound routing into
+  Durable Objects (`handleAsNodeConnection`, cloudflare/workerd#7306, #7313) and
+  the `node:fs` fixes for positional buffer I/O (#7368), `O_TRUNC` (#7369),
+  `O_CREAT` (#7393), and rename over an existing path (#7394).
 
 ## Updating a patch
 
@@ -54,14 +63,12 @@ upstream base from the repository root. Write it under `.work/` to preserve the
 commit description at the top of the maintained patch:
 
 ```sh
+git -C .work/pumpkin add -N crates/pumpkin/src/net/bedrock/nethernet_stub.rs
 git -C .work/pumpkin diff b5b9b9d7010e793806a83c495af223c67e1d35ee -- \
   . ':(exclude)Cargo.lock' ':(exclude)crates/pumpkin-world/src/generation' \
   > .work/pumpkin-emscripten.diff
 git -C .work/pumpkin diff b5b9b9d7010e793806a83c495af223c67e1d35ee -- \
   crates/pumpkin-world/src/generation > .work/pumpkin-memory.diff
-git -C .work/wasm-bindgen diff 4b69f3b3ba4212c857be6854f77fa5aec8b62871 -- crates/cli-support/src/js/mod.rs > .work/wasm-bindgen-emscripten-closures.diff
-git -C .work/workers-rs diff 7db011ec97658a5d907f3e3102028ce86c044f19 > .work/workers-rs-emscripten-toolchain.diff
-git -C .work/wasm-streams diff 35665f7b1da830b5ac51b4c6c3ff13f5c1a09ccb > .work/wasm-streams-rlib.diff
 ```
 
 Replace the corresponding patch's contents from its first `diff --git` line onward
@@ -72,14 +79,14 @@ The Pumpkin path filters reflect the current separation: all memory-patch files
 are under `crates/pumpkin-world/src/generation/`. Adjust the filters if that scope
 changes, keeping platform support and memory optimizations in their own patches.
 
-`git diff` omits untracked files, including files created by existing patches.
-Preserve those added-file diffs when regenerating (for example,
-`nethernet_stub.rs` in the compatibility patch). If you add a file in a dependency
-checkout, include it explicitly and verify application on a fresh copy of the base.
-Run `bash scripts/test.sh` after runtime changes. Keep unpatched checkouts unmodified.
-Setup refuses to repin a modified checkout rather than discarding local work.
+`git diff` omits untracked files, including files created by existing patches;
+`add -N` above includes `nethernet_stub.rs`. If you add a file in a dependency
+checkout, include it the same way and verify application on a fresh copy of the
+base. Run `bash scripts/test.sh` after runtime changes. Keep unpatched checkouts
+unmodified. Setup refuses to repin a modified checkout rather than discarding
+local work.
 
-For source/patch validation without rebuilding the toolchain:
+For source/patch validation without provisioning the toolchain:
 
 ```sh
 bash scripts/setup.sh --sources-only
@@ -87,11 +94,14 @@ bash scripts/setup.sh --sources-only
 
 ## JavaScript dependencies
 
-`package-lock.json` pins Wrangler 4.129.0, worker-fs-mount 0.2.0,
-durable-object-fs 1.0.0, TypeScript, and their dependencies. The npm override for
-durable-object-fs replaces its published `workspace:*` peer dependency with the
-selected worker-fs-mount version. Generated runtime/binding types are recreated by
-`npm run types` and are not committed.
+`package-lock.json` pins Wrangler 4.141.0, workerd 1.20260925.1, `worker-fs-mount` 0.2.0 and
+`durable-object-fs` 1.0.0 (the SQLite filesystem mount, imported by
+`src/js/mount.js` and bundled by worker-build). `npm install` applies
+`patches/worker-fs-mount-open-mode.patch` to the installed `worker-fs-mount`
+(numeric open modes masked to their permission bits, as Node does; pending
+upstream). worker-build generates
+`build/index.js`, which wraps the exports into the entrypoint and derives the
+Durable Object class from `DurableObject` for RPC.
 
 After moving a checkout with cached build output, run `cargo clean` before rebuilding.
 Generated data can contain absolute paths. This leaves databases under `.data/` intact.

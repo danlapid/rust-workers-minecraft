@@ -1,111 +1,88 @@
 mod config;
+mod handshake;
+mod host;
 mod memory;
+mod settings;
+mod world;
 
-use pumpkin::{data::VanillaData, PumpkinServer};
-use std::{cell::RefCell, sync::atomic::Ordering, sync::Arc};
+use host::method;
 use wasm_bindgen::prelude::*;
-use worker::emscripten::{future_to_promise, js_error, socket_from_value};
+use worker::{event, Context, Env, Request, Response, Socket};
 
 fn main() {}
 
-thread_local! {
-    static FAILURE: RefCell<Option<String>> = const { RefCell::new(None) };
-    static SERVER: RefCell<Option<Arc<PumpkinServer>>> = const { RefCell::new(None) };
-    static NEXT_CLIENT: RefCell<u64> = const { RefCell::new(0) };
+/// The world's Durable Object stub, from the declared `MinecraftWorld` export.
+fn world(env: &Env) -> worker::Result<worker::worker_sys::DurableObject> {
+    let name = env.var("WORLD_NAME")?.to_string();
+    let namespace = host::EXPORTS.with(|exports| host::property(exports, "MinecraftWorld"))?;
+    Ok(method(&namespace, "getByName", &[&JsValue::from(name)])?.unchecked_into())
 }
 
-fn server() -> Result<Arc<PumpkinServer>, JsValue> {
-    if let Some(error) = FAILURE.with(|failure| failure.borrow().clone()) {
-        return Err(js_error(error));
-    }
-    SERVER
-        .with(|server| server.borrow().clone())
-        .ok_or_else(|| js_error("Server is not started"))
-}
-
-#[wasm_bindgen]
-pub fn pumpkin_start() -> js_sys::Promise {
-    future_to_promise(async {
-        if SERVER.with(|server| server.borrow().is_some()) {
-            return Ok(JsValue::UNDEFINED);
+/// Serves an inbound TCP connection. Server-list pings are answered from the
+/// object's metadata without starting a server; a login handshake is piped to
+/// the world's object until either side closes.
+#[event(connect)]
+async fn connect(mut socket: Socket, env: Env, _ctx: Context) -> worker::Result<()> {
+    let world = world(&env)?;
+    let rpc: JsValue = world.clone().into();
+    let server_list = |protocol: u32| async move {
+        let promise =
+            method(&rpc, "serverList", &[&JsValue::from(protocol)]).map_err(js_message)?;
+        let json = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(promise))
+            .await
+            .map_err(js_message)?;
+        json.as_string()
+            .ok_or_else(|| "serverList returned no text".to_string())
+    };
+    let consumed = match handshake::accept(&mut socket, server_list).await {
+        Ok(handshake::Handshake::Login { consumed }) => consumed,
+        // Invalid or interrupted pre-login traffic never starts a game runtime.
+        Ok(handshake::Handshake::Status) => return Ok(()),
+        Err(error) => {
+            worker::console_debug!("Minecraft connection ended: {error}");
+            return Ok(());
         }
-        std::panic::set_hook(Box::new(|info| {
-            FAILURE.with(|failure| {
-                failure.borrow_mut().get_or_insert_with(|| info.to_string());
-            });
-            eprintln!("RUST PANIC: {info}");
-        }));
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
-            .use_current_thread()
-            .build_global()
-            .map_err(js_error)?;
-        let (basic, advanced) = config::configuration();
-        pumpkin::init_logger(&advanced);
-        let server = Arc::new(PumpkinServer::new(basic, advanced, VanillaData::load()).await);
-        server.init_plugins().await;
-        SERVER.with(|slot| *slot.borrow_mut() = Some(server));
-        Ok(JsValue::UNDEFINED)
-    })
-}
-
-#[wasm_bindgen]
-pub fn pumpkin_connect(raw: JsValue) -> js_sys::Promise {
-    future_to_promise(async move {
-        let server = server()?;
-        let socket = socket_from_value(raw)?;
-        let id = NEXT_CLIENT.with(|slot| {
-            let mut id = slot.borrow_mut();
-            *id += 1;
-            *id
-        });
-        // The SDK's socket is the injected Tokio byte stream. Its adapter handles
-        // backpressure, EOF and JS stream errors; no emulated TCP listener is used.
-        server
-            .serve_connection(socket, ([127, 0, 0, 1], 0).into(), id)
-            .await;
-        Ok(JsValue::UNDEFINED)
-    })
-}
-
-#[wasm_bindgen]
-pub fn pumpkin_status() -> Result<JsValue, JsValue> {
-    let server = server()?;
-    let result = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &result,
-        &"players".into(),
-        &(server.server.get_all_players().len() as f64).into(),
-    )?;
-    js_sys::Reflect::set(
-        &result,
-        &"ticks".into(),
-        &(server.server.tick_count.load(Ordering::Relaxed) as f64).into(),
-    )?;
-    js_sys::Reflect::set(
-        &result,
-        &"wasm_memory_bytes".into(),
-        &((core::arch::wasm32::memory_size::<0>() * 65536) as f64).into(),
-    )?;
-    for (name, bytes) in memory::heap_usage() {
-        js_sys::Reflect::set(&result, &name.into(), &(bytes as f64).into())?;
+    };
+    let options = js_sys::Object::new();
+    js_sys::Reflect::set(&options, &"allowHalfOpen".into(), &JsValue::TRUE)?;
+    let mut upstream = Socket::from(world.connect(&world::authority(), options.into())?);
+    // Either side closing ends the connection; a disconnect is not an error
+    // of the handler (which the `connect` event treats as fatal).
+    if let Err(error) = tokio::io::AsyncWriteExt::write_all(&mut upstream, &consumed).await {
+        worker::console_debug!("Minecraft connection ended: {error}");
+        return Ok(());
     }
-    Ok(result.into())
+    let (mut client_read, mut client_write) = tokio::io::split(socket);
+    let (mut server_read, mut server_write) = tokio::io::split(upstream);
+    let _ = tokio::select! {
+        r = tokio::io::copy(&mut client_read, &mut server_write) => r,
+        r = tokio::io::copy(&mut server_read, &mut client_write) => r,
+    };
+    Ok(())
 }
 
-#[wasm_bindgen]
-pub fn pumpkin_shutdown() -> js_sys::Promise {
-    future_to_promise(async {
-        let server = server()?;
-        if !server.server.get_all_players().is_empty() {
-            return Err(js_error(
-                "Disconnect clients before shutting down the world",
-            ));
+fn js_message(error: JsValue) -> String {
+    js_sys::Error::from(error).message().into()
+}
+
+#[event(fetch)]
+async fn fetch(request: Request, env: Env, _ctx: Context) -> worker::Result<Response> {
+    match request.path().as_str() {
+        "/health" => Response::ok(r#"{"ready":true}"#).map(json),
+        "/" if request.method() == worker::Method::Get => {
+            let rpc: JsValue = world(&env)?.into();
+            let status = method(&rpc, "status", &[])?;
+            let status =
+                wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(status)).await?;
+            let body = js_sys::JSON::stringify(&status)?;
+            Response::ok(String::from(body)).map(json)
         }
-        pumpkin::stop_server();
-        server.server.save_all().await.map_err(js_error)?;
-        server.server.shutdown().await;
-        SERVER.with(|slot| slot.borrow_mut().take());
-        Ok(JsValue::UNDEFINED)
-    })
+        _ => Response::error("Not found", 404),
+    }
+}
+
+fn json(response: Response) -> Response {
+    let headers = worker::Headers::new();
+    let _ = headers.set("content-type", "application/json");
+    response.with_headers(headers)
 }
