@@ -37,6 +37,9 @@ tokio-macros = { git = "https://github.com/guybedford/tokio", tag = "1.53.1-cf.e
 # tokio-rs/mio#1969; its emscripten epoll bindings come from libc's unreleased libc-0.2 branch.
 mio = { git = "https://github.com/guybedford/mio", tag = "1.2.3-cf.emscripten" }
 libc = { git = "https://github.com/rust-lang/libc", branch = "libc-0.2" }
+# rayon-rs/rayon#1323: the single-threaded fallback wakes the host to run spawned jobs.
+rayon = { git = "https://github.com/guybedford/rayon", branch = "fallback-spawn" }
+rayon-core = { git = "https://github.com/guybedford/rayon", branch = "fallback-spawn" }
 # getrandom-backed SystemRandom on emscripten.
 ring = { git = "https://github.com/guybedford/ring", branch = "emscripten" }
 

@@ -1826,7 +1826,6 @@ dependencies = [
  "p384",
  "pumpkin-codecs",
  "pumpkin-nbt",
- "rayon",
  "reqwest",
  "rsa",
  "rustls",
@@ -1930,8 +1929,7 @@ checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 [[package]]
 name = "rayon"
 version = "1.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb39b166781f92d482534ef4b4b1b2568f42613b53e5b6c160e24cfbfa30926d"
+source = "git+https://github.com/guybedford/rayon?branch=fallback-spawn#39b1d8c838d4d8c446249db526ec096999155f1b"
 dependencies = [
  "either",
  "rayon-core",
@@ -1940,8 +1938,7 @@ dependencies = [
 [[package]]
 name = "rayon-core"
 version = "1.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
+source = "git+https://github.com/guybedford/rayon?branch=fallback-spawn#39b1d8c838d4d8c446249db526ec096999155f1b"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
@@ -2617,7 +2614,7 @@ dependencies = [
 [[package]]
 name = "tokio"
 version = "1.53.1"
-source = "git+https://github.com/guybedford/tokio?tag=1.53.1-cf.emscripten#d56f1eff2c3fd72a946e1e536a3b93e32b002a80"
+source = "git+https://github.com/guybedford/tokio?tag=1.53.1-cf.emscripten#7227f2d72739c3bc9821074cc704e7582be92907"
 dependencies = [
  "bytes",
  "libc",
@@ -2631,7 +2628,7 @@ dependencies = [
 [[package]]
 name = "tokio-macros"
 version = "2.7.2"
-source = "git+https://github.com/guybedford/tokio?tag=1.53.1-cf.emscripten#d56f1eff2c3fd72a946e1e536a3b93e32b002a80"
+source = "git+https://github.com/guybedford/tokio?tag=1.53.1-cf.emscripten#7227f2d72739c3bc9821074cc704e7582be92907"
 dependencies = [
  "proc-macro2",
  "quote",
