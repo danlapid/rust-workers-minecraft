@@ -70,6 +70,14 @@ async fn fetch(request: Request, env: Env, _ctx: Context) -> worker::Result<Resp
     match request.path().as_str() {
         "/health" => Response::ok(r#"{"ready":true}"#).map(json),
         "/" if request.method() == worker::Method::Get => {
+            let expected = env.secret("STATUS_TOKEN")?.to_string();
+            let provided = request
+                .headers()
+                .get("Authorization")?
+                .and_then(|header| header.strip_prefix("Bearer ").map(str::to_string));
+            if provided.as_deref() != Some(expected.as_str()) {
+                return Response::error("Unauthorized", 401);
+            }
             let rpc: JsValue = world(&env)?.into();
             let status = method(&rpc, "status", &[])?;
             let status =
