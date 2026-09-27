@@ -1,0 +1,37 @@
+build.rs
+  s_dccdbcee9eb73b::t_ca362e71962ebe 15
+docs/architecture.md
+  s_dccdbcee9eb73b::t_f63cf11a89a8ac 22-29,49-54,106-107
+patches/pumpkin-emscripten.patch
+  s_dccdbcee9eb73b::t_cfead99af120f8 36-40,1390,1450-1461,1479,1688-1712,1721,1729,1737,2388,2391-2399,2408-2418,2428,2440,2449,2457,2502,2511-2574,2623,2756,2765,2778,2791
+src/workerd.js
+  s_dccdbcee9eb73b::t_d2c1b2bc08db1d 1,3-33
+src/world.rs
+  s_dccdbcee9eb73b::t_ff778517c6b474 16,91-104,409-442
+tests/host-tasks.test.mjs
+  s_dccdbcee9eb73b::t_926862a96a1178 1-77
+tests/server.mjs
+  s_dccdbcee9eb73b::t_fd769f33913fe9 36-37
+wrangler.jsonc
+  s_dccdbcee9eb73b::t_8b17e3cfe39bfa 14
+tests/client.mjs
+  s_dccdbcee9eb73b::t_ca545cec17677f 65,82-91,98,117-124,126-132,142,184
+tests/integration.mjs
+  s_dccdbcee9eb73b::t_c3fb36352cec0f 40-44,51-56
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3de0b787123f05ea5fe25dffd641650c6ba9e71f",
+  "prompts": {},
+  "sessions": {
+    "s_dccdbcee9eb73b": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a07663-3837-7741-892f-3e0fae2953db",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Dan Lapid <dlapid@cloudflare.com>"
+    }
+  }
+}
