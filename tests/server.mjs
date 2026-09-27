@@ -33,6 +33,8 @@ export async function testServer({ seed = '1789195700909824175', vars = {} } = {
     const log = path.join(probe, `${++phase}-minecraft.log`);
     const sourceConfig = path.join(repo, 'wrangler.jsonc');
     const config = JSON.parse(await readFile(sourceConfig, 'utf8'));
+    assert.ok(!config.compatibility_flags?.includes('precise_timers'),
+      'Integration tests must exercise the standard Workers clock');
     config.name += '-' + path.basename(probe).split('.').at(-1).toLowerCase();
     // The probe config lives outside the repository root. Keep the real build
     // hook and resolve its paths so tests exercise the same startup as dev.

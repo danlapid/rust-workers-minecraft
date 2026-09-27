@@ -1,5 +1,36 @@
-// Emscripten library adjustments for NODERAWFS on workerd's Node filesystem.
+// Emscripten platform hooks for Workers.
 addToLibrary({
+  $workerdHostTasks__deps: ['$emSetImmediate', '$emClearImmediate'],
+  $workerdHostTasks__postset: () => addAtPreRun('workerdHostTasks()'),
+  $workerdHostTasks: () => {
+    const pending = new Map();
+    let nextId = 0;
+    // Workers implements setImmediate as a zero-delay timer. Its callback
+    // caps the clock at that timer's deadline, including nested microtasks.
+    // scheduler.wait resumes outside the callback, after the cap is released.
+    emSetImmediate = (callback) => {
+      do { nextId = (nextId + 1) & 0x7fffffff; } while (!nextId || pending.has(nextId));
+      const id = nextId;
+      const controller = new AbortController();
+      pending.set(id, controller);
+      void scheduler.wait(0, { signal: controller.signal }).then(() => {
+        // Cancellation can race with an already-fulfilled wait promise.
+        if (pending.delete(id)) callback();
+      }).catch(error => {
+        pending.delete(id);
+        if (!controller.signal.aborted) queueMicrotask(() => { throw error; });
+      });
+      return id;
+    };
+    emClearImmediate = (id) => {
+      const controller = pending.get(id);
+      if (!controller) return false;
+      pending.delete(id);
+      controller.abort();
+      return true;
+    };
+  },
+
   // Node's deprecated process.binding is absent; fs.constants is the public
   // form of the same table.
   $NODEFS__postset: `

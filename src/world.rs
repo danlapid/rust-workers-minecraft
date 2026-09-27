@@ -13,7 +13,7 @@ use pumpkin::{data::VanillaData, server::Server, PumpkinServer};
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
-    sync::{atomic::Ordering, Arc},
+    sync::{atomic::Ordering, Arc, Once},
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
@@ -88,6 +88,20 @@ impl DurableObject for MinecraftWorld {
         }));
         let storage = state.storage();
         host::mount_storage(storage.as_raw());
+        static INITIALIZE_RUNTIME: Once = Once::new();
+        INITIALIZE_RUNTIME.call_once(|| {
+            // Chunk generation tasks do substantial synchronous work. Return to
+            // the host between tasks so packets and timers can keep progressing.
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .event_interval(1)
+                .build_hosted_local_event_loop(Default::default())
+                .expect("failed to create the world event loop");
+            assert!(
+                wasm_bindgen_futures::tokio::try_set_ambient(runtime).is_ok(),
+                "world event loop was initialized before its constructor"
+            );
+        });
         MinecraftWorld {
             shared: Rc::new(Shared {
                 storage,
@@ -392,6 +406,40 @@ fn server_status(server: &Server) -> Result<JsValue, JsValue> {
     let result = js_sys::Object::new();
     let set = |key: &str, value: f64| js_sys::Reflect::set(&result, &key.into(), &value.into());
     set("players", server.get_all_players().len() as f64)?;
+    let players = server.get_all_players();
+    set(
+        "loading_players",
+        players
+            .iter()
+            .filter(|player| {
+                player
+                    .client
+                    .java()
+                    .is_some_and(|client| client.is_spawning())
+            })
+            .count() as f64,
+    )?;
+    set(
+        "queued_incoming_packets",
+        players
+            .iter()
+            .map(|player| player.inbound_packets.len())
+            .sum::<usize>() as f64,
+    )?;
+    set(
+        "pending_keep_alives",
+        players
+            .iter()
+            .filter_map(|player| player.client.java())
+            .map(|client| {
+                client
+                    .pending_keep_alives
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len()
+            })
+            .sum::<usize>() as f64,
+    )?;
     set("ticks", server.tick_count.load(Ordering::Relaxed) as f64)?;
     set(
         "wasm_memory_bytes",

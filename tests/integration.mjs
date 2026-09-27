@@ -37,13 +37,23 @@ try {
   assert.equal((await status({ fragmented: true })).version.protocol, 776);
   assert.equal((await status()).players.max, 2);
   assert.equal((await request('/')).runtime_starts, 0, 'Status ping started Wasm');
-  const a = await play('ProbeA'); clients.push(a);
+  // Keep traffic below the 500 packets/s limit while stressing startup: the
+  // reader and world generation must both progress before terrain arrives.
+  const a = await play('ProbeA', { tickIntervalMs: 10 }); clients.push(a);
+  assert.ok(a.traffic.sentTicks > 0, 'Client did not tick while terrain was loading');
+  console.log(`Client ticks sent during initial spawn: ${a.traffic.sentTicks}`);
   const b = await play('ProbeB'); clients.push(b);
   await waitFor(() => {
     a.assertHealthy(); b.assertHealthy(); worker.healthy();
     return a.seenNames.has('ProbeB') && b.seenNames.has('ProbeA');
   }, 'both players to see each other');
   assert.equal((await status()).players.online, 2);
+  // Use socket traffic alone here: HTTP status polling must not be what keeps
+  // the runtime's clock and keep-alive timers moving.
+  await waitFor(() => {
+    a.assertHealthy(); b.assertHealthy(); worker.healthy();
+    return a.traffic.keepAlives > 0 && b.traffic.keepAlives > 0;
+  }, 'both clients to receive keep-alives');
   assert.equal(a.traffic.compressionThreshold, 512);
   assert.ok(a.traffic.decodedBytes > a.traffic.wireBytes, 'Compression did not reduce traffic');
   await assert.rejects(play('ProbeExtra'), /login rejected/);

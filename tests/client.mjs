@@ -62,7 +62,7 @@ export async function status({ fragmented = false } = {}) {
 }
 
 /** A small vanilla-protocol client that remains connected after receiving chunks. */
-export async function play(name, { viewDistance = 32 } = {}) {
+export async function play(name, { viewDistance = 32, tickIntervalMs = 50 } = {}) {
   const stream = await socket();
   const compression = { threshold: null, decodedBytes: 0 };
   const send = (id, payload) => stream.write(frame(id, payload, compression.threshold));
@@ -79,12 +79,23 @@ export async function play(name, { viewDistance = 32 } = {}) {
   let loaded = false;
   let closing = false;
   let failure;
+  let tickTimer;
+  let readTimer;
+  let sentTicks = 0;
+  let keepAlives = 0;
+  const receivedPacket = () => {
+    clearTimeout(readTimer);
+    readTimer = setTimeout(() => stream.destroy(new Error(`${name}: no server packet for 30 seconds`)), 30_000);
+  };
+  stream.once('close', () => { clearInterval(tickTimer); clearTimeout(readTimer); });
+  receivedPacket();
   let readyResolve, readyReject;
   const ready = new Promise((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
   stream.write(handshake(2));
   send(0, Buffer.concat([mcString(name), uuid]));
   const reading = (async () => {
     for await (const { id, payload } of packets(stream, compression)) {
+      receivedPacket();
       if (state === 'login') {
         if (id === 0) throw new Error(`${name}: login rejected`);
         if (id === 1) throw new Error('Probe requires offline mode');
@@ -103,9 +114,22 @@ export async function play(name, { viewDistance = 32 } = {}) {
         if (id === 2) throw new Error(`${name}: disconnected during configuration`);
         if (id === 0x0e) send(7, varint(0));
         if (id === 4 || id === 5) send(id, payload);
-        if (id === 3) { send(3); state = 'play'; }
+        if (id === 3) {
+          send(3);
+          state = 'play';
+          // Vanilla keeps ticking while the server is still loading terrain.
+          tickTimer = setInterval(() => {
+            if (!closing && !failure) { send(0x0d); sentTicks++; }
+          }, tickIntervalMs);
+        }
       } else {
-        if (id === 0x20) throw new Error(`${name}: disconnected during Play`);
+        if (id === 0x20) {
+          // Plain disconnect messages are network NBT strings (tag 8).
+          const reason = payload[0] === 8 && payload.length >= 3
+            ? payload.subarray(3, 3 + payload.readUInt16BE(1)).toString()
+            : 'server disconnected';
+          throw new Error(`${name}: disconnected during Play: ${reason}`);
+        }
         if (id === 0x54) {
           for (const update of sectionUpdates(payload)) {
             blockUpdates.set(`${update.x},${update.y},${update.z}`, update.state);
@@ -115,7 +139,7 @@ export async function play(name, { viewDistance = 32 } = {}) {
           const position = readBlockPosition(payload);
           blockUpdates.set(`${position.x},${position.y},${position.z}`, readVarint(payload, 8)[0]);
         }
-        if (id === 0x2c) send(0x1c, payload);
+        if (id === 0x2c) { send(0x1c, payload); keepAlives++; }
         if (id === 0x48) {
           const [teleport, offset] = readVarint(payload);
           position = { x: payload.readDoubleBE(offset), y: payload.readDoubleBE(offset + 8), z: payload.readDoubleBE(offset + 16) };
@@ -157,7 +181,7 @@ export async function play(name, { viewDistance = 32 } = {}) {
   finally { clearTimeout(timer); }
   return {
     chunks, seenNames,
-    get traffic() { return { wireBytes: stream.bytesRead, decodedBytes: compression.decodedBytes, compressionThreshold: compression.threshold }; },
+    get traffic() { return { wireBytes: stream.bytesRead, decodedBytes: compression.decodedBytes, compressionThreshold: compression.threshold, sentTicks, keepAlives }; },
     block(position) {
       const update = blockUpdates.get(`${position.x},${position.y},${position.z}`);
       if (update !== undefined) return update;

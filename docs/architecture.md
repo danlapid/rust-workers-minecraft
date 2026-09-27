@@ -19,6 +19,14 @@ macro exports the object's handlers with `experimental_tokio` (ambient): the
 future runs on the thread's Tokio `LocalEventLoop` (tokio-rs/tokio#8484), the
 current-thread scheduler and drivers with the host event loop as their wait,
 and the export returns the Promise of its outcome. Nothing blocks or suspends.
+The object installs that event loop with `event_interval(1)` before its first
+async call. Generation tasks do substantial synchronous work, so scheduling
+batches contain one task to keep I/O and timer checks responsive.
+Workers caps the clock inside timer callbacks, and its Node `setImmediate` is
+a zero-delay timer. The Emscripten library maps host immediates to the public
+`scheduler.wait(0)` API, whose continuation runs after the timer callback has
+finished. Tokio can then observe clock progress without `precise_timers`.
+Cancellation aborts the wait and prevents a queued callback from running.
 `status` and `serverList` are plain `#[wasm_bindgen]` RPC methods. The first
 `connect` after idle runs the server lifetime: it starts Pumpkin on the mounted
 world, awaits the server's return after its final save, awaits `storage.sync()`,
@@ -37,6 +45,12 @@ inbound socket to that listener with `Socket::handle_as_node_connection`; the
 accepted connection surfaces
 through epoll readiness and Pumpkin's normal accept loop, reporting the bound
 address and an unspecified peer.
+
+The Java packet reader runs while the player's spawn terrain loads, so client
+ticks are rate-limited as they arrive. Keep-alive replies are handled during
+loading, while gameplay waits in a queue of at most 4096 packets and 2 MiB of
+payload until spawning finishes. This prevents loading delays from turning
+ordinary client traffic into an apparent packet flood or a connection timeout.
 
 One wasm instance serves the isolate, so one object hosts one server at a time;
 `WORLD_NAME` selects it. When the last connection closes, the server root saves
@@ -89,6 +103,8 @@ The world name comes from `WORLD_NAME` in `wrangler.jsonc`.
   count, last shutdown save time, reconnect deadline, and effective settings.
 
 Runtime statistics include Wasm capacity and allocator in-use/free/arena bytes.
+They also expose players still loading, queued incoming packets, and outstanding
+keep-alive requests to distinguish slow spawning from a stalled connection.
 Allocator counters include allocation metadata and unused container capacity;
 Wasm capacity additionally includes static data, stack, and growth headroom.
 

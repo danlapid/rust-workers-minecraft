@@ -33,6 +33,11 @@ and preserve batch ordering for asynchronous resends. Release idle generation
 graph allocations once no task holds a key. Keep imports and helpers behind
 the same feature gates as their consumers so headless builds compile cleanly.
 
+Read and rate-limit Play packets while spawn terrain loads, with a bounded
+queue for gameplay until initialization finishes. Handle keep-alive replies
+during loading so ordinary client traffic is not mistaken for a packet flood
+and the connection stays alive during a slow spawn.
+
 Base-commit: b5b9b9d7010e793806a83c495af223c67e1d35ee
 
 ---
@@ -1382,7 +1387,7 @@ index 7d64f9b1..ca28e83b 100644
                      let Some(entity_arc) = world_clone.get_entity_by_id(entity_id) else {
                          return;
 diff --git a/crates/pumpkin/src/entity/player.rs b/crates/pumpkin/src/entity/player.rs
-index a19825bc..ec620557 100644
+index a19825bc..374c38cd 100644
 --- a/crates/pumpkin/src/entity/player.rs
 +++ b/crates/pumpkin/src/entity/player.rs
 @@ -523,26 +523,33 @@ pub struct Player {
@@ -1442,7 +1447,18 @@ index a19825bc..ec620557 100644
      #[must_use]
      pub fn fetch_skin(properties: &[Property]) -> Option<pumpkin_protocol::bedrock::client::Skin> {
          let textures_prop = properties.iter().find(|p| &*p.name == "textures")?;
-@@ -2590,10 +2606,13 @@ impl Player {
+@@ -2416,6 +2432,10 @@ impl Player {
+     pub fn process_inbound_packets(&self) {
+         const MAX_PACKETS_PER_TICK: usize = 64;
+
++        if self.client.java().is_some_and(|client| client.is_spawning()) {
++            return;
++        }
++
+         let Some(player_arc) = self.world().get_player_by_uuid(self.gameprofile.id) else {
+             return;
+         };
+@@ -2590,10 +2610,13 @@ impl Player {
                      .map_or(0, |s| s.sent_chunks_count())
              },
              |batch| match self.client.as_ref() {
@@ -1460,7 +1476,7 @@ index a19825bc..ec620557 100644
                      self.chunk_sender.try_lock().map_or(0, |mut sender| {
                          sender.commit_batch(&batch, &encoded, &self.client, current_epoch);
 diff --git a/crates/pumpkin/src/lib.rs b/crates/pumpkin/src/lib.rs
-index 7110bc9e..e7e9ecb4 100644
+index 7110bc9e..aeb926d8 100644
 --- a/crates/pumpkin/src/lib.rs
 +++ b/crates/pumpkin/src/lib.rs
 @@ -8,29 +8,37 @@ extern crate pumpkin_macros;
@@ -1669,7 +1685,31 @@ index 7110bc9e..e7e9ecb4 100644
          if let Some((wrapper, _, _)) = LOGGER_IMPL.wait()
              && let Some(rl) = wrapper.take_readline()
          {
-@@ -618,7 +696,7 @@ impl PumpkinServer {
+@@ -587,13 +665,22 @@ impl PumpkinServer {
+
+                                      if let ClientPlatform::Java(client) = player.client.as_ref() {
+                                          client.set_player(player.clone());
++                                         let reading_player = player.clone();
++                                         let reading_server = server_clone.clone();
++                                         client.spawn_task(async move {
++                                             if let ClientPlatform::Java(client) = reading_player.client.as_ref() {
++                                                 client.progress_player_packets(&reading_player, &reading_server).await;
++                                                 client.close();
++                                             }
++                                         });
+                                      }
+                                      world
+                                          .spawn_java_player(&server_clone.basic_config, &player, &server_clone)
+                                          .await;
+
+                                      if let ClientPlatform::Java(client) = player.client.as_ref() {
+-                                         client.progress_player_packets(&player, &server_clone).await;
++                                         client.finish_spawn();
++                                         client.await_close_interrupt().await;
+
+                                          // Close when done
+                                          client.close();
+@@ -618,7 +705,7 @@ impl PumpkinServer {
                          });
                      }
                      Err(e) => {
@@ -1678,7 +1718,7 @@ index 7110bc9e..e7e9ecb4 100644
                          if e.raw_os_error() == Some(libc::EMFILE) {
                              error!(
                                  "Too many open files! Server reached file descriptor limit. \
-@@ -719,6 +797,7 @@ impl PumpkinServer {
+@@ -719,6 +806,7 @@ impl PumpkinServer {
      }
  }
  
@@ -1686,7 +1726,7 @@ index 7110bc9e..e7e9ecb4 100644
  fn setup_stdin_console(server: &Arc<Server>) {
      let (tx, mut rx) = tokio::sync::mpsc::channel(1);
      let rt = tokio::runtime::Handle::current();
-@@ -759,6 +838,7 @@ fn setup_stdin_console(server: &Arc<Server>) {
+@@ -759,6 +847,7 @@ fn setup_stdin_console(server: &Arc<Server>) {
      });
  }
  
@@ -1694,7 +1734,7 @@ index 7110bc9e..e7e9ecb4 100644
  fn setup_console(mut rl: Editor<PumpkinCommandCompleter, FileHistory>, server: Arc<Server>) {
      let (tx, mut rx) = tokio::sync::mpsc::channel(1);
      let (tx_reply, mut rx_reply) = tokio::sync::mpsc::channel(1);
-@@ -839,7 +919,7 @@ fn scrub_address(ip: &str) -> String {
+@@ -839,7 +928,7 @@ fn scrub_address(ip: &str) -> String {
          .collect()
  }
  
@@ -2345,10 +2385,18 @@ index 7e45c3db..8a4d5af4 100644
                  let mut packets = Vec::new();
                  let mut sent_dimension_type = false;
 diff --git a/crates/pumpkin/src/net/java/mod.rs b/crates/pumpkin/src/net/java/mod.rs
-index fb0e9c90..b1e2bfdf 100644
+index fb0e9c90..36627754 100644
 --- a/crates/pumpkin/src/net/java/mod.rs
 +++ b/crates/pumpkin/src/net/java/mod.rs
-@@ -43,7 +43,7 @@ use pumpkin_util::version::JavaMinecraftVersion;
+@@ -17,6 +17,7 @@ use pumpkin_protocol::java::server::play::{
+     SConfigurationAcknowledged, SConfirmTeleport, SContainerButtonClick,
+     SContainerSlotStateChanged, SCookieResponse as SPCookieResponse, SCustomPayload,
+     SDebugSampleSubscription, SDebugSubscriptionRequest, SEditBook, SEntityTagQuery, SInteract,
++    SKeepAlive,
+     SJigsawGenerate, SLockDifficulty, SMoveVehicle, SPaddleBoat, SPickItemFromBlock, SPlaceRecipe,
+     SPlayPingRequest, SPlayPong, SPlayResourcePack, SPlayerAbilities, SPlayerAction,
+     SPlayerCommand, SPlayerInput, SPlayerLoaded, SPlayerPosition, SPlayerPositionRotation,
+@@ -43,7 +44,7 @@ use pumpkin_util::version::JavaMinecraftVersion;
  use tokio::{
      io::{BufReader, BufWriter},
      net::tcp::{OwnedReadHalf, OwnedWriteHalf},
@@ -2357,7 +2405,17 @@ index fb0e9c90..b1e2bfdf 100644
  };
  use tokio::{
      sync::mpsc::{Receiver, Sender, error::TryRecvError},
-@@ -102,6 +102,9 @@ pub struct JavaClient {
+@@ -89,6 +90,9 @@ pub struct JavaClient {
+     pub brand: ArcSwap<Option<String>>,
+     /// Associated player reference. Lock-free `ArcSwap`.
+     pub player: ArcSwap<Option<Arc<Player>>>,
++    /// Read and rate-limit packets during terrain loading, but defer gameplay
++    /// until the initial spawn sequence has finished.
++    spawn_complete: AtomicBool,
+     /// A collection of tasks associated with this client. The tasks await completion when removing the client.
+     tasks: TaskTracker,
+     rt_handle: tokio::runtime::Handle,
+@@ -102,6 +106,9 @@ pub struct JavaClient {
      outgoing_packet_priority_send: Sender<OutgoingPacket>,
      /// A high-priority queue of serialized packets to send to the network.
      outgoing_packet_priority_recv: Option<Receiver<OutgoingPacket>>,
@@ -2367,7 +2425,7 @@ index fb0e9c90..b1e2bfdf 100644
      /// The packet encoder for outgoing packets.
      network_writer: std::sync::Mutex<Option<TCPNetworkEncoder<BufWriter<OwnedWriteHalf>>>>,
      /// The packet decoder for incoming packets.
-@@ -132,8 +135,11 @@ pub enum OutgoingPacketType {
+@@ -132,8 +139,11 @@ pub enum OutgoingPacketType {
  struct OutgoingPacket {
      data: Bytes,
      completion: Option<oneshot::Sender<()>>,
@@ -2379,7 +2437,7 @@ index fb0e9c90..b1e2bfdf 100644
  const MAX_FRAME_BATCH_DATA_SIZE: usize = MAX_PACKET_SIZE as usize;
  
  fn take_frame_batch(packets: &mut VecDeque<OutgoingPacket>) -> Vec<OutgoingPacket> {
-@@ -190,7 +196,7 @@ async fn frame_batch_maybe_offload(
+@@ -190,7 +200,7 @@ async fn frame_batch_maybe_offload(
          .any(|packet| writer.is_compressing_packet(&packet.data));
  
      if needs_offload {
@@ -2388,7 +2446,7 @@ index fb0e9c90..b1e2bfdf 100644
              let (writer, frame, frame_err) = frame_packet_batch(writer, &packet_batch);
              (writer, packet_batch, frame, frame_err)
          })
-@@ -206,6 +212,7 @@ impl OutgoingPacket {
+@@ -206,6 +216,7 @@ impl OutgoingPacket {
          Self {
              data,
              completion: None,
@@ -2396,7 +2454,7 @@ index fb0e9c90..b1e2bfdf 100644
          }
      }
  
-@@ -213,10 +220,44 @@ impl OutgoingPacket {
+@@ -213,10 +224,44 @@ impl OutgoingPacket {
          Self {
              data,
              completion: Some(completion),
@@ -2441,7 +2499,7 @@ index fb0e9c90..b1e2bfdf 100644
  impl JavaClient {
      #[must_use]
      pub fn from_pending(
-@@ -242,6 +283,8 @@ impl JavaClient {
+@@ -242,10 +287,13 @@ impl JavaClient {
              outgoing_packet_priority_send: priority_send,
              outgoing_packet_priority_recv: Some(priority_recv),
              version: pending.version,
@@ -2450,7 +2508,70 @@ index fb0e9c90..b1e2bfdf 100644
              network_writer: std::sync::Mutex::new(Some(pending.network_writer)),
              network_reader: std::sync::Mutex::new(Some(pending.network_reader)),
              brand: ArcSwap::from_pointee(pending.brand),
-@@ -382,6 +425,48 @@ impl JavaClient {
+             player: ArcSwap::from_pointee(None),
++            spawn_complete: AtomicBool::new(false),
+             wait_for_keep_alive: AtomicBool::new(false),
+             keep_alive_id: AtomicCell::new(0),
+             last_keep_alive_time: AtomicCell::new(Instant::now()),
+@@ -260,6 +308,15 @@ impl JavaClient {
+         self.player.store(Arc::new(Some(player)));
+     }
+
++    pub fn is_spawning(&self) -> bool {
++        !self.spawn_complete.load(Ordering::Acquire)
++    }
++
++    pub fn finish_spawn(&self) {
++        self.last_packet_time.store(Instant::now());
++        self.spawn_complete.store(true, Ordering::Release);
++    }
++
+     pub async fn progress_player_packets(&self, player: &Arc<Player>, server: &Arc<Server>) {
+         let Some(mut network_reader) = self
+             .network_reader
+@@ -278,6 +335,8 @@ impl JavaClient {
+
+         // Skip the immediate first tick so we don't send a keep-alive the exact millisecond they join
+         keep_alive_interval.tick().await;
++        let mut spawn_packets = 0usize;
++        let mut spawn_bytes = 0usize;
+
+         loop {
+             tokio::select! {
+@@ -353,6 +412,32 @@ impl JavaClient {
+                         break;
+                     }
+
++                    if self.is_spawning() {
++                        // Keep the connection alive while gameplay handling is
++                        // deferred. A keep-alive reply only updates connection
++                        // state; it does not require the spawn terrain.
++                        let version = self.version.load();
++                        if packet.id == SKeepAlive::to_id(version) {
++                            match SKeepAlive::read(&mut packet.payload.as_ref(), &version) {
++                                Ok(reply) => self.handle_keep_alive(player, &reply),
++                                Err(_) => {
++                                    self.kick(TextComponent::text("Invalid keep-alive reply")).await;
++                                    break;
++                                }
++                            }
++                            continue;
++                        }
++                        // The ticker leaves these packets queued until spawning
++                        // completes. Bound both payload storage and empty packets.
++                        spawn_packets += 1;
++                        spawn_bytes += packet.payload.len();
++                        if spawn_packets > 4096 || spawn_bytes > MAX_PACKET_SIZE as usize {
++                            self.kick(TextComponent::text(
++                                "Too much data received while loading terrain",
++                            )).await;
++                            break;
++                        }
++                    }
+                     player.inbound_packets.push(packet);
+                 }
+             }
+@@ -382,6 +467,48 @@ impl JavaClient {
          }
      }
  
@@ -2499,7 +2620,7 @@ index fb0e9c90..b1e2bfdf 100644
      pub async fn send_chunks(&self, chunks: &[SyncChunk]) {
          let player = self.player.load_full();
          let Some(player) = player.as_ref() else {
-@@ -405,69 +490,78 @@ impl JavaClient {
+@@ -405,69 +532,78 @@ impl JavaClient {
          }
  
          let version = self.version.load();
@@ -2632,7 +2753,7 @@ index fb0e9c90..b1e2bfdf 100644
          if version >= JavaMinecraftVersion::V_1_20_2 {
              self.send_packet(&CChunkBatchEnd::new(chunks.len() as u16))
                  .await;
-@@ -746,7 +840,7 @@ impl JavaClient {
+@@ -746,7 +882,7 @@ impl JavaClient {
                  }
  
                  let mut packets_to_frame = VecDeque::from(packet_batch);
@@ -2641,7 +2762,7 @@ index fb0e9c90..b1e2bfdf 100644
                  let mut send_failed = false;
  
                  while !packets_to_frame.is_empty() {
-@@ -780,7 +874,11 @@ impl JavaClient {
+@@ -780,7 +916,11 @@ impl JavaClient {
                          break;
                      }
  
@@ -2654,7 +2775,7 @@ index fb0e9c90..b1e2bfdf 100644
                  }
  
                  if !send_failed && let Err(err) = writer.flush().await {
-@@ -796,10 +894,8 @@ impl JavaClient {
+@@ -796,10 +936,8 @@ impl JavaClient {
                      break;
                  }
  
@@ -2667,7 +2788,7 @@ index fb0e9c90..b1e2bfdf 100644
                  }
              }
          });
-@@ -1311,3 +1407,59 @@ impl JavaClient {
+@@ -1311,3 +1449,59 @@ impl JavaClient {
          Ok(())
      }
  }
